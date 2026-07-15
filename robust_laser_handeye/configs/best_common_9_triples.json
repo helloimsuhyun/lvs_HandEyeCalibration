@@ -1,0 +1,50 @@
+{
+  "description": "Every triple in this list is applied to every one of the nine target lines. 9 lines x 9 common triples = 81 nominal scans.",
+  "triples": [
+    {
+      "d_mm": 60.0,
+      "theta_deg": 0.0,
+      "beta_deg": 60.0
+    },
+    {
+      "d_mm": 60.0,
+      "theta_deg": 0.0,
+      "beta_deg": 100.0
+    },
+    {
+      "d_mm": 60.0,
+      "theta_deg": 20.0,
+      "beta_deg": 90.0
+    },
+    {
+      "d_mm": 60.0,
+      "theta_deg": 40.0,
+      "beta_deg": 120.0
+    },
+    {
+      "d_mm": 80.0,
+      "theta_deg": 0.0,
+      "beta_deg": 120.0
+    },
+    {
+      "d_mm": 80.0,
+      "theta_deg": 30.0,
+      "beta_deg": 90.0
+    },
+    {
+      "d_mm": 90.0,
+      "theta_deg": 25.0,
+      "beta_deg": 90.0
+    },
+    {
+      "d_mm": 100.0,
+      "theta_deg": 40.0,
+      "beta_deg": 120.0
+    },
+    {
+      "d_mm": 110.0,
+      "theta_deg": 40.0,
+      "beta_deg": 60.0
+    }
+  ]
+}

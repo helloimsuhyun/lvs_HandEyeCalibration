@@ -1,0 +1,73 @@
+{
+  "robot": {
+    "adapter": "real_laser_handeye.hardware:MockRobot",
+    "kwargs": {
+      "initial_T_base_tcp": [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 700],
+        [0, 0, 0, 1]
+      ]
+    }
+  },
+  "laser": {
+    "adapter": "real_laser_handeye.hardware:MockPlanarLaser",
+    "inject_robot": true,
+    "kwargs": {
+      "T_tcp_sensor": [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+      ],
+      "plane_normal_base": [0, 0, 1],
+      "plane_offset_mm": 400,
+      "point_count": 151,
+      "noise_std_mm": 0.2,
+      "seed": 7
+    }
+  },
+  "safety": {
+    "live_enabled": true,
+    "workspace_mm": {
+      "min": [-800, -800, -100],
+      "max": [800, 800, 1000]
+    },
+    "no_go_boxes_mm": [],
+    "safe_transit_T_base_tcp": [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 700],
+      [0, 0, 0, 1]
+    ],
+    "approach_clearance_mm": 50,
+    "max_linear_step_mm": 100,
+    "max_angular_step_deg": 30,
+    "linear_speed_mm_s": 50,
+    "angular_speed_deg_s": 30,
+    "motion_timeout_s": 10,
+    "settle_time_s": 0,
+    "readback_position_tolerance_mm": 0.01,
+    "readback_rotation_tolerance_deg": 0.01,
+    "stationarity_position_tolerance_mm": 0.01,
+    "stationarity_rotation_tolerance_deg": 0.01,
+    "min_sensor_plane_clearance_mm": 10,
+    "initial_handeye_uncertainty_mm": 0,
+    "initial_handeye_uncertainty_deg": 0,
+    "require_controller_collision_check": true,
+    "controller_collision_check_acknowledged": true
+  },
+  "capture": {
+    "timeout_s": 1,
+    "profiles_per_pose": 1,
+    "min_points": 80,
+    "max_profile_age_ms": 1000,
+    "max_abs_sensor_y_mm": 0.1,
+    "max_initial_plane_rms_mm": 2,
+    "max_final_plane_rms_mm": 1,
+    "max_bootstrap_plane_rms_mm": 2,
+    "min_bootstrap_span_mm": 50,
+    "min_bootstrap_sensor_plane_distance_mm": 10,
+    "return_to_safe_between_scans": true
+  }
+}

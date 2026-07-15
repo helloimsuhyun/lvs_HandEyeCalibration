@@ -1,0 +1,58 @@
+{
+  "robot": {
+    "adapter": "real_laser_handeye.robot_adapter_template:RobotAdapter",
+    "kwargs": {
+      "host": "192.168.0.10",
+      "port": null
+    }
+  },
+  "laser": {
+    "adapter": "real_laser_handeye.keyence_adapter:KeyenceLaserAdapter",
+    "kwargs": {
+      "ip": "192.168.1.1",
+      "control_port": 24691,
+      "high_speed_port": 24692,
+      "device_id": 0,
+      "batch_profiles": 5,
+      "aggregate": "median"
+    }
+  },
+  "safety": {
+    "live_enabled": false,
+    "workspace_mm": {
+      "min": [-700.0, -700.0, 50.0],
+      "max": [700.0, 700.0, 900.0]
+    },
+    "no_go_boxes_mm": [],
+    "safe_transit_T_base_tcp": null,
+    "approach_clearance_mm": 50.0,
+    "max_linear_step_mm": 20.0,
+    "max_angular_step_deg": 5.0,
+    "linear_speed_mm_s": 20.0,
+    "angular_speed_deg_s": 10.0,
+    "motion_timeout_s": 30.0,
+    "settle_time_s": 0.4,
+    "readback_position_tolerance_mm": 1.0,
+    "readback_rotation_tolerance_deg": 1.0,
+    "stationarity_position_tolerance_mm": 0.2,
+    "stationarity_rotation_tolerance_deg": 0.2,
+    "min_sensor_plane_clearance_mm": 10.0,
+    "initial_handeye_uncertainty_mm": 10.0,
+    "initial_handeye_uncertainty_deg": 5.0,
+    "require_controller_collision_check": true,
+    "controller_collision_check_acknowledged": false
+  },
+  "capture": {
+    "timeout_s": 3.0,
+    "profiles_per_pose": 1,
+    "min_points": 80,
+    "max_profile_age_ms": 500.0,
+    "max_abs_sensor_y_mm": 0.1,
+    "max_initial_plane_rms_mm": 15.0,
+    "max_final_plane_rms_mm": 2.0,
+    "max_bootstrap_plane_rms_mm": 5.0,
+    "min_bootstrap_span_mm": 50.0,
+    "min_bootstrap_sensor_plane_distance_mm": 10.0,
+    "return_to_safe_between_scans": true
+  }
+}

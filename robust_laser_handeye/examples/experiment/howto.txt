@@ -1,0 +1,37 @@
+# 1. 논문 제안 방식
+
+PYTHONPATH=. python examples/experiment/run_three_plane_noise_sweep.py \
+  --systems 1 \
+  --mode unknown \
+  --poses-per-plane 35 \
+  --noise-min 0.0 \
+  --noise-max 0.5 \
+  --noise-step 0.05 \
+  --max-iter 3000 \
+  --tol 1e-9 \
+  --init-mode carlson \
+  --init-translation-range-mm 200 \
+  --init-angle-range-deg 30 \
+  --plane-offset-mode fitted \
+  --csv results/fitted/three_plane_noise_trials.csv \
+  --summary-csv results/fitted/three_plane_noise_summary.csv \
+  --plot-dir results/fitted/plots \
+  --verbose
+
+PYTHONPATH=. python examples/experiment/run_three_plane_noise_sweep.py \
+  --systems 100 \
+  --mode unknown \
+  --poses-per-plane 35 \
+  --noise-min 0.0 \
+  --noise-max 0.5 \
+  --noise-step 0.05 \
+  --max-iter 3000 \
+  --tol 1e-9 \
+  --init-mode carlson \
+  --init-translation-range-mm 200 \
+  --init-angle-range-deg 30 \
+  --plane-offset-mode joint \
+  --csv results/joint/three_plane_noise_trials.csv \
+  --summary-csv results/joint/three_plane_noise_summary.csv \
+  --plot-dir results/joint/plots \
+  --verbose

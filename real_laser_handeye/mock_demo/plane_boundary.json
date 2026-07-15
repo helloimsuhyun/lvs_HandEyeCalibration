@@ -1,0 +1,47 @@
+{
+  "plane": {
+    "normal_base": [0, 0, 1],
+    "offset_mm": 400,
+    "center_base_mm": [0, 0, 400],
+    "rms_error_mm": 0
+  },
+  "plane_frame": {
+    "T_base_plane": [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 400],
+      [0, 0, 0, 1]
+    ]
+  },
+  "observed_bounds_uv_mm": {
+    "u_min": -170,
+    "u_max": 170,
+    "v_min": -170,
+    "v_max": 170
+  },
+  "safe_bounds_uv_mm": {
+    "u_min": -150,
+    "u_max": 150,
+    "v_min": -150,
+    "v_max": 150
+  },
+  "quality_gate": {
+    "accepted": true,
+    "max_plane_rms_mm": 2,
+    "min_span_mm": 50,
+    "min_sensor_distance_mm": 10,
+    "observed_u_span_mm": 340,
+    "observed_v_span_mm": 340,
+    "sensor_plane_signed_distances_mm": [300, 300, 300, 300]
+  },
+  "bootstrap_provenance": {
+    "capture_count": 4,
+    "T_tcp_sensor_init": [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1]
+    ],
+    "transform_convention": "T_tcp_sensor maps sensor coordinates into TCP"
+  }
+}

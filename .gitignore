@@ -1,0 +1,27 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Experiment outputs
+diagnostics/
+three_plane_benchmark_plots/
+
+# Archives
+*.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Plot and data outputs
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.html
+*_plots/
+plots/
+diagnostics/

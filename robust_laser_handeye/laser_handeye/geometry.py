@@ -1,12 +1,9 @@
 from __future__ import annotations
 import numpy as np
 
-
+# 스캔 Point들의 PCA와 무게중심으로 추정 board 방정식 구함
 def fit_plane_pca(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray, float]:
-    """Fit a plane n_unit^T x = l using PCA.
 
-    Returns (n_unit, l, centroid, rms). The normal sign is chosen so l >= 0.
-    """
     P = np.asarray(points, dtype=float)
     if P.ndim != 2 or P.shape[1] != 3 or len(P) < 3:
         raise ValueError('points must have shape (N, 3), N>=3')
@@ -22,7 +19,7 @@ def fit_plane_pca(points: np.ndarray) -> tuple[np.ndarray, float, np.ndarray, fl
     rms = float(np.sqrt(np.mean(residuals**2)))
     return n, l, c, rms
 
-
+# scale encoging된 normal vector 구함
 def scaled_normal_from_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     """Return paper-style scaled normal n = l*n_unit and plane fit RMS.
 
