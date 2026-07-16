@@ -77,6 +77,94 @@ use `--tol`. Configure SciPy nonlinear least squares with `--nonlinear-ftol`,
 options work after either a joint or fitted linear solve, although the
 comparison commands below intentionally refine the legacy fitted result.
 
+### Interpreting the convergence plots
+
+Both single-plane and three-plane benchmark commands save exactly five default
+figures:
+
+| File | Contents |
+|---|---|
+| `translation_error_by_iteration.png` | Translation norm error [mm] by solver step |
+| `rotation_error_by_iteration.png` | Geodesic rotation error [deg] by solver step |
+| `fitted_plane_rms_by_iteration.png` | RMS distance to the fitted plane(s) [mm] by solver step |
+| `final_translation_rotation_error_boxplot.png` | Before/after translation and rotation error distributions |
+| `final_error_sensor_axis_components.png` | Final signed translation and rotation-vector errors along true sensor X/Z/Y |
+
+Both histories record the same solver states: state 0 is the initial estimate,
+followed by one state per completed linear update. When nonlinear refinement
+is enabled, its final transform and recomputed self-fitted RMS are appended as
+the final solver state. Thus matching x coordinates now refer to the same
+hand-eye estimate in both plots.
+
+### Saved CSV artifacts
+
+Every single-plane and three-plane benchmark run writes four CSV files.
+For `--csv results/example.csv`, the defaults are:
+
+| File | Contents |
+|---|---|
+| `results/example.csv` | One complete row per generated trial |
+| `results/example_iterations.csv` | Long format: one row per trial and solver step |
+| `results/example_summary.csv` | One aggregate row for the execution |
+| `results/example_failures.csv` | One row per failed trial; header-only when no trial failed |
+
+Override the companion paths with `--summary-csv` and `--failures-csv`. The
+summary remains available even if every trial fails. It records requested,
+completed and failed counts; convergence and success rates; the complete CLI
+configuration and elapsed time; and aggregate statistics for translation,
+rotation, component errors, iterations, condition number, plane RMS,
+Frobenius error and nonlinear refinement.
+
+The main error metrics include `min`, `p05`, `p25`, `median`, `mean`, `std`,
+`rmse`, `p75`, `p95`, `p99` and `max`. Min/max columns also include the
+corresponding `system_idx`, while signed component errors additionally report
+the largest absolute error and its trial ID. The failure CSV records
+`system_idx`, exception type and exception message.
+
+The three-plane noise sweep keeps one summary row per noise level and now also
+includes translation/rotation min, max, p99 and extreme trial IDs, plus
+iteration and condition-number ranges. Its failure log additionally records
+the noise level of each failed trial. It also writes
+`paper_style_noise_sweep_gt_errors.png`, a two-panel translation/rotation view
+corresponding to one fixed-scan-count slice of Fig. 5 in `single_plane.pdf`.
+It is deliberately not drawn as the paper's 3-D surface because the current
+sweep varies noise while holding `--poses-per-plane` fixed.
+
+Translation and rotation-vector errors are rotated into the true sensor frame
+and stored as `err_t_sensor_{x,y,z}_mm` and
+`err_r_sensor_{x,y,z}_deg`. The iteration CSV exposes translation error,
+rotation error, plane RMS, Frobenius error and available gauge components as
+ordinary numeric columns, so no JSON parsing is needed for follow-up analysis.
+Single-plane optimal trials also store fitted/GT plane offsets, their signed
+error, the mean fitted-normal/sensor-Z dot product, and aligned per-iteration
+histories in `iter_plane_offset_estimate_mm`, `iter_plane_offset_error_mm`,
+`iter_err_t_sensor_z_mm`, and `iter_normal_sensor_z_dot_mean`.
+
+To inspect an optimal single-plane scene interactively in 3-D, pass an HTML
+path to `--debug-scene-plot`:
+
+```bash
+PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
+  --systems 1 \
+  --seed 7 \
+  --reference-scans 24 \
+  --debug-scene-plot results/single_plane_optimal_scene.html \
+  --no-plots
+```
+
+The HTML contains the GT plane and normal, reconstructed laser profiles and
+base-frame axes. It supports mouse rotation, zoom, pan, hover coordinates and
+legend-based trace toggling. The representative scene uses `--debug-scene-seed`
+when provided, otherwise the main `--seed`. Supplying an image suffix such as
+`.png` keeps the existing static scene plot.
+
+When regular plots are enabled, the optimal benchmark also writes
+`translation_error_direction_3d.html` inside `--plot-dir`. It displays one
+interactive translation-error vector per trial in the true sensor X/Y/Z frame,
+colors endpoints by total error magnitude, and overlays the `+/-` sensor-Z
+gauge axis with translucent 15-degree gauge cones. Hovering an endpoint shows
+its `system_idx`, signed components, norm and angle to the gauge axis.
+
 ## Single-plane optimal comparison
 
 Run the following commands from the repository directory. All three use the
@@ -109,7 +197,6 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
   --max-iter 30 \
   --tol 1e-9 \
   --csv results/single_plane_optimal_joint.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -137,7 +224,6 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
   --max-iter 3000 \
   --tol 1e-9 \
   --csv results/single_plane_optimal_fitted.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -172,7 +258,6 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
   --nonlinear-gtol 1e-10 \
   --nonlinear-loss linear \
   --csv results/single_plane_optimal_fitted_nonlinear.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -182,12 +267,6 @@ plane offset and then solves the hand-eye update, so it generally needs a much
 higher iteration limit; 3000 is a conservative cap for this single-plane
 configuration. For unknown-plane nonlinear refinement, `refit` re-estimates
 the plane for every candidate hand-eye transform.
-
-The default linear multistart safeguard is not nonlinear refinement. It only
-retries six deterministic linear/PCA starts when the first solution's plane
-RMS exceeds `max(1 mm, 3*noise_std)`, then selects the lowest-residual linear
-result. Disable it with `--no-linear-multistart` for a literal single-start
-study.
 
 ## Three-plane comparison
 
@@ -211,7 +290,6 @@ PYTHONPATH=. python examples/run_three_plane_benchmark.py \
   --max-iter 30 \
   --tol 1e-9 \
   --csv results/three_plane_joint.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -232,7 +310,6 @@ PYTHONPATH=. python examples/run_three_plane_benchmark.py \
   --max-iter 500 \
   --tol 1e-9 \
   --csv results/three_plane_fitted.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -259,7 +336,6 @@ PYTHONPATH=. python examples/run_three_plane_benchmark.py \
   --nonlinear-gtol 1e-10 \
   --nonlinear-loss linear \
   --csv results/three_plane_fitted_nonlinear.csv \
-  --no-plots \
   --verbose
 ```
 
@@ -282,9 +358,7 @@ scene/noise and initialization. Equal `system_idx` values therefore have the
 same true hand-eye and exactly the same initial perturbation in both methods.
 The observable single-plane configuration is better in all three translation
 statistics; rotation is effectively identical (single is slightly lower in
-median and slightly higher in mean/max). In a separate 300-system stress run,
-two single-plane trials invoked the linear multistart safeguard and all 300
-finished below 0.108 mm translation and 0.081 deg rotation error.
+median and slightly higher in mean/max).
 
 ## Strict-grid diagnostic
 
@@ -336,7 +410,6 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
   --init-angle-range-deg 0 \
   --max-iter 30 \
   --tol -1 \
-  --no-linear-multistart \
   --debug-gauge-plot fixed_theta_gauge_proof.png \
   --csv fixed_theta_gauge_results.csv \
   --plot-dir fixed_theta_gauge_plots \

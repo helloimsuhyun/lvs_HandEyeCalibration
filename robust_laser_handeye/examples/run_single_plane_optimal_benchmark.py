@@ -13,7 +13,11 @@ from laser_handeye.benchmark_analysis import (
     iter_frobenius_error,
     print_calibration_summary,
     save_calibration_plots,
+    save_experiment_summary_csv,
+    save_failures_csv,
+    save_iteration_history_csv,
     save_plane_scene_plot,
+    save_plane_scene_plot_3d,
     save_results_csv,
 )
 
@@ -56,6 +60,12 @@ class SinglePlaneTrialResult:
     err_tx_mm: float
     err_ty_mm: float
     err_tz_mm: float
+    err_t_sensor_x_mm: float
+    err_t_sensor_y_mm: float
+    err_t_sensor_z_mm: float
+    err_r_sensor_x_deg: float
+    err_r_sensor_y_deg: float
+    err_r_sensor_z_deg: float
     err_rx_deg: float
     err_ry_deg: float
     err_rz_deg: float
@@ -63,9 +73,11 @@ class SinglePlaneTrialResult:
     gauge_perpendicular_error_mm: float
     gauge_axis_angle_deg: float
     gauge_parallel_fraction: float
+    estimated_plane_offset_mm: float
+    ground_truth_plane_offset_mm: float
+    plane_offset_error_mm: float
+    normal_sensor_z_dot_mean: float
     paper_success: bool
-    linear_multistart_used: bool
-    linear_start_count: int
     final_linear_plane_rms_mm: float
     init_trans_err_norm_mm: float
     init_rot_err_angle_deg: float
@@ -78,6 +90,14 @@ class SinglePlaneTrialResult:
     nonlinear_delta_rotation_deg: float = float("nan")
     plane_rms_history_mm: list[float] = field(default_factory=list)
     iter_T_frob_error: list[float] = field(default_factory=list)
+    iter_translation_error_norm_mm: list[float] = field(default_factory=list)
+    iter_rotation_geodesic_error_deg: list[float] = field(default_factory=list)
+    iter_gauge_parallel_abs_error_mm: list[float] = field(default_factory=list)
+    iter_gauge_perpendicular_error_mm: list[float] = field(default_factory=list)
+    iter_plane_offset_estimate_mm: list[float] = field(default_factory=list)
+    iter_plane_offset_error_mm: list[float] = field(default_factory=list)
+    iter_err_t_sensor_z_mm: list[float] = field(default_factory=list)
+    iter_normal_sensor_z_dot_mean: list[float] = field(default_factory=list)
 
 def sample_random_plane_pose(
     rng: np.random.Generator,
@@ -175,6 +195,63 @@ def make_scan_params(
     )
 
 
+def _theta_from_scan_param(param: dict) -> float:
+    """Read theta from one scan-parameter dictionary."""
+    for key in (
+        "theta_deg",
+        "projection_deg",
+        "projection_angle_deg",
+        "theta",
+    ):
+        if key in param:
+            return float(param[key])
+    raise KeyError(f"scan parameter does not contain theta: {param}")
+
+
+def _validate_theta_by_line(
+    theta_by_line_deg: tuple[float, ...] | None,
+) -> tuple[float, ...] | None:
+    """Validate the optional theta assignment for the nine circular lines."""
+    if theta_by_line_deg is None:
+        return None
+    values = tuple(float(value) for value in theta_by_line_deg)
+    if len(values) != 9:
+        raise ValueError("theta_by_line_deg must contain exactly 9 values")
+    if np.any(~np.isfinite(np.asarray(values, dtype=float))):
+        raise ValueError("theta_by_line_deg must contain only finite values")
+    return values
+
+
+def _nominal_target_scan_count(
+    scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None,
+) -> int:
+    """Return target-scan count before reachability filtering."""
+    theta_by_line_deg = _validate_theta_by_line(theta_by_line_deg)
+    if theta_by_line_deg is None:
+        return 9 * len(scan_params)
+
+    parameter_thetas = np.asarray(
+        [_theta_from_scan_param(param) for param in scan_params],
+        dtype=float,
+    )
+    count = 0
+    for line_theta in theta_by_line_deg:
+        matches = np.isclose(
+            parameter_thetas,
+            float(line_theta),
+            rtol=0.0,
+            atol=1e-9,
+        )
+        n_matches = int(np.count_nonzero(matches))
+        if n_matches == 0:
+            raise ValueError(
+                f"no scan parameters exist for line theta={line_theta:g} deg"
+            )
+        count += n_matches
+    return count
+
+
 def generate_optimal_single_plane_dataset(
     T_ef_s_true: np.ndarray,
     plane_R: np.ndarray,
@@ -185,15 +262,18 @@ def generate_optimal_single_plane_dataset(
     noise_std: float,
     check_reachability: bool,
     scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None = None,
     pose_geometry: str = "paper_incidence",
     reference_scan_params: list[dict] | None = None,
     reference_scan_count: int = 0,
 ) -> dict[int, list[LaserScan]]:
-    """Generate the 81-scan fixed-theta grid plus optional excitation.
+    """Generate the circular-line scan set plus optional excitation.
 
-    Nine target lines are arranged around a circular pattern at 40-degree
-    intervals. Each target line is scanned using all nine optimal parameter
-    combinations, yielding nominally 9 x 9 = 81 scans.
+    By default, every target line uses every entry in ``scan_params``. When
+    ``theta_by_line_deg`` is provided, it must contain nine values and line i
+    keeps only scan-parameter entries whose theta equals
+    ``theta_by_line_deg[i]``. Thus two theta values can be distributed across
+    lines without increasing the number of retained scans.
 
     A faithful fixed-theta incidence ring cannot distinguish one hand-eye
     translation component from the unknown plane offset. ``reference_scan_*``
@@ -213,6 +293,51 @@ def generate_optimal_single_plane_dataset(
         plane_id=0,
         pose_geometry=pose_geometry,
     )
+
+    theta_by_line_deg = _validate_theta_by_line(theta_by_line_deg)
+    if theta_by_line_deg is not None:
+        parameter_thetas = np.asarray(
+            [_theta_from_scan_param(param) for param in scan_params],
+            dtype=float,
+        )
+        selected_scans: list[LaserScan] = []
+        selected_count_by_line = np.zeros(9, dtype=int)
+
+        for scan in scans:
+            line_id = int(scan.meta.get("line_id", -1))
+            parameter_id = int(scan.meta.get("parameter_id", -1))
+            if not 0 <= line_id < 9:
+                raise ValueError(
+                    "theta-by-line filtering requires valid scan.meta['line_id']"
+                )
+            if not 0 <= parameter_id < len(scan_params):
+                raise ValueError(
+                    "theta-by-line filtering requires valid "
+                    "scan.meta['parameter_id']"
+                )
+
+            target_theta = float(theta_by_line_deg[line_id])
+            parameter_theta = float(parameter_thetas[parameter_id])
+            if np.isclose(
+                parameter_theta,
+                target_theta,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                # Retain explicit metadata so plots/debugging can verify the
+                # line-wise assignment without relying on parameter ordering.
+                scan.meta["assigned_theta_deg"] = target_theta
+                selected_scans.append(scan)
+                selected_count_by_line[line_id] += 1
+
+        missing_lines = np.flatnonzero(selected_count_by_line == 0)
+        if len(missing_lines):
+            missing_text = ", ".join(str(int(value)) for value in missing_lines)
+            raise RuntimeError(
+                "theta-by-line selection produced no valid scans for line(s): "
+                + missing_text
+            )
+        scans = selected_scans
 
     if reference_scan_count > 0:
         if not reference_scan_params:
@@ -251,35 +376,6 @@ def _rotation_angle_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
         R_b, dtype=float
     ).reshape(3, 3)
     return float(np.degrees(Rotation.from_matrix(R_rel).magnitude()))
-
-
-def _linear_retry_initial_guesses(
-    T_init: np.ndarray,
-    angle_deg: float,
-) -> list[np.ndarray]:
-    """Return six deterministic Euler-neighbour starts around ``T_init``.
-
-    These starts are used only when the first linear alternating solve ends in
-    a high-residual PCA basin. They do not run the optional nonlinear SE(3)
-    refinement and do not use the simulated ground truth.
-    """
-    angle_deg = float(angle_deg)
-    if angle_deg <= 0.0:
-        raise ValueError("linear multistart angle must be positive")
-    initial_euler = Rotation.from_matrix(
-        np.asarray(T_init, dtype=float)[:3, :3]
-    ).as_euler("xyz", degrees=True)
-    candidates: list[np.ndarray] = []
-    for axis in range(3):
-        for sign in (-1.0, 1.0):
-            euler = initial_euler.copy()
-            euler[axis] += sign * angle_deg
-            candidate = np.asarray(T_init, dtype=float).copy()
-            candidate[:3, :3] = Rotation.from_euler(
-                "xyz", euler, degrees=True
-            ).as_matrix()
-            candidates.append(candidate)
-    return candidates
 
 
 def _reconstruct_points_base(
@@ -359,6 +455,7 @@ def translation_error_sensor_z_components(
     T_est = np.asarray(T_est, dtype=float).reshape(4, 4)
     T_true = np.asarray(T_true, dtype=float).reshape(4, 4)
     error = T_est[:3, 3] - T_true[:3, 3]
+    error_sensor = T_true[:3, :3].T @ error
     sensor_z_ef = T_true[:3, 2].copy()
     sensor_z_ef /= np.linalg.norm(sensor_z_ef)
 
@@ -380,12 +477,43 @@ def translation_error_sensor_z_components(
 
     return {
         "error_ef": error,
+        "error_sensor": error_sensor,
         "sensor_z_ef": sensor_z_ef,
         "parallel_signed_mm": parallel_signed,
         "parallel_abs_mm": abs(parallel_signed),
         "perpendicular_mm": perpendicular_norm,
         "axis_angle_deg": axis_angle_deg,
         "parallel_fraction": parallel_fraction,
+    }
+
+
+def transform_error_component_histories(
+    transforms: list[np.ndarray],
+    T_true: np.ndarray,
+) -> dict[str, list[float]]:
+    """Return physically interpretable GT-error histories for solver states."""
+    translation_norm_mm: list[float] = []
+    rotation_geodesic_deg: list[float] = []
+    gauge_parallel_abs_mm: list[float] = []
+    gauge_perpendicular_mm: list[float] = []
+
+    for transform in transforms:
+        transform = np.asarray(transform, dtype=float).reshape(4, 4)
+        translation_norm_mm.append(
+            float(np.linalg.norm(transform[:3, 3] - T_true[:3, 3]))
+        )
+        rotation_geodesic_deg.append(
+            float(rot_error_deg(transform[:3, :3], T_true[:3, :3]))
+        )
+        gauge = translation_error_sensor_z_components(transform, T_true)
+        gauge_parallel_abs_mm.append(float(gauge["parallel_abs_mm"]))
+        gauge_perpendicular_mm.append(float(gauge["perpendicular_mm"]))
+
+    return {
+        "translation_norm_mm": translation_norm_mm,
+        "rotation_geodesic_deg": rotation_geodesic_deg,
+        "gauge_parallel_abs_mm": gauge_parallel_abs_mm,
+        "gauge_perpendicular_mm": gauge_perpendicular_mm,
     }
 
 
@@ -598,6 +726,819 @@ def save_translation_error_direction_plot(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+    return out_path
+
+
+def save_translation_error_direction_dashboard(
+    results: list[SinglePlaneTrialResult],
+    out_path: Path,
+) -> Path | None:
+    """Visualize signed translation-error directions in the true sensor frame.
+
+    The true hand-eye rotation maps sensor axes into the end-effector frame, so
+    ``R_true.T @ (t_est - t_true)`` expresses every trial in one meaningful
+    local coordinate system. Sensor Z is the fixed-theta gauge direction.
+    """
+    rows = [
+        result
+        for result in results
+        if np.all(
+            np.isfinite(
+                [
+                    result.err_t_sensor_x_mm,
+                    result.err_t_sensor_y_mm,
+                    result.err_t_sensor_z_mm,
+                ]
+            )
+        )
+    ]
+    if not rows:
+        return None
+
+    error_sensor = np.asarray(
+        [
+            [
+                result.err_t_sensor_x_mm,
+                result.err_t_sensor_y_mm,
+                result.err_t_sensor_z_mm,
+            ]
+            for result in rows
+        ],
+        dtype=float,
+    )
+    error_x, error_y, error_z = error_sensor.T
+    transverse = np.hypot(error_x, error_y)
+    error_norm = np.linalg.norm(error_sensor, axis=1)
+    axis_angle_deg = np.degrees(
+        np.arctan2(transverse, np.abs(error_z))
+    )
+    azimuth_rad = np.arctan2(error_y, error_x)
+
+    from matplotlib import colors
+    from matplotlib.cm import ScalarMappable
+
+    color_upper = max(float(np.max(error_norm)), np.finfo(float).eps)
+    color_norm = colors.Normalize(vmin=0.0, vmax=color_upper)
+    cmap = plt.get_cmap("viridis")
+
+    fig = plt.figure(figsize=(14.5, 10.5), constrained_layout=True)
+    grid = fig.add_gridspec(2, 2, width_ratios=(1.05, 1.0))
+    ax_xy = fig.add_subplot(grid[0, 0])
+    ax_polar = fig.add_subplot(grid[0, 1], projection="polar")
+    ax_components = fig.add_subplot(grid[1, 0])
+    ax_angle = fig.add_subplot(grid[1, 1])
+
+    # A. Transverse signed direction in the sensor XY plane.
+    scatter_xy = ax_xy.scatter(
+        error_x,
+        error_y,
+        c=error_norm,
+        cmap=cmap,
+        norm=color_norm,
+        s=48,
+        alpha=0.82,
+        edgecolors="white",
+        linewidths=0.55,
+    )
+    median_xy = np.median(error_sensor[:, :2], axis=0)
+    ax_xy.scatter(
+        median_xy[0],
+        median_xy[1],
+        marker="X",
+        s=150,
+        color="#d62728",
+        edgecolors="white",
+        linewidths=1.0,
+        label="component-wise median",
+        zorder=5,
+    )
+    xy_limit = max(
+        float(np.max(np.abs(error_sensor[:, :2]))) * 1.15,
+        1e-6,
+    )
+    ax_xy.axhline(0.0, color="0.45", linewidth=0.9)
+    ax_xy.axvline(0.0, color="0.45", linewidth=0.9)
+    ax_xy.set_xlim(-xy_limit, xy_limit)
+    ax_xy.set_ylim(-xy_limit, xy_limit)
+    ax_xy.set_aspect("equal", adjustable="box")
+    ax_xy.set_xlabel(r"Sensor $X$: $\Delta t_{S,x}$ [mm]")
+    ax_xy.set_ylabel(r"Sensor $Y$: $\Delta t_{S,y}$ [mm]")
+    ax_xy.set_title("A  Transverse error direction (sensor XY)", loc="left")
+    ax_xy.grid(True, alpha=0.22)
+    ax_xy.legend(loc="best", framealpha=0.92)
+
+    # B. Azimuth plus unsigned angular distance from the sensor-Z gauge axis.
+    positive_z = error_z >= 0.0
+    for mask, marker, label in (
+        (positive_z, "^", r"$\Delta t_{S,z}\geq0$"),
+        (~positive_z, "v", r"$\Delta t_{S,z}<0$"),
+    ):
+        if np.any(mask):
+            ax_polar.scatter(
+                azimuth_rad[mask],
+                axis_angle_deg[mask],
+                c=error_norm[mask],
+                cmap=cmap,
+                norm=color_norm,
+                marker=marker,
+                s=46,
+                alpha=0.82,
+                edgecolors="white",
+                linewidths=0.5,
+                label=label,
+            )
+    ax_polar.set_ylim(0.0, 90.0)
+    ax_polar.set_rticks([15, 30, 45, 60, 75, 90])
+    ax_polar.set_rlabel_position(135)
+    ax_polar.set_theta_zero_location("E")
+    ax_polar.set_theta_direction(1)
+    ax_polar.set_title(
+        "B  Direction around / away from sensor-Z gauge\n"
+        "radius = angle to nearest ±Z axis",
+        loc="left",
+        pad=20,
+    )
+    ax_polar.grid(True, alpha=0.25)
+    ax_polar.legend(loc="upper right", bbox_to_anchor=(1.30, 1.16))
+
+    # C. Signed component distributions with every trial retained.
+    component_data = [error_x, error_y, error_z]
+    component_colors = ["#4c78a8", "#f2a541", "#59a14f"]
+    violin = ax_components.violinplot(
+        component_data,
+        positions=[1, 2, 3],
+        showmeans=False,
+        showmedians=True,
+        showextrema=True,
+        widths=0.76,
+    )
+    for body, color in zip(violin["bodies"], component_colors):
+        body.set_facecolor(color)
+        body.set_edgecolor("white")
+        body.set_alpha(0.62)
+    for key in ("cmedians", "cmins", "cmaxes", "cbars"):
+        violin[key].set_color("0.2")
+        violin[key].set_linewidth(1.1)
+    jitter_rng = np.random.default_rng(0)
+    for position, values, color in zip(
+        [1, 2, 3], component_data, component_colors
+    ):
+        jitter = jitter_rng.uniform(-0.09, 0.09, size=len(values))
+        ax_components.scatter(
+            position + jitter,
+            values,
+            s=18,
+            color=color,
+            alpha=0.48,
+            edgecolors="none",
+        )
+    ax_components.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax_components.set_xticks([1, 2, 3], ["sensor X", "sensor Y", "sensor Z"])
+    ax_components.set_ylabel("Signed translation error [mm]")
+    ax_components.set_title("C  Signed component distributions", loc="left")
+    ax_components.grid(True, axis="y", alpha=0.25)
+
+    # D. Gauge-axis angle distribution and empirical cumulative fraction.
+    bins = np.linspace(0.0, 90.0, 13)
+    ax_angle.hist(
+        axis_angle_deg,
+        bins=bins,
+        color="#6f4e9c",
+        alpha=0.70,
+        edgecolor="white",
+        label="trial count",
+    )
+    median_angle = float(np.median(axis_angle_deg))
+    ax_angle.axvline(
+        median_angle,
+        color="#d62728",
+        linestyle="--",
+        linewidth=2.0,
+        label=f"median = {median_angle:.2f}°",
+    )
+    ax_angle.set_xlim(0.0, 90.0)
+    ax_angle.set_xlabel("Angle to nearest ±sensor-Z axis [deg]")
+    ax_angle.set_ylabel("Trial count")
+    ax_angle.set_title("D  Alignment with the gauge direction", loc="left")
+    ax_angle.grid(True, axis="y", alpha=0.25)
+    ax_angle.legend(loc="upper left")
+
+    cumulative_axis = ax_angle.twinx()
+    sorted_angle = np.sort(axis_angle_deg)
+    cumulative = np.arange(1, len(sorted_angle) + 1) / len(sorted_angle)
+    cumulative_axis.step(
+        sorted_angle,
+        cumulative,
+        where="post",
+        color="0.18",
+        linewidth=1.7,
+        label="empirical CDF",
+    )
+    cumulative_axis.set_ylim(0.0, 1.05)
+    cumulative_axis.set_ylabel("Cumulative fraction")
+
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=color_norm, cmap=cmap),
+        ax=[ax_xy, ax_polar],
+        shrink=0.82,
+        pad=0.06,
+    )
+    colorbar.set_label(r"Total translation error $\|\Delta t\|$ [mm]")
+
+    aligned_15 = 100.0 * float(np.mean(axis_angle_deg <= 15.0))
+    fig.suptitle(
+        "Optimal single-plane translation-error direction\n"
+        f"true sensor frame | trials={len(rows)} | "
+        f"median error={np.median(error_norm):.4g} mm | "
+        f"within 15° of ±sensor-Z={aligned_15:.1f}%",
+        fontsize=15,
+    )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=210, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_translation_error_direction_publication_plot(
+    results: list[SinglePlaneTrialResult],
+    out_path: Path,
+) -> Path | None:
+    """Save a publication-style sensor-frame direction and magnitude figure."""
+
+    error_sensor = np.asarray(
+        [
+            [
+                result.err_t_sensor_x_mm,
+                result.err_t_sensor_y_mm,
+                result.err_t_sensor_z_mm,
+            ]
+            for result in results
+            if np.all(
+                np.isfinite(
+                    [
+                        result.err_t_sensor_x_mm,
+                        result.err_t_sensor_y_mm,
+                        result.err_t_sensor_z_mm,
+                    ]
+                )
+            )
+        ],
+        dtype=float,
+    )
+    if error_sensor.size == 0:
+        return None
+
+    error_norm = np.linalg.norm(error_sensor, axis=1)
+    nonzero = error_norm > np.finfo(float).eps
+    if not np.any(nonzero):
+        return None
+    error_sensor = error_sensor[nonzero]
+    error_norm = error_norm[nonzero]
+    direction = error_sensor / error_norm[:, None]
+
+    azimuth = np.arctan2(direction[:, 1], direction[:, 0])
+    elevation = np.arcsin(np.clip(direction[:, 2], -1.0, 1.0))
+    gauge_axis_angle_deg = np.degrees(
+        np.arccos(np.clip(np.abs(direction[:, 2]), 0.0, 1.0))
+    )
+
+    from matplotlib import colors
+    from matplotlib.cm import ScalarMappable
+
+    magnitude_norm = colors.Normalize(
+        vmin=float(np.min(error_norm)),
+        vmax=max(float(np.max(error_norm)), float(np.min(error_norm)) + 1e-12),
+    )
+    cmap = plt.get_cmap("viridis")
+
+    fig = plt.figure(figsize=(14.2, 5.8), constrained_layout=True)
+    grid = fig.add_gridspec(1, 2, width_ratios=(1.2, 1.0))
+    ax_direction = fig.add_subplot(grid[0, 0], projection="mollweide")
+    ax_alignment = fig.add_subplot(grid[0, 1])
+
+    ax_direction.scatter(
+        azimuth,
+        elevation,
+        c=error_norm,
+        cmap=cmap,
+        norm=magnitude_norm,
+        s=34,
+        alpha=0.80,
+        edgecolors="white",
+        linewidths=0.4,
+    )
+    ax_direction.scatter(
+        [0.0, 0.0],
+        [np.pi / 2.0, -np.pi / 2.0],
+        marker="*",
+        s=120,
+        color="#d62728",
+        edgecolors="white",
+        linewidths=0.7,
+        label=r"sensor $\pm Z$ gauge axes",
+        zorder=5,
+    )
+    ax_direction.set_title(
+        "(a) Translation-error direction in the true sensor frame\n"
+        "longitude = XY azimuth; latitude = elevation",
+        pad=18,
+    )
+    ax_direction.grid(True, alpha=0.28)
+    ax_direction.legend(loc="lower center", bbox_to_anchor=(0.5, -0.18), fontsize=8)
+
+    positive_z = direction[:, 2] >= 0.0
+    for mask, marker, label, color in (
+        (positive_z, "^", r"toward sensor $+Z$", "#4c78a8"),
+        (~positive_z, "v", r"toward sensor $-Z$", "#f58518"),
+    ):
+        if np.any(mask):
+            ax_alignment.scatter(
+                gauge_axis_angle_deg[mask],
+                error_norm[mask],
+                marker=marker,
+                s=38,
+                color=color,
+                alpha=0.72,
+                edgecolors="white",
+                linewidths=0.45,
+                label=label,
+            )
+    ax_alignment.axvspan(0.0, 15.0, color="#d62728", alpha=0.08)
+    ax_alignment.axvline(
+        15.0,
+        color="#d62728",
+        linestyle="--",
+        linewidth=1.2,
+        label=r"15$^\circ$ gauge-alignment threshold",
+    )
+    median_angle = float(np.median(gauge_axis_angle_deg))
+    median_norm = float(np.median(error_norm))
+    ax_alignment.scatter(
+        [median_angle],
+        [median_norm],
+        marker="X",
+        s=125,
+        color="black",
+        edgecolors="white",
+        linewidths=0.8,
+        label="median angle / magnitude",
+        zorder=6,
+    )
+    if float(np.max(error_norm)) / float(np.min(error_norm)) > 20.0:
+        ax_alignment.set_yscale("log")
+    ax_alignment.set_xlim(0.0, 90.0)
+    ax_alignment.set_xlabel(r"Angle to nearest sensor $\pm Z$ axis [deg]")
+    ax_alignment.set_ylabel(r"Translation error magnitude $\|\Delta t\|$ [mm]")
+    ax_alignment.set_title("(b) Gauge-axis alignment versus error magnitude")
+    ax_alignment.grid(True, which="both", alpha=0.28)
+    ax_alignment.legend(loc="best", fontsize=8)
+
+    aligned_fraction = 100.0 * float(np.mean(gauge_axis_angle_deg <= 15.0))
+    ax_alignment.text(
+        0.98,
+        0.03,
+        f"N = {len(error_norm)}\n"
+        f"median magnitude = {median_norm:.4g} mm\n"
+        f"median axis angle = {median_angle:.3g}°\n"
+        f"within 15° of ±Z = {aligned_fraction:.1f}%",
+        transform=ax_alignment.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        bbox={
+            "boxstyle": "round,pad=0.35",
+            "facecolor": "white",
+            "alpha": 0.88,
+        },
+    )
+
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=magnitude_norm, cmap=cmap),
+        ax=ax_direction,
+        orientation="horizontal",
+        shrink=0.72,
+        pad=0.12,
+    )
+    colorbar.set_label(r"Translation error magnitude $\|\Delta t\|$ [mm]")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_translation_error_direction_intuitive_plot(
+    results: list[SinglePlaneTrialResult],
+    out_path: Path,
+) -> Path | None:
+    """Save a compact gauge-versus-transverse translation direction plot."""
+    rows = [
+        result
+        for result in results
+        if np.all(
+            np.isfinite(
+                [
+                    result.err_t_sensor_x_mm,
+                    result.err_t_sensor_y_mm,
+                    result.err_t_sensor_z_mm,
+                ]
+            )
+        )
+    ]
+    if not rows:
+        return None
+
+    error_sensor = np.asarray(
+        [
+            [
+                result.err_t_sensor_x_mm,
+                result.err_t_sensor_y_mm,
+                result.err_t_sensor_z_mm,
+            ]
+            for result in rows
+        ],
+        dtype=float,
+    )
+    error_z = error_sensor[:, 2]
+    transverse = np.linalg.norm(error_sensor[:, :2], axis=1)
+    error_norm = np.linalg.norm(error_sensor, axis=1)
+    axis_angle_deg = np.degrees(np.arctan2(transverse, np.abs(error_z)))
+
+    from matplotlib import colors
+    from matplotlib.patches import Wedge
+
+    color_upper = max(float(np.max(error_norm)), np.finfo(float).eps)
+    color_norm = colors.Normalize(vmin=0.0, vmax=color_upper)
+    cmap = plt.get_cmap("viridis")
+
+    fig, (ax_map, ax_ruler) = plt.subplots(
+        1,
+        2,
+        figsize=(14.5, 6.0),
+        gridspec_kw={"width_ratios": [1.08, 1.0]},
+        constrained_layout=True,
+    )
+
+    # Left: collapse sensor XY azimuth and retain exactly the gauge-relevant
+    # signed-Z versus transverse decomposition. Each trial is a literal arrow.
+    radius = max(float(np.max(error_norm)) * 1.16, 1e-6)
+    ax_map.add_patch(
+        Wedge(
+            (0.0, 0.0), radius, 0.0, 15.0,
+            facecolor="#ef6f6c", alpha=0.14, edgecolor="none",
+        )
+    )
+    ax_map.add_patch(
+        Wedge(
+            (0.0, 0.0), radius, 165.0, 180.0,
+            facecolor="#ef6f6c", alpha=0.14, edgecolor="none",
+        )
+    )
+    ax_map.add_patch(
+        Wedge(
+            (0.0, 0.0), radius, 75.0, 105.0,
+            facecolor="#6baed6", alpha=0.14, edgecolor="none",
+        )
+    )
+    for angle_deg in (15.0, 45.0, 75.0):
+        for direction_deg in (angle_deg, 180.0 - angle_deg):
+            direction_rad = np.deg2rad(direction_deg)
+            ax_map.plot(
+                [0.0, radius * np.cos(direction_rad)],
+                [0.0, radius * np.sin(direction_rad)],
+                linestyle="--",
+                linewidth=0.85,
+                color="0.60",
+                alpha=0.75,
+            )
+
+    arrow_plot = ax_map.quiver(
+        np.zeros(len(rows)),
+        np.zeros(len(rows)),
+        error_z,
+        transverse,
+        error_norm,
+        cmap=cmap,
+        norm=color_norm,
+        angles="xy",
+        scale_units="xy",
+        scale=1.0,
+        width=0.0045,
+        headwidth=4.0,
+        headlength=5.0,
+        alpha=0.62,
+    )
+    ax_map.scatter(
+        error_z,
+        transverse,
+        c=error_norm,
+        cmap=cmap,
+        norm=color_norm,
+        s=35,
+        edgecolors="white",
+        linewidths=0.55,
+        zorder=4,
+    )
+    ax_map.scatter(0.0, 0.0, marker="o", s=45, color="0.15", zorder=5)
+    ax_map.axhline(0.0, color="0.25", linewidth=1.0)
+    ax_map.axvline(0.0, color="0.55", linewidth=0.8)
+    ax_map.set_xlim(-radius, radius)
+    ax_map.set_ylim(0.0, radius)
+    ax_map.set_aspect("equal", adjustable="box")
+    ax_map.set_xlabel(
+        r"Signed sensor-Z error $\Delta t_{S,z}$ [mm]"
+        "\n← −sensor-Z                         +sensor-Z →"
+    )
+    ax_map.set_ylabel(
+        r"Transverse error $\sqrt{\Delta t_{S,x}^2+\Delta t_{S,y}^2}$ [mm]"
+    )
+    ax_map.set_title("A  Where does the translation error point?", loc="left")
+    ax_map.text(
+        0.0,
+        radius * 0.96,
+        "sensor XY direction (90°)",
+        ha="center",
+        va="top",
+        color="#2171b5",
+        fontsize=10,
+        weight="bold",
+    )
+    ax_map.text(
+        radius * 0.70,
+        radius * 0.055,
+        "gauge-aligned",
+        ha="center",
+        color="#b22222",
+        fontsize=9,
+    )
+    ax_map.text(
+        -radius * 0.70,
+        radius * 0.055,
+        "gauge-aligned",
+        ha="center",
+        color="#b22222",
+        fontsize=9,
+    )
+    ax_map.grid(True, alpha=0.18)
+
+    # Right: a one-dimensional direction ruler. Vertical jitter only separates
+    # overlapping trials and carries no physical meaning.
+    ax_ruler.axvspan(0.0, 15.0, color="#ef6f6c", alpha=0.16)
+    ax_ruler.axvspan(15.0, 45.0, color="#f6bd60", alpha=0.12)
+    ax_ruler.axvspan(45.0, 75.0, color="0.75", alpha=0.10)
+    ax_ruler.axvspan(75.0, 90.0, color="#6baed6", alpha=0.16)
+    jitter_rng = np.random.default_rng(0)
+    jitter = jitter_rng.uniform(-0.24, 0.24, size=len(rows))
+    positive_z = error_z >= 0.0
+    for mask, marker, label in (
+        (positive_z, ">", "+sensor-Z component"),
+        (~positive_z, "<", "−sensor-Z component"),
+    ):
+        if np.any(mask):
+            ax_ruler.scatter(
+                axis_angle_deg[mask],
+                jitter[mask],
+                c=error_norm[mask],
+                cmap=cmap,
+                norm=color_norm,
+                marker=marker,
+                s=62,
+                edgecolors="white",
+                linewidths=0.6,
+                alpha=0.86,
+                label=label,
+                zorder=3,
+            )
+    median_angle = float(np.median(axis_angle_deg))
+    ax_ruler.axvline(
+        median_angle,
+        color="#d62728",
+        linestyle="--",
+        linewidth=2.2,
+        label=f"median = {median_angle:.2f}°",
+    )
+    # Small margins keep markers at the meaningful 0/90-degree boundaries from
+    # being clipped while the labeled ruler itself remains 0..90 degrees.
+    ax_ruler.set_xlim(-2.0, 92.0)
+    ax_ruler.set_ylim(-0.42, 0.42)
+    ax_ruler.set_xticks([0, 15, 30, 45, 60, 75, 90])
+    ax_ruler.set_yticks([])
+    ax_ruler.set_xlabel(
+        "Angle to nearest ±sensor-Z axis [deg]\n"
+        "0° = gauge direction                         90° = sensor XY"
+    )
+    ax_ruler.set_title("B  Direction ruler (one marker per trial)", loc="left")
+    ax_ruler.text(
+        7.5, 0.35, "gauge", ha="center", color="#b22222", weight="bold"
+    )
+    ax_ruler.text(
+        82.5, 0.35, "transverse", ha="center", color="#2171b5", weight="bold"
+    )
+    ax_ruler.grid(True, axis="x", alpha=0.22)
+    ax_ruler.legend(loc="lower center", ncol=1, framealpha=0.94)
+
+    colorbar = fig.colorbar(arrow_plot, ax=[ax_map, ax_ruler], shrink=0.82)
+    colorbar.set_label(r"Total translation error $\|\Delta t\|$ [mm]")
+
+    within_15 = 100.0 * float(np.mean(axis_angle_deg <= 15.0))
+    fig.suptitle(
+        "Optimal single-plane translation-error direction — quick view\n"
+        f"trials={len(rows)} | median error={np.median(error_norm):.4g} mm | "
+        f"median direction={median_angle:.2f}° | gauge-aligned (≤15°)={within_15:.1f}%",
+        fontsize=14.5,
+    )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=210, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_translation_error_direction_html(
+    results: list[SinglePlaneTrialResult],
+    out_path: Path,
+) -> Path | None:
+    """Save interactive 3-D translation-error vectors in the true sensor frame."""
+    rows = [
+        result
+        for result in results
+        if np.all(
+            np.isfinite(
+                [
+                    result.err_t_sensor_x_mm,
+                    result.err_t_sensor_y_mm,
+                    result.err_t_sensor_z_mm,
+                ]
+            )
+        )
+    ]
+    if not rows:
+        return None
+
+    import plotly.graph_objects as go
+
+    errors = np.asarray(
+        [
+            [
+                result.err_t_sensor_x_mm,
+                result.err_t_sensor_y_mm,
+                result.err_t_sensor_z_mm,
+            ]
+            for result in rows
+        ],
+        dtype=float,
+    )
+    norms = np.linalg.norm(errors, axis=1)
+    transverse = np.linalg.norm(errors[:, :2], axis=1)
+    angles = np.degrees(np.arctan2(transverse, np.abs(errors[:, 2])))
+    scale = max(float(np.max(norms)) * 1.15, 1e-6)
+
+    figure = go.Figure()
+
+    line_x: list[float | None] = []
+    line_y: list[float | None] = []
+    line_z: list[float | None] = []
+    for error in errors:
+        line_x.extend([0.0, float(error[0]), None])
+        line_y.extend([0.0, float(error[1]), None])
+        line_z.extend([0.0, float(error[2]), None])
+    figure.add_trace(
+        go.Scatter3d(
+            x=line_x,
+            y=line_y,
+            z=line_z,
+            mode="lines",
+            line={"color": "rgba(70,70,70,0.42)", "width": 3},
+            name="Error vectors",
+            hoverinfo="skip",
+        )
+    )
+
+    customdata = np.column_stack(
+        [
+            np.asarray([result.system_idx for result in rows], dtype=int),
+            norms,
+            angles,
+        ]
+    )
+    figure.add_trace(
+        go.Scatter3d(
+            x=errors[:, 0],
+            y=errors[:, 1],
+            z=errors[:, 2],
+            mode="markers",
+            marker={
+                "size": 5,
+                "color": norms,
+                "colorscale": "Viridis",
+                "cmin": 0.0,
+                "cmax": max(float(np.max(norms)), np.finfo(float).eps),
+                "colorbar": {"title": "|Δt| [mm]"},
+                "line": {"color": "white", "width": 0.8},
+            },
+            customdata=customdata,
+            name="Trial endpoints",
+            hovertemplate=(
+                "system %{customdata[0]:.0f}<br>"
+                "sensor X: %{x:.5g} mm<br>"
+                "sensor Y: %{y:.5g} mm<br>"
+                "sensor Z: %{z:.5g} mm<br>"
+                "|Δt|: %{customdata[1]:.5g} mm<br>"
+                "angle to ±Z: %{customdata[2]:.3f}°"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Translucent 15-degree cones mark the two fixed-theta gauge directions.
+    axial = np.linspace(0.0, scale, 18)
+    azimuth = np.linspace(0.0, 2.0 * np.pi, 40)
+    axial_grid, azimuth_grid = np.meshgrid(axial, azimuth)
+    radial_grid = axial_grid * np.tan(np.deg2rad(15.0))
+    cone_x = radial_grid * np.cos(azimuth_grid)
+    cone_y = radial_grid * np.sin(azimuth_grid)
+    for sign, name in ((1.0, "+sensor-Z gauge cone"), (-1.0, "−sensor-Z gauge cone")):
+        figure.add_trace(
+            go.Surface(
+                x=cone_x,
+                y=cone_y,
+                z=sign * axial_grid,
+                surfacecolor=np.zeros_like(cone_x),
+                colorscale=[[0.0, "rgb(214,39,40)"], [1.0, "rgb(214,39,40)"]],
+                showscale=False,
+                opacity=0.10,
+                name=name,
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
+
+    axes = (
+        ("Sensor X", np.array([scale, 0.0, 0.0]), "red"),
+        ("Sensor Y", np.array([0.0, scale, 0.0]), "green"),
+        ("Sensor Z", np.array([0.0, 0.0, scale]), "blue"),
+    )
+    for name, endpoint, color in axes:
+        figure.add_trace(
+            go.Scatter3d(
+                x=[0.0, endpoint[0]],
+                y=[0.0, endpoint[1]],
+                z=[0.0, endpoint[2]],
+                mode="lines+text",
+                line={"color": color, "width": 7},
+                text=["", name],
+                textposition="top center",
+                name=name,
+                hoverinfo="skip",
+            )
+        )
+    figure.add_trace(
+        go.Scatter3d(
+            x=[0.0, 0.0],
+            y=[0.0, 0.0],
+            z=[-scale, scale],
+            mode="lines",
+            line={"color": "rgba(214,39,40,0.75)", "width": 6, "dash": "dash"},
+            name="±sensor-Z gauge axis",
+            hoverinfo="skip",
+        )
+    )
+
+    median_angle = float(np.median(angles))
+    within_15 = 100.0 * float(np.mean(angles <= 15.0))
+    figure.update_layout(
+        title={
+            "text": (
+                "Interactive optimal single-plane translation-error directions"
+                "<br><sup>true sensor frame | "
+                f"trials={len(rows)} | median error={np.median(norms):.4g} mm | "
+                f"median angle to ±Z={median_angle:.2f}° | "
+                f"within 15°={within_15:.1f}%</sup>"
+            ),
+            "x": 0.5,
+        },
+        scene={
+            "xaxis_title": "Sensor X error [mm]",
+            "yaxis_title": "Sensor Y error [mm]",
+            "zaxis_title": "Sensor Z error [mm]",
+            "aspectmode": "data",
+            "camera": {"eye": {"x": 1.5, "y": -1.5, "z": 1.2}},
+        },
+        legend={"itemsizing": "constant"},
+        width=1100,
+        height=850,
+        margin={"l": 20, "r": 20, "t": 90, "b": 20},
+    )
+
+    out_path = Path(out_path)
+    if out_path.suffix.lower() != ".html":
+        out_path = out_path.with_suffix(".html")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.write_html(out_path, include_plotlyjs="cdn", full_html=True)
     return out_path
 
 
@@ -1774,6 +2715,23 @@ def estimate_plane_from_handeye(
     return plane_n, plane_l
 
 
+def mean_plane_normal_sensor_z_dot(
+    scans: list[LaserScan],
+    T_ef_s: np.ndarray,
+    plane_normal_base: np.ndarray,
+) -> float:
+    """Return mean signed dot(n_plane, sensor +Z) across all scan poses."""
+    normal = np.asarray(plane_normal_base, dtype=float).reshape(3)
+    normal /= np.linalg.norm(normal)
+    dots = []
+    for scan in scans:
+        T_base_s = np.asarray(scan.T_base_ef, dtype=float) @ np.asarray(
+            T_ef_s, dtype=float
+        )
+        dots.append(float(normal @ T_base_s[:3, 2]))
+    return float(np.mean(dots)) if dots else float("nan")
+
+
 
 def _scan_param_number(
     param: dict,
@@ -2014,6 +2972,7 @@ def make_and_save_sensor_pose_plot(
     plane_center_xy_range_mm: float,
     plane_center_z_range_mm: tuple[float, float],
     scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None,
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
@@ -2042,6 +3001,7 @@ def make_and_save_sensor_pose_plot(
         noise_std=noise_std,
         check_reachability=check_reachability,
         scan_params=scan_params,
+        theta_by_line_deg=theta_by_line_deg,
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
@@ -2075,6 +3035,7 @@ def make_and_save_translation_gauge_plot(
     plane_center_xy_range_mm: float,
     plane_center_z_range_mm: tuple[float, float],
     scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None,
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
@@ -2148,6 +3109,7 @@ def make_and_save_translation_gauge_plot(
         noise_std=noise_std,
         check_reachability=check_reachability,
         scan_params=scan_params,
+        theta_by_line_deg=theta_by_line_deg,
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
@@ -2188,6 +3150,7 @@ def make_and_save_debug_scene_plot(
     plane_center_xy_range_mm: float,
     plane_center_z_range_mm: tuple[float, float],
     scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None,
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
@@ -2222,18 +3185,22 @@ def make_and_save_debug_scene_plot(
         noise_std=noise_std,
         check_reachability=check_reachability,
         scan_params=scan_params,
+        theta_by_line_deg=theta_by_line_deg,
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
     )
 
-    return save_plane_scene_plot(
-        T_ef_s_true=T_true,
-        scans_by_plane=scans_by_plane,
-        planes=[(plane_n, plane_l)],
-        out_path=out_path,
-        plane_size_mm=plane_size_mm,
-    )
+    plot_arguments = {
+        "T_ef_s_true": T_true,
+        "scans_by_plane": scans_by_plane,
+        "planes": [(plane_n, plane_l)],
+        "out_path": out_path,
+        "plane_size_mm": plane_size_mm,
+    }
+    if Path(out_path).suffix.lower() == ".html":
+        return save_plane_scene_plot_3d(**plot_arguments)
+    return save_plane_scene_plot(**plot_arguments)
 
 
 def run_one_trial(
@@ -2249,9 +3216,6 @@ def run_one_trial(
     init_translation_range_mm: float,
     init_angle_range_deg: float,
     plane_offset_mode: str,
-    linear_multistart: bool,
-    linear_multistart_threshold_mm: float,
-    linear_multistart_angle_deg: float,
     nonlinear_refine: bool,
     nonlinear_plane_mode: str,
     nonlinear_max_nfev: int,
@@ -2269,6 +3233,7 @@ def run_one_trial(
     plane_center_xy_range_mm: float,
     plane_center_z_range_mm: tuple[float, float],
     scan_params: list[dict],
+    theta_by_line_deg: tuple[float, ...] | None,
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
@@ -2304,6 +3269,7 @@ def run_one_trial(
         noise_std=noise_std,
         check_reachability=check_reachability,
         scan_params=scan_params,
+        theta_by_line_deg=theta_by_line_deg,
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
@@ -2316,7 +3282,10 @@ def run_one_trial(
             T_true=T_true,
             plane_n=plane_n,
             plane_l=plane_l,
-            expected_scan_count=9 * len(scan_params) + reference_scan_count,
+            expected_scan_count=(
+                _nominal_target_scan_count(scan_params, theta_by_line_deg)
+                + reference_scan_count
+            ),
             noise_std=noise_std,
             scan_params=scan_params,
         )
@@ -2331,10 +3300,9 @@ def run_one_trial(
     nonlinear_final_rms_mm = float("nan")
     nonlinear_delta_translation_mm = float("nan")
     nonlinear_delta_rotation_deg = float("nan")
-    linear_multistart_used = False
-    linear_start_count = 1
     final_linear_plane_rms_mm = float("nan")
     T_init: np.ndarray | None = None
+    history_initial_T: np.ndarray | None = None
     solver_result: object | None = None
     offset_anchor_applied = False
     offset_anchor_plane: tuple[np.ndarray, float] | None = None
@@ -2348,6 +3316,9 @@ def run_one_trial(
         rank_last = -1
         cond_last = float("nan")
         transform_history = [T_linear]
+        plane_rms_history_mm = [
+            _final_self_fit_plane_rms_mm(scans_by_plane, T_linear)
+        ]
 
         if nonlinear_refine:
             nonlinear_result = refine_handeye_nonlinear(
@@ -2374,6 +3345,9 @@ def run_one_trial(
                 nonlinear_result.delta_rotation_deg
             )
             transform_history.append(T_est)
+            plane_rms_history_mm.append(
+                _final_self_fit_plane_rms_mm(scans_by_plane, T_est)
+            )
 
         iter_T_frob_error = iter_frobenius_error(transform_history, T_true)
 
@@ -2387,6 +3361,7 @@ def run_one_trial(
             translation_range_mm=init_translation_range_mm,
             angle_range_deg=init_angle_range_deg,
         )
+        history_initial_T = T_init
 
         init_trans_err_norm_mm = float(
             np.linalg.norm(T_init[:3, 3] - T_true[:3, 3])
@@ -2407,50 +3382,6 @@ def run_one_trial(
             scans_by_plane,
             result.T_ef_s,
         )
-        if (
-            linear_multistart
-            and final_linear_plane_rms_mm
-            > float(linear_multistart_threshold_mm)
-        ):
-            linear_multistart_used = True
-            candidates = [result]
-            for retry_init in _linear_retry_initial_guesses(
-                T_init,
-                linear_multistart_angle_deg,
-            ):
-                linear_start_count += 1
-                try:
-                    candidates.append(
-                        calibrate_planes(
-                            scans_by_plane,
-                            T_init=retry_init,
-                            max_iter=max_iter,
-                            tol=tol,
-                            plane_offset_mode=plane_offset_mode,
-                        )
-                    )
-                except np.linalg.LinAlgError:
-                    continue
-            candidate_rms = [
-                _final_self_fit_plane_rms_mm(
-                    scans_by_plane,
-                    candidate.T_ef_s,
-                )
-                for candidate in candidates
-            ]
-            eligible_indices = [
-                index
-                for index, candidate in enumerate(candidates)
-                if candidate.converged
-            ]
-            if not eligible_indices:
-                eligible_indices = list(range(len(candidates)))
-            selected_index = min(
-                eligible_indices,
-                key=lambda index: candidate_rms[index],
-            )
-            result = candidates[selected_index]
-            final_linear_plane_rms_mm = float(candidate_rms[selected_index])
         solver_result = result
 
         T_est = result.T_ef_s
@@ -2490,6 +3421,9 @@ def run_one_trial(
                 }
             )
             transform_history.append(T_est)
+            plane_rms_history_mm.append(
+                _final_self_fit_plane_rms_mm(scans_by_plane, T_est)
+            )
             offset_anchor_applied = True
 
         if nonlinear_refine:
@@ -2552,15 +3486,65 @@ def run_one_trial(
                 nonlinear_result.delta_rotation_deg
             )
             transform_history.append(T_est)
+            plane_rms_history_mm.append(
+                _final_self_fit_plane_rms_mm(scans_by_plane, T_est)
+            )
 
         iter_T_frob_error = iter_frobenius_error(
             transform_history,
             T_true,
-            T_initial=T_init,
+            T_initial=history_initial_T,
         )
 
     else:
         raise ValueError("mode must be 'known' or 'unknown'")
+
+    transform_states = list(transform_history)
+    if history_initial_T is not None:
+        transform_states.insert(0, history_initial_T)
+    component_histories = transform_error_component_histories(
+        transform_states,
+        T_true,
+    )
+    cached_plane_states: list[tuple[np.ndarray, float]] = []
+    if solver_result is not None:
+        cached_normals = getattr(solver_result, "plane_normals_history", [])
+        cached_offsets = getattr(solver_result, "plane_offsets_history", [])
+        for normals, offsets in zip(cached_normals, cached_offsets):
+            if normals and offsets:
+                cached_plane_states.append((normals[0], float(offsets[0])))
+
+    iter_plane_offset_estimate_mm: list[float] = []
+    iter_plane_offset_error_mm: list[float] = []
+    iter_err_t_sensor_z_mm: list[float] = []
+    iter_normal_sensor_z_dot_mean: list[float] = []
+    for state_index, transform in enumerate(transform_states):
+        if state_index < len(cached_plane_states):
+            estimated_plane = cached_plane_states[state_index]
+        else:
+            estimated_plane = estimate_plane_from_handeye(
+                scans=scans_by_plane[0],
+                T_ef_s=transform,
+            )
+        estimated_normal, estimated_offset = _align_plane_representation(
+            estimated_plane,
+            plane_n,
+        )
+        iter_plane_offset_estimate_mm.append(float(estimated_offset))
+        iter_plane_offset_error_mm.append(float(estimated_offset - plane_l))
+        state_gauge = translation_error_sensor_z_components(transform, T_true)
+        iter_err_t_sensor_z_mm.append(float(state_gauge["error_sensor"][2]))
+        iter_normal_sensor_z_dot_mean.append(
+            mean_plane_normal_sensor_z_dot(
+                scans_by_plane[0],
+                transform,
+                estimated_normal,
+            )
+        )
+
+    estimated_plane_offset_mm = float(iter_plane_offset_estimate_mm[-1])
+    plane_offset_error_mm = float(iter_plane_offset_error_mm[-1])
+    normal_sensor_z_dot_mean = float(iter_normal_sensor_z_dot_mean[-1])
 
     if debug_diagnostics:
         print_solver_diagnostics(
@@ -2583,6 +3567,7 @@ def run_one_trial(
         T_est[:3, :3],
         T_true[:3, :3],
     )
+    rotation_error_sensor = T_true[:3, :3].T @ rotation_vector_error
     paper_success = bool(
         converged
         and iterations <= 2000
@@ -2613,6 +3598,12 @@ def run_one_trial(
         err_tx_mm=float(translation_error[0]),
         err_ty_mm=float(translation_error[1]),
         err_tz_mm=float(translation_error[2]),
+        err_t_sensor_x_mm=float(gauge_components["error_sensor"][0]),
+        err_t_sensor_y_mm=float(gauge_components["error_sensor"][1]),
+        err_t_sensor_z_mm=float(gauge_components["error_sensor"][2]),
+        err_r_sensor_x_deg=float(rotation_error_sensor[0]),
+        err_r_sensor_y_deg=float(rotation_error_sensor[1]),
+        err_r_sensor_z_deg=float(rotation_error_sensor[2]),
         err_rx_deg=float(rotation_vector_error[0]),
         err_ry_deg=float(rotation_vector_error[1]),
         err_rz_deg=float(rotation_vector_error[2]),
@@ -2626,9 +3617,11 @@ def run_one_trial(
         gauge_parallel_fraction=float(
             gauge_components["parallel_fraction"]
         ),
+        estimated_plane_offset_mm=estimated_plane_offset_mm,
+        ground_truth_plane_offset_mm=float(plane_l),
+        plane_offset_error_mm=plane_offset_error_mm,
+        normal_sensor_z_dot_mean=normal_sensor_z_dot_mean,
         paper_success=paper_success,
-        linear_multistart_used=linear_multistart_used,
-        linear_start_count=linear_start_count,
         final_linear_plane_rms_mm=final_linear_plane_rms_mm,
         init_trans_err_norm_mm=init_trans_err_norm_mm,
         init_rot_err_angle_deg=init_rot_err_angle_deg,
@@ -2641,6 +3634,22 @@ def run_one_trial(
         nonlinear_delta_rotation_deg=nonlinear_delta_rotation_deg,
         plane_rms_history_mm=plane_rms_history_mm,
         iter_T_frob_error=iter_T_frob_error,
+        iter_translation_error_norm_mm=component_histories[
+            "translation_norm_mm"
+        ],
+        iter_rotation_geodesic_error_deg=component_histories[
+            "rotation_geodesic_deg"
+        ],
+        iter_gauge_parallel_abs_error_mm=component_histories[
+            "gauge_parallel_abs_mm"
+        ],
+        iter_gauge_perpendicular_error_mm=component_histories[
+            "gauge_perpendicular_mm"
+        ],
+        iter_plane_offset_estimate_mm=iter_plane_offset_estimate_mm,
+        iter_plane_offset_error_mm=iter_plane_offset_error_mm,
+        iter_err_t_sensor_z_mm=iter_err_t_sensor_z_mm,
+        iter_normal_sensor_z_dot_mean=iter_normal_sensor_z_dot_mean,
     )
 
 
@@ -2667,7 +3676,27 @@ def main() -> None:
         type=float,
         nargs="+",
         default=[30.0],
-        help="projection angles theta in degrees",
+        help=(
+            "projection-angle pool used on every line unless "
+            "--theta-by-line-deg is provided"
+        ),
+    )
+    parser.add_argument(
+        "--theta-by-line-deg",
+        type=float,
+        nargs=9,
+        default=None,
+        metavar=(
+            "THETA_L0", "THETA_L1", "THETA_L2",
+            "THETA_L3", "THETA_L4", "THETA_L5",
+            "THETA_L6", "THETA_L7", "THETA_L8",
+        ),
+        help=(
+            "theta assigned to circular lines 0..8 (phi=0,40,...,320 deg). "
+            "Each line retains only its assigned theta, so using multiple "
+            "theta values does not multiply the retained scan count. Example: "
+            "--theta-by-line-deg 30 60 30 60 30 60 30 60 30"
+        ),
     )
     parser.add_argument(
         "--beta-deg",
@@ -2756,30 +3785,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--linear-multistart",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "retry six deterministic linear starts only when the first "
-            "alternating solve has a high plane residual; this is a linear "
-            "PCA-basin safeguard, not nonlinear refinement"
-        ),
-    )
-    parser.add_argument(
-        "--linear-multistart-threshold-mm",
-        type=float,
-        default=None,
-        help=(
-            "trigger residual for linear multistart; default is "
-            "max(1 mm, 3*noise_std)"
-        ),
-    )
-    parser.add_argument(
-        "--linear-multistart-angle-deg",
-        type=float,
-        default=30.0,
-    )
-    parser.add_argument(
         "--nonlinear-refine",
         action="store_true",
         help="run a final six-parameter SE(3) nonlinear least-squares refinement",
@@ -2809,7 +3814,17 @@ def main() -> None:
         type=Path,
         default=Path("single_plane_optimal_benchmark.csv"),
     )
-    parser.add_argument("--debug-scene-plot", type=Path, default=None)
+    parser.add_argument("--summary-csv", type=Path, default=None)
+    parser.add_argument("--failures-csv", type=Path, default=None)
+    parser.add_argument(
+        "--debug-scene-plot",
+        type=Path,
+        default=None,
+        help=(
+            "save one representative optimal scene; use a .html suffix for "
+            "interactive Plotly 3-D or an image suffix for the static plot"
+        ),
+    )
     parser.add_argument("--debug-scene-seed", type=int, default=None)
     parser.add_argument("--debug-scene-plane-size", type=float, default=700.0)
     parser.add_argument(
@@ -2899,20 +3914,10 @@ def main() -> None:
 
     if args.reference_scans < 0:
         parser.error("--reference-scans must be non-negative")
-    if args.linear_multistart_angle_deg <= 0.0:
-        parser.error("--linear-multistart-angle-deg must be positive")
     if args.debug_gauge_span_mm <= 0.0:
         parser.error("--debug-gauge-span-mm must be positive")
     if args.debug_gauge_samples < 3:
         parser.error("--debug-gauge-samples must be at least 3")
-    linear_multistart_threshold_mm = (
-        max(1.0, 3.0 * float(args.noise_std))
-        if args.linear_multistart_threshold_mm is None
-        else float(args.linear_multistart_threshold_mm)
-    )
-    if linear_multistart_threshold_mm <= 0.0:
-        parser.error("--linear-multistart-threshold-mm must be positive")
-
     plane_center_z_range_mm = (
         args.plane_center_z_min_mm,
         args.plane_center_z_max_mm,
@@ -2924,9 +3929,21 @@ def main() -> None:
         args.profile_points,
     )
 
+    theta_by_line_deg = _validate_theta_by_line(
+        None
+        if args.theta_by_line_deg is None
+        else tuple(args.theta_by_line_deg)
+    )
+    if theta_by_line_deg is None:
+        target_theta_pool = tuple(float(value) for value in args.theta_deg)
+    else:
+        # Generate the union once, then retain one theta per line. dict preserves
+        # command-line order while removing duplicate theta values.
+        target_theta_pool = tuple(dict.fromkeys(theta_by_line_deg))
+
     scan_params = make_scan_params(
         heights_mm=tuple(args.heights_mm),
-        theta_deg=tuple(args.theta_deg),
+        theta_deg=target_theta_pool,
         beta_deg=tuple(args.beta_deg),
     )
     reference_scan_params = make_scan_params(
@@ -2934,9 +3951,17 @@ def main() -> None:
         theta_deg=(float(args.reference_theta_deg),),
         beta_deg=tuple(args.reference_beta_deg),
     )
-    nominal_scan_count = 9 * len(scan_params) + args.reference_scans
+    nominal_scan_count = (
+        _nominal_target_scan_count(scan_params, theta_by_line_deg)
+        + args.reference_scans
+    )
+    incidence_source = (
+        theta_by_line_deg
+        if theta_by_line_deg is not None
+        else tuple(args.theta_deg)
+    )
     incidence_magnitudes = {
-        round(abs(float(value)), 12) for value in args.theta_deg
+        round(abs(float(value)), 12) for value in incidence_source
     }
     if args.reference_scans > 0:
         incidence_magnitudes.add(
@@ -2974,6 +3999,7 @@ def main() -> None:
             plane_center_xy_range_mm=args.plane_center_xy_range_mm,
             plane_center_z_range_mm=plane_center_z_range_mm,
             scan_params=scan_params,
+            theta_by_line_deg=theta_by_line_deg,
             pose_geometry=args.pose_geometry,
             reference_scan_params=reference_scan_params,
             reference_scan_count=args.reference_scans,
@@ -3000,6 +4026,7 @@ def main() -> None:
             plane_center_xy_range_mm=args.plane_center_xy_range_mm,
             plane_center_z_range_mm=plane_center_z_range_mm,
             scan_params=scan_params,
+            theta_by_line_deg=theta_by_line_deg,
             pose_geometry=args.pose_geometry,
             reference_scan_params=reference_scan_params,
             reference_scan_count=args.reference_scans,
@@ -3028,6 +4055,7 @@ def main() -> None:
                 plane_center_xy_range_mm=args.plane_center_xy_range_mm,
                 plane_center_z_range_mm=plane_center_z_range_mm,
                 scan_params=scan_params,
+                theta_by_line_deg=theta_by_line_deg,
                 pose_geometry=args.pose_geometry,
                 reference_scan_params=reference_scan_params,
                 reference_scan_count=args.reference_scans,
@@ -3060,6 +4088,7 @@ def main() -> None:
 
     results: list[SinglePlaneTrialResult] = []
     failures = 0
+    failure_records: list[dict[str, object]] = []
     first_failure: str | None = None
     start_time = time.perf_counter()
     log_every = max(1, args.log_every)
@@ -3070,15 +4099,23 @@ def main() -> None:
             f"nominal_scans={nominal_scan_count} | noise={args.noise_std} mm | "
             f"init_mode={args.init_mode} | nonlinear={args.nonlinear_refine} "
             f"({args.nonlinear_plane_mode}) | offset_mode={args.plane_offset_mode} | "
-            f"linear_multistart={args.linear_multistart} "
-            f"(trigger>{linear_multistart_threshold_mm:g} mm) | "
             f"fix_true_plane_offset={args.fix_true_plane_offset}"
         )
         print(
             f"[single-plane-optimal] grid | d={tuple(args.heights_mm)} | "
-            f"theta={tuple(args.theta_deg)} | beta={tuple(args.beta_deg)} | "
-            f"combinations={len(scan_params)} | geometry={args.pose_geometry}"
+            f"theta_pool={target_theta_pool} | beta={tuple(args.beta_deg)} | "
+            f"generated_combinations={len(scan_params)} | "
+            f"retained_target_scans={nominal_scan_count - args.reference_scans} | "
+            f"geometry={args.pose_geometry}"
         )
+        if theta_by_line_deg is not None:
+            print(
+                "[single-plane-optimal] theta by line | "
+                + ", ".join(
+                    f"L{line_id}(phi={40 * line_id}deg):{theta:g}deg"
+                    for line_id, theta in enumerate(theta_by_line_deg)
+                )
+            )
         print(
             "[single-plane-optimal] observability extension | "
             f"reference_scans={args.reference_scans} | "
@@ -3115,9 +4152,6 @@ def main() -> None:
                 init_translation_range_mm=args.init_translation_range_mm,
                 init_angle_range_deg=args.init_angle_range_deg,
                 plane_offset_mode=args.plane_offset_mode,
-                linear_multistart=args.linear_multistart,
-                linear_multistart_threshold_mm=linear_multistart_threshold_mm,
-                linear_multistart_angle_deg=args.linear_multistart_angle_deg,
                 nonlinear_refine=args.nonlinear_refine,
                 nonlinear_plane_mode=args.nonlinear_plane_mode,
                 nonlinear_max_nfev=args.nonlinear_max_nfev,
@@ -3135,6 +4169,7 @@ def main() -> None:
                 plane_center_xy_range_mm=args.plane_center_xy_range_mm,
                 plane_center_z_range_mm=plane_center_z_range_mm,
                 scan_params=scan_params,
+                theta_by_line_deg=theta_by_line_deg,
                 pose_geometry=args.pose_geometry,
                 reference_scan_params=reference_scan_params,
                 reference_scan_count=args.reference_scans,
@@ -3148,15 +4183,15 @@ def main() -> None:
                 init_rng=init_rng,
             )
             results.append(result)
-            if args.verbose and result.linear_multistart_used:
-                print(
-                    f"[trial {system_idx:04d}] linear multistart selected | "
-                    f"starts={result.linear_start_count} | "
-                    "final_plane_rms="
-                    f"{result.final_linear_plane_rms_mm:.6g} mm"
-                )
         except Exception as exc:
             failures += 1
+            failure_records.append(
+                {
+                    "system_idx": system_idx,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
             if first_failure is None:
                 first_failure = f"{type(exc).__name__}: {exc}"
             if args.verbose or args.debug_diagnostics:
@@ -3203,13 +4238,35 @@ def main() -> None:
         )
 
     print_calibration_summary(results)
+    summary_csv = args.summary_csv or args.csv.with_name(
+        f"{args.csv.stem}_summary.csv"
+    )
+    failures_csv = args.failures_csv or args.csv.with_name(
+        f"{args.csv.stem}_failures.csv"
+    )
+    save_experiment_summary_csv(
+        results,
+        summary_csv,
+        requested_systems=args.systems,
+        failed_systems=failures,
+        config={
+            **vars(args),
+            "elapsed_seconds": time.perf_counter() - start_time,
+        },
+    )
+    save_failures_csv(failure_records, failures_csv)
+    print(f"saved summary: {summary_csv}")
+    print(f"saved failures: {failures_csv}")
     if not results:
         if first_failure is not None:
             print(f"first failure: {first_failure}")
         raise SystemExit(2)
 
     save_results_csv(results, args.csv)
-    print(f"saved: {args.csv}")
+    print(f"saved trials: {args.csv}")
+    iterations_csv = args.csv.with_name(f"{args.csv.stem}_iterations.csv")
+    save_iteration_history_csv(results, iterations_csv)
+    print(f"saved iterations: {iterations_csv}")
 
     finite_gauge_angles = np.asarray(
         [
@@ -3244,14 +4301,12 @@ def main() -> None:
         if args.plot_dir is not None
         else args.csv.parent / f"{args.csv.stem}_plots"
     )
-    for path in save_calibration_plots(results, plot_dir):
-        print(f"saved plot: {path}")
-    error_direction_path = save_translation_error_direction_plot(
+    for path in save_calibration_plots(
         results,
-        plot_dir / "translation_error_vs_sensor_z_gauge.png",
-    )
-    if error_direction_path is not None:
-        print(f"saved plot: {error_direction_path}")
+        plot_dir,
+        sensor_noise_std_mm=args.noise_std,
+    ):
+        print(f"saved plot: {path}")
 
 
 if __name__ == "__main__":

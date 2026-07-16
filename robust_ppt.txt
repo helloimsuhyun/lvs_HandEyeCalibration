@@ -1,0 +1,4 @@
+1. three orthogonal plane
+PYTHONPATH=. python examples/run_three_plane_benchmark.py   --systems 100   --seed 7   --mode unknown   --poses-per-plane 35   --profile-points 100   --noise-std 0.5   --plane-offset-mode fitted   --init-mode carlson   --init-translation-range-mm 200   --init-angle-range-deg 30   --max-iter 500   --tol 1e-6   --csv results/three_plane_fitted.csv   --verbose
+
+2.

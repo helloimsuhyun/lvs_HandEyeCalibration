@@ -9,8 +9,12 @@ import numpy as np
 
 from laser_handeye.benchmark_analysis import (
     iter_frobenius_error,
+    iter_physical_transform_errors,
     print_calibration_summary,
     save_calibration_plots,
+    save_experiment_summary_csv,
+    save_failures_csv,
+    save_iteration_history_csv,
     save_plane_scene_plot,
     save_results_csv,
 )
@@ -49,9 +53,15 @@ class SinglePlaneTrialResult:
     err_tx_mm: float
     err_ty_mm: float
     err_tz_mm: float
+    err_t_sensor_x_mm: float
+    err_t_sensor_y_mm: float
+    err_t_sensor_z_mm: float
     err_rx_deg: float
     err_ry_deg: float
     err_rz_deg: float
+    err_r_sensor_x_deg: float
+    err_r_sensor_y_deg: float
+    err_r_sensor_z_deg: float
     paper_success: bool
     init_trans_err_norm_mm: float
     init_rot_err_angle_deg: float
@@ -64,6 +74,8 @@ class SinglePlaneTrialResult:
     nonlinear_delta_rotation_deg: float = float("nan")
     plane_rms_history_mm: list[float] = field(default_factory=list)
     iter_T_frob_error: list[float] = field(default_factory=list)
+    iter_translation_error_norm_mm: list[float] = field(default_factory=list)
+    iter_rotation_geodesic_error_deg: list[float] = field(default_factory=list)
 
 def sample_random_plane(
     rng: np.random.Generator,
@@ -472,11 +484,20 @@ def run_one_trial(
     else:
         raise ValueError("mode must be 'known' or 'unknown'")
 
+    iter_translation_error_norm_mm, iter_rotation_geodesic_error_deg = (
+        iter_physical_transform_errors(
+            transform_history,
+            T_true,
+            T_initial=T_init if mode == "unknown" else None,
+        )
+    )
     translation_error = T_est[:3, 3] - T_true[:3, 3]
     rotation_vector_error = rotation_vector_error_deg(
         T_est[:3, :3],
         T_true[:3, :3],
     )
+    translation_error_sensor = T_true[:3, :3].T @ translation_error
+    rotation_error_sensor = T_true[:3, :3].T @ rotation_vector_error
     paper_success = bool(
         converged
         and np.all(np.abs(translation_error) < 0.01)
@@ -501,9 +522,15 @@ def run_one_trial(
         err_tx_mm=float(translation_error[0]),
         err_ty_mm=float(translation_error[1]),
         err_tz_mm=float(translation_error[2]),
+        err_t_sensor_x_mm=float(translation_error_sensor[0]),
+        err_t_sensor_y_mm=float(translation_error_sensor[1]),
+        err_t_sensor_z_mm=float(translation_error_sensor[2]),
         err_rx_deg=float(rotation_vector_error[0]),
         err_ry_deg=float(rotation_vector_error[1]),
         err_rz_deg=float(rotation_vector_error[2]),
+        err_r_sensor_x_deg=float(rotation_error_sensor[0]),
+        err_r_sensor_y_deg=float(rotation_error_sensor[1]),
+        err_r_sensor_z_deg=float(rotation_error_sensor[2]),
         paper_success=paper_success,
         init_trans_err_norm_mm=init_trans_err_norm_mm,
         init_rot_err_angle_deg=init_rot_err_angle_deg,
@@ -516,6 +543,8 @@ def run_one_trial(
         nonlinear_delta_rotation_deg=nonlinear_delta_rotation_deg,
         plane_rms_history_mm=plane_rms_history_mm,
         iter_T_frob_error=iter_T_frob_error,
+        iter_translation_error_norm_mm=iter_translation_error_norm_mm,
+        iter_rotation_geodesic_error_deg=iter_rotation_geodesic_error_deg,
     )
 
 
@@ -578,6 +607,8 @@ def main() -> None:
         type=Path,
         default=Path("single_plane_random_benchmark.csv"),
     )
+    parser.add_argument("--summary-csv", type=Path, default=None)
+    parser.add_argument("--failures-csv", type=Path, default=None)
     parser.add_argument("--debug-scene-plot", type=Path, default=None)
     parser.add_argument("--debug-scene-seed", type=int, default=None)
     parser.add_argument("--debug-scene-plane-size", type=float, default=700.0)
@@ -634,6 +665,7 @@ def main() -> None:
 
     results: list[SinglePlaneTrialResult] = []
     failures = 0
+    failure_records: list[dict[str, object]] = []
     start_time = time.perf_counter()
     log_every = max(1, args.log_every)
 
@@ -676,6 +708,13 @@ def main() -> None:
             results.append(result)
         except Exception as exc:
             failures += 1
+            failure_records.append(
+                {
+                    "system_idx": system_idx,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
             if args.verbose:
                 print(
                     f"[trial {system_idx:04d}] failed | "
@@ -718,11 +757,33 @@ def main() -> None:
         )
 
     print_calibration_summary(results)
+    summary_csv = args.summary_csv or args.csv.with_name(
+        f"{args.csv.stem}_summary.csv"
+    )
+    failures_csv = args.failures_csv or args.csv.with_name(
+        f"{args.csv.stem}_failures.csv"
+    )
+    save_experiment_summary_csv(
+        results,
+        summary_csv,
+        requested_systems=args.systems,
+        failed_systems=failures,
+        config={
+            **vars(args),
+            "elapsed_seconds": time.perf_counter() - start_time,
+        },
+    )
+    save_failures_csv(failure_records, failures_csv)
+    print(f"saved summary: {summary_csv}")
+    print(f"saved failures: {failures_csv}")
     if not results:
         return
 
     save_results_csv(results, args.csv)
-    print(f"saved: {args.csv}")
+    print(f"saved trials: {args.csv}")
+    iterations_csv = args.csv.with_name(f"{args.csv.stem}_iterations.csv")
+    save_iteration_history_csv(results, iterations_csv)
+    print(f"saved iterations: {iterations_csv}")
 
     if args.no_plots:
         return
@@ -732,7 +793,11 @@ def main() -> None:
         if args.plot_dir is not None
         else args.csv.parent / f"{args.csv.stem}_plots"
     )
-    for path in save_calibration_plots(results, plot_dir):
+    for path in save_calibration_plots(
+        results,
+        plot_dir,
+        sensor_noise_std_mm=args.noise_std,
+    ):
         print(f"saved plot: {path}")
 
 

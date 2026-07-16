@@ -24,6 +24,8 @@ class CalibrationResult:
     cond_history: list[float]
     T_history: list[np.ndarray] = field(default_factory=list)
     plane_offsets: list[float] = field(default_factory=list)
+    plane_normals_history: list[list[np.ndarray]] = field(default_factory=list)
+    plane_offsets_history: list[list[float]] = field(default_factory=list)
     plane_offset_mode: PlaneOffsetMode = "fitted"
 
 
@@ -136,6 +138,24 @@ def _normalize_scan_groups(
         raise ValueError("at least one non-empty plane scan group is required")
     return items
 
+
+def mean_self_fitted_plane_rms(
+    scans_by_plane: Mapping[int, list[LaserScan]] | Sequence[list[LaserScan]],
+    T_ef_s: np.ndarray,
+) -> float:
+    """Return the unweighted mean PCA-plane RMS at one hand-eye transform.
+
+    Each physical plane is fitted again from the points reconstructed with
+    ``T_ef_s``.  This is a self-consistency residual, not an error to a known
+    ground-truth plane or hand-eye transform.
+    """
+    rms_values = []
+    for _plane_id, scans in _normalize_scan_groups(scans_by_plane):
+        points_base = reconstruct_points_base(scans, T_ef_s)
+        _normal, _offset, _centroid, plane_rms = fit_plane_pca(points_base)
+        rms_values.append(float(plane_rms))
+    return float(np.mean(rms_values))
+
 # 각 plane의 결과들을 합쳐 Aw = Y 만들기
 def _build_grouped_system_from_current_T(
     scans_by_plane: Mapping[int, list[LaserScan]] | Sequence[list[LaserScan]],
@@ -169,6 +189,7 @@ def _build_grouped_joint_offset_system_from_current_T(
     np.ndarray,
     list[float],
     list[np.ndarray],
+    list[float],
     list[tuple[int, list[LaserScan]]],
 ]:
     """Build a linear update that estimates each plane offset with hand-eye.
@@ -193,11 +214,13 @@ def _build_grouped_joint_offset_system_from_current_T(
     rhs_blocks: list[np.ndarray] = []
     rms_all: list[float] = []
     normals_unit: list[np.ndarray] = []
+    fitted_offsets: list[float] = []
 
     for plane_index, (_plane_id, scans) in enumerate(groups):
         points_base = reconstruct_points_base(scans, T_ef_s)
-        normal, _offset, _centroid, plane_rms = fit_plane_pca(points_base)
+        normal, offset, _centroid, plane_rms = fit_plane_pca(points_base)
         normals_unit.append(normal)
+        fitted_offsets.append(float(offset))
         rms_all.append(float(plane_rms))
 
         for scan in scans:
@@ -234,6 +257,7 @@ def _build_grouped_joint_offset_system_from_current_T(
         np.concatenate(rhs_blocks),
         rms_all,
         normals_unit,
+        fitted_offsets,
         groups,
     )
 
@@ -467,6 +491,8 @@ def calibrate_planes(
     cond_history: list[float] = []
     T_history: list[np.ndarray] = []
     plane_offsets: list[float] = []
+    plane_normals_history: list[list[np.ndarray]] = []
+    plane_offsets_history: list[list[float]] = []
 
     converged = False
     for k in range(max_iter):
@@ -476,6 +502,7 @@ def calibrate_planes(
                 y,
                 rms_all,
                 normals_unit,
+                fitted_offsets,
                 groups,
             ) = _build_grouped_joint_offset_system_from_current_T(
                 scans_by_plane,
@@ -530,6 +557,14 @@ def calibrate_planes(
                 groups,
             ) = _build_grouped_system_from_current_T(scans_by_plane, T)
             required_rank = int(min_rank)
+            normals_unit = []
+            fitted_offsets = []
+            for normal_scaled in normals_scaled:
+                offset = float(np.linalg.norm(normal_scaled))
+                if offset <= np.finfo(float).eps:
+                    raise np.linalg.LinAlgError("fitted plane offset is zero")
+                normals_unit.append(normal_scaled / offset)
+                fitted_offsets.append(offset)
 
         rank = int(np.linalg.matrix_rank(A))
         s = np.linalg.svd(A, compute_uv=False)
@@ -566,7 +601,13 @@ def calibrate_planes(
             )
 
         delta = float(np.linalg.norm(T_new - T))
+        # rms_all was evaluated at the transform entering this update.  These
+        # entries therefore represent T_initial, T_after_1, ..., T_after_(N-1).
         plane_rms_history.append(float(np.mean(rms_all)))
+        plane_normals_history.append(
+            [np.asarray(normal, dtype=float).copy() for normal in normals_unit]
+        )
+        plane_offsets_history.append([float(value) for value in fitted_offsets])
         delta_history.append(delta)
         rank_history.append(rank)
         cond_history.append(cond)
@@ -583,6 +624,22 @@ def calibrate_planes(
     if tol < 0.0:
         converged = True
 
+    # Add the residual at the transform returned by the last update.  The RMS
+    # and transform-error histories now describe the same N+1 solver states:
+    # initial state followed by every completed linear update.
+    final_rms_values: list[float] = []
+    final_normals: list[np.ndarray] = []
+    final_offsets: list[float] = []
+    for _plane_id, scans in _normalize_scan_groups(scans_by_plane):
+        points_base = reconstruct_points_base(scans, T)
+        normal, offset, _centroid, plane_rms = fit_plane_pca(points_base)
+        final_rms_values.append(float(plane_rms))
+        final_normals.append(np.asarray(normal, dtype=float).copy())
+        final_offsets.append(float(offset))
+    plane_rms_history.append(float(np.mean(final_rms_values)))
+    plane_normals_history.append(final_normals)
+    plane_offsets_history.append(final_offsets)
+
     return CalibrationResult(
         T_ef_s=T,
         iterations=k + 1,
@@ -593,6 +650,8 @@ def calibrate_planes(
         cond_history=cond_history,
         T_history=T_history,
         plane_offsets=plane_offsets,
+        plane_normals_history=plane_normals_history,
+        plane_offsets_history=plane_offsets_history,
         plane_offset_mode=plane_offset_mode,
     )
 

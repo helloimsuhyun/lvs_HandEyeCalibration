@@ -11,8 +11,10 @@ import numpy as np
 
 from laser_handeye.benchmark_analysis import (
     iter_frobenius_error,
+    iter_physical_transform_errors,
     print_calibration_summary,
     save_calibration_plots,
+    save_failures_csv,
     save_plane_scene_plot,
     save_results_csv,
 )
@@ -68,6 +70,9 @@ class ThreePlaneTrialResult:
     nonlinear_delta_rotation_deg: float = float("nan")
     plane_rms_history_mm: list[float] = field(default_factory=list)
     iter_T_frob_error: list[float] = field(default_factory=list)
+    iter_translation_error_norm_mm: list[float] = field(default_factory=list)
+    iter_rotation_geodesic_error_deg: list[float] = field(default_factory=list)
+
 
 def sample_scan_dataset_for_planes(
     T_ef_s_true: np.ndarray,
@@ -392,6 +397,14 @@ def run_one_trial(
     else:
         raise ValueError("mode must be 'known' or 'unknown'")
 
+    iter_translation_error_norm_mm, iter_rotation_geodesic_error_deg = (
+        iter_physical_transform_errors(
+            transform_history,
+            T_true,
+            T_initial=T_init if mode == "unknown" else None,
+        )
+    )
+
     translation_error = T_est[:3, 3] - T_true[:3, 3]
     rotation_vector_error = rotation_vector_error_deg(
         T_est[:3, :3],
@@ -438,6 +451,8 @@ def run_one_trial(
         nonlinear_delta_rotation_deg=nonlinear_delta_rotation_deg,
         plane_rms_history_mm=plane_rms_history_mm,
         iter_T_frob_error=iter_T_frob_error,
+        iter_translation_error_norm_mm=iter_translation_error_norm_mm,
+        iter_rotation_geodesic_error_deg=iter_rotation_geodesic_error_deg,
     )
 
 
@@ -458,9 +473,10 @@ def summarize_noise_results(
     results: list[ThreePlaneTrialResult],
     noise_levels: np.ndarray,
     requested_systems: int,
-) -> list[dict[str, float | int]]:
+    config: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     """Aggregate calibration performance for every sensor-noise level."""
-    summary_rows: list[dict[str, float | int]] = []
+    summary_rows: list[dict[str, object]] = []
 
     for noise_std in noise_levels:
         group = [
@@ -483,8 +499,19 @@ def summarize_noise_results(
         def stat(values: np.ndarray, fn, default=float("nan")) -> float:
             return float(fn(values)) if values.size else float(default)
 
-        summary_rows.append(
-            {
+        def extreme_system_id(attribute: str, find_max: bool) -> int | str:
+            pairs = [
+                (float(getattr(result, attribute)), int(result.system_idx))
+                for result in group
+                if np.isfinite(float(getattr(result, attribute)))
+            ]
+            if not pairs:
+                return ""
+            values = np.asarray([value for value, _idx in pairs], dtype=float)
+            position = int(np.argmax(values) if find_max else np.argmin(values))
+            return pairs[position][1]
+
+        row = {
                 "noise_std_mm": float(noise_std),
                 "requested_systems": int(requested_systems),
                 "completed_systems": int(len(group)),
@@ -493,12 +520,24 @@ def summarize_noise_results(
                 "convergence_rate": (
                     converged_count / len(group) if group else 0.0
                 ),
+                "convergence_rate_requested": (
+                    converged_count / requested_systems
+                    if requested_systems
+                    else 0.0
+                ),
                 "paper_success_count": paper_success_count,
                 "paper_success_rate": (
                     paper_success_count / len(group) if group else 0.0
                 ),
                 "translation_mean_mm": stat(translation, np.mean),
                 "translation_std_mm": stat(translation, np.std),
+                "translation_rmse_mm": stat(
+                    translation, lambda x: np.sqrt(np.mean(x**2))
+                ),
+                "translation_min_mm": stat(translation, np.min),
+                "translation_min_system_idx": extreme_system_id(
+                    "trans_err_norm_mm", False
+                ),
                 "translation_median_mm": stat(translation, np.median),
                 "translation_p25_mm": stat(
                     translation, lambda x: np.percentile(x, 25.0)
@@ -509,8 +548,22 @@ def summarize_noise_results(
                 "translation_p95_mm": stat(
                     translation, lambda x: np.percentile(x, 95.0)
                 ),
+                "translation_p99_mm": stat(
+                    translation, lambda x: np.percentile(x, 99.0)
+                ),
+                "translation_max_mm": stat(translation, np.max),
+                "translation_max_system_idx": extreme_system_id(
+                    "trans_err_norm_mm", True
+                ),
                 "rotation_mean_deg": stat(rotation, np.mean),
                 "rotation_std_deg": stat(rotation, np.std),
+                "rotation_rmse_deg": stat(
+                    rotation, lambda x: np.sqrt(np.mean(x**2))
+                ),
+                "rotation_min_deg": stat(rotation, np.min),
+                "rotation_min_system_idx": extreme_system_id(
+                    "rot_err_angle_deg", False
+                ),
                 "rotation_median_deg": stat(rotation, np.median),
                 "rotation_p25_deg": stat(
                     rotation, lambda x: np.percentile(x, 25.0)
@@ -521,20 +574,45 @@ def summarize_noise_results(
                 "rotation_p95_deg": stat(
                     rotation, lambda x: np.percentile(x, 95.0)
                 ),
+                "rotation_p99_deg": stat(
+                    rotation, lambda x: np.percentile(x, 99.0)
+                ),
+                "rotation_max_deg": stat(rotation, np.max),
+                "rotation_max_system_idx": extreme_system_id(
+                    "rot_err_angle_deg", True
+                ),
+                "iterations_min": stat(iterations, np.min),
                 "iterations_median": stat(iterations, np.median),
+                "iterations_mean": stat(iterations, np.mean),
+                "iterations_p95": stat(
+                    iterations, lambda x: np.percentile(x, 95.0)
+                ),
+                "iterations_max": stat(iterations, np.max),
+                "condition_number_min": stat(cond, np.min),
                 "condition_number_median": stat(cond, np.median),
+                "condition_number_mean": stat(cond, np.mean),
+                "condition_number_p95": stat(
+                    cond, lambda x: np.percentile(x, 95.0)
+                ),
+                "condition_number_max": stat(cond, np.max),
                 "nonlinear_success_count": nonlinear_success_count,
                 "nonlinear_success_rate": (
                     nonlinear_success_count / len(group) if group else 0.0
                 ),
             }
-        )
+        for key, value in sorted((config or {}).items()):
+            if isinstance(value, Path):
+                value = str(value)
+            elif isinstance(value, (list, tuple, dict)):
+                value = str(value)
+            row[f"config_{key}"] = value
+        summary_rows.append(row)
 
     return summary_rows
 
 
 def save_noise_summary_csv(
-    summary_rows: list[dict[str, float | int]],
+    summary_rows: list[dict[str, object]],
     out_path: Path,
 ) -> Path:
     """Save one aggregate row per sensor-noise level."""
@@ -553,7 +631,7 @@ def save_noise_summary_csv(
 
 
 def save_noise_performance_plots(
-    summary_rows: list[dict[str, float | int]],
+    summary_rows: list[dict[str, object]],
     out_dir: Path,
 ) -> list[Path]:
     """Save translation, rotation, and success-rate noise sweep plots."""
@@ -652,6 +730,66 @@ def save_noise_performance_plots(
     fig.tight_layout()
     path = out_dir / "noise_sweep_rotation_error.png"
     fig.savefig(path, dpi=200)
+    plt.close(fig)
+    paths.append(path)
+
+    # single_plane.pdf Fig. 5 varies both noise and the number of scanned
+    # lines. This sweep fixes the scan count, so this is deliberately labelled
+    # as one scan-count slice instead of being presented as a 3-D surface.
+    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.9), constrained_layout=True)
+    panels = (
+        (
+            axes[0],
+            translation_median,
+            translation_p25,
+            translation_p75,
+            translation_p95,
+            "Translation error norm [mm]",
+            "(a) Translation error",
+            "#4c78a8",
+        ),
+        (
+            axes[1],
+            rotation_median,
+            rotation_p25,
+            rotation_p75,
+            rotation_p95,
+            "Geodesic rotation error [deg]",
+            "(b) Rotation error",
+            "#f58518",
+        ),
+    )
+    for ax, median, p25, p75, p95, ylabel, title, color in panels:
+        ax.fill_between(
+            noise,
+            p25,
+            p75,
+            color=color,
+            alpha=0.22,
+            label="25–75 percentile",
+        )
+        ax.plot(noise, median, color=color, marker="o", label="Median")
+        ax.plot(
+            noise,
+            p95,
+            color=color,
+            linestyle="--",
+            marker=".",
+            alpha=0.8,
+            label="95th percentile",
+        )
+        ax.set_xlabel("Sensor Gaussian noise standard deviation [mm]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.28)
+        ax.legend(fontsize=8)
+    fig.suptitle(
+        "Three-plane GT error vs noise (single_plane.pdf Fig. 5 scan-count slice)\n"
+        "the number of scans is fixed in this experiment",
+        fontsize=13,
+    )
+    path = out_dir / "paper_style_noise_sweep_gt_errors.png"
+    fig.savefig(path, dpi=210, bbox_inches="tight")
     plt.close(fig)
     paths.append(path)
 
@@ -759,6 +897,7 @@ def main() -> None:
         default=Path("three_plane_noise_sweep_summary.csv"),
         help="aggregate CSV containing one row per noise level",
     )
+    parser.add_argument("--failures-csv", type=Path, default=None)
     parser.add_argument("--debug-scene-plot", type=Path, default=None)
     parser.add_argument("--debug-scene-seed", type=int, default=None)
     parser.add_argument("--debug-scene-plane-size", type=float, default=700.0)
@@ -811,6 +950,7 @@ def main() -> None:
 
     results: list[ThreePlaneTrialResult] = []
     failures = 0
+    failure_records: list[dict[str, object]] = []
     first_failure: str | None = None
     start_time = time.perf_counter()
     log_every = max(1, args.log_every)
@@ -866,6 +1006,14 @@ def main() -> None:
                 results.append(result)
             except Exception as exc:
                 failures += 1
+                failure_records.append(
+                    {
+                        "system_idx": system_idx,
+                        "noise_std_mm": float(noise_std),
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
                 if first_failure is None:
                     first_failure = f"{type(exc).__name__}: {exc}"
                 if args.verbose:
@@ -924,6 +1072,22 @@ def main() -> None:
         )
 
     print_calibration_summary(results)
+    failures_csv = args.failures_csv or args.csv.with_name(
+        f"{args.csv.stem}_failures.csv"
+    )
+    save_failures_csv(failure_records, failures_csv)
+    print(f"saved failures: {failures_csv}")
+    summary_rows = summarize_noise_results(
+        results=results,
+        noise_levels=noise_levels,
+        requested_systems=args.systems,
+        config={
+            **vars(args),
+            "elapsed_seconds": time.perf_counter() - start_time,
+        },
+    )
+    summary_path = save_noise_summary_csv(summary_rows, args.summary_csv)
+    print(f"saved noise summary: {summary_path}")
     if not results:
         if first_failure is not None:
             print(f"first failure: {first_failure}")
@@ -931,14 +1095,6 @@ def main() -> None:
 
     save_results_csv(results, args.csv)
     print(f"saved raw trials: {args.csv}")
-
-    summary_rows = summarize_noise_results(
-        results=results,
-        noise_levels=noise_levels,
-        requested_systems=args.systems,
-    )
-    summary_path = save_noise_summary_csv(summary_rows, args.summary_csv)
-    print(f"saved noise summary: {summary_path}")
 
     if args.no_plots:
         return
