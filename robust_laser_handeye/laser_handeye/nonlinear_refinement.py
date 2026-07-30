@@ -41,6 +41,41 @@ class NonlinearRefinementResult:
     local_update: np.ndarray
 
 
+@dataclass
+class JointPlaneNonlinearRefinementResult:
+    """Joint nonlinear least-squares result for hand-eye and unknown planes.
+
+    There are six local SE(3) variables and three variables per physical
+    plane: two tangent-space coordinates for its unit normal and one signed
+    offset.  The tangent parameterization keeps every optimized normal on
+    S^2 without introducing a redundant normal-magnitude variable.
+    """
+
+    T_ef_s: np.ndarray
+    plane_normals: dict[int, np.ndarray]
+    plane_offsets_mm: dict[int, float]
+    success: bool
+    status: int
+    message: str
+    nfev: int
+    njev: int | None
+    cost: float
+    optimality: float
+    initial_rms_mm: float
+    final_rms_mm: float
+    delta_rotation_deg: float
+    delta_translation_mm: float
+    mean_plane_normal_delta_deg: float
+    max_plane_normal_delta_deg: float
+    mean_plane_offset_delta_mm: float
+    max_plane_offset_delta_mm: float
+    jacobian_rank: int
+    jacobian_condition: float
+    scaled_jacobian_condition: float
+    variable_count: int
+    local_update: np.ndarray
+
+
 def refine_handeye_nonlinear(
     scans_by_plane: ScanGroups,
     T_init: np.ndarray,
@@ -144,6 +179,199 @@ def refine_handeye_nonlinear(
         delta_translation_mm=float(np.linalg.norm(optimization.x[3:])),
         jacobian_rank=jacobian_rank,
         jacobian_condition=jacobian_condition,
+        local_update=np.asarray(optimization.x, dtype=float).copy(),
+    )
+
+
+def refine_handeye_planes_nonlinear(
+    scans_by_plane: ScanGroups,
+    T_init: np.ndarray,
+    *,
+    initial_planes: PlaneGroups | None = None,
+    loss: RobustLoss = "linear",
+    f_scale_mm: float = 1.0,
+    max_nfev: int = 300,
+    ftol: float = 1e-10,
+    xtol: float = 1e-10,
+    gtol: float = 1e-10,
+) -> JointPlaneNonlinearRefinementResult:
+    """Jointly refine the hand-eye transform and all unknown physical planes.
+
+    The local variable is
+
+    ``[d_se3(6), d_normal_0(2), d_offset_0(1), ...]``.
+
+    ``d_se3`` is applied on the right of ``T_init``.  Each plane normal starts
+    from the supplied (or PCA-fitted) unit normal and is updated on the sphere
+    by ``Exp([B @ d_normal]x) @ n_init``, where the columns of ``B`` span the
+    tangent plane at ``n_init``.  The offset update is additive in millimetres.
+
+    This differs from :func:`refine_handeye_nonlinear` with
+    ``plane_mode='refit'``: plane normals and offsets are explicit optimization
+    variables here, so their estimates and the full joint Jacobian diagnostics
+    are available after refinement.
+    """
+    groups = _normalize_scan_groups(scans_by_plane)
+    T_reference = _validate_transform(T_init, "T_init")
+
+    f_scale_mm = float(f_scale_mm)
+    if not np.isfinite(f_scale_mm) or f_scale_mm <= 0.0:
+        raise ValueError("f_scale_mm must be finite and positive")
+    if max_nfev <= 0:
+        raise ValueError("max_nfev must be positive")
+
+    if initial_planes is None:
+        plane_reference = {
+            plane_id: fit_plane_pca(
+                _reconstruct_group_points(scans, T_reference)
+            )[:2]
+            for plane_id, scans in groups
+        }
+    else:
+        plane_reference = _normalize_planes(initial_planes, groups)
+
+    plane_ids = [plane_id for plane_id, _scans in groups]
+    normal_references = [
+        np.asarray(plane_reference[plane_id][0], dtype=float).reshape(3)
+        for plane_id in plane_ids
+    ]
+    offset_references = np.asarray(
+        [plane_reference[plane_id][1] for plane_id in plane_ids],
+        dtype=float,
+    )
+    tangent_bases = [
+        _normal_tangent_basis(normal) for normal in normal_references
+    ]
+
+    variable_count = 6 + 3 * len(groups)
+    parameter_scales = np.ones(variable_count, dtype=float)
+    # One dimensionless trust-region unit corresponds to a 1-degree angular
+    # change or a 1-mm translational/offset change.
+    parameter_scales[:3] = np.deg2rad(1.0)
+    for plane_index in range(len(groups)):
+        base = 6 + 3 * plane_index
+        parameter_scales[base : base + 2] = np.deg2rad(1.0)
+
+    def unpack(
+        local_update: np.ndarray,
+    ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+        update = np.asarray(local_update, dtype=float).reshape(variable_count)
+        T_candidate = apply_local_se3_update(T_reference, update[:6])
+        normals: list[np.ndarray] = []
+        offsets = np.empty(len(groups), dtype=float)
+        for plane_index, (normal_reference, tangent_basis) in enumerate(
+            zip(normal_references, tangent_bases, strict=True)
+        ):
+            base = 6 + 3 * plane_index
+            normal_rotvec = tangent_basis @ update[base : base + 2]
+            normals.append(
+                Rotation.from_rotvec(normal_rotvec).apply(normal_reference)
+            )
+            offsets[plane_index] = (
+                offset_references[plane_index] + update[base + 2]
+            )
+        return T_candidate, normals, offsets
+
+    def residual_function(local_update: np.ndarray) -> np.ndarray:
+        T_candidate, normals, offsets = unpack(local_update)
+        residual_blocks: list[np.ndarray] = []
+        for plane_index, (_plane_id, scans) in enumerate(groups):
+            points_base = _reconstruct_group_points(scans, T_candidate)
+            residual_blocks.append(
+                points_base @ normals[plane_index] - offsets[plane_index]
+            )
+        return np.concatenate(residual_blocks)
+
+    x0 = np.zeros(variable_count, dtype=float)
+    residual_initial = residual_function(x0)
+    if residual_initial.size < variable_count:
+        raise ValueError(
+            f"joint refinement requires at least {variable_count} point "
+            f"residuals, got {residual_initial.size}"
+        )
+
+    optimization = least_squares(
+        residual_function,
+        x0,
+        method="trf",
+        jac="2-point",
+        x_scale=parameter_scales,
+        loss=loss,
+        f_scale=f_scale_mm,
+        max_nfev=int(max_nfev),
+        ftol=float(ftol),
+        xtol=float(xtol),
+        gtol=float(gtol),
+    )
+
+    residual_final = residual_function(optimization.x)
+    T_refined, normals_refined, offsets_refined = unpack(optimization.x)
+    jacobian = np.asarray(optimization.jac, dtype=float)
+    jacobian_rank, jacobian_condition = _jacobian_diagnostics(jacobian)
+    _scaled_rank, scaled_jacobian_condition = _jacobian_diagnostics(
+        jacobian * parameter_scales[None, :]
+    )
+
+    normal_deltas_deg = np.asarray(
+        [
+            np.degrees(
+                np.arccos(
+                    np.clip(
+                        float(initial @ refined),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+            for initial, refined in zip(
+                normal_references,
+                normals_refined,
+                strict=True,
+            )
+        ],
+        dtype=float,
+    )
+    offset_deltas_mm = np.abs(offsets_refined - offset_references)
+
+    return JointPlaneNonlinearRefinementResult(
+        T_ef_s=T_refined,
+        plane_normals={
+            plane_id: np.asarray(normal, dtype=float).copy()
+            for plane_id, normal in zip(
+                plane_ids,
+                normals_refined,
+                strict=True,
+            )
+        },
+        plane_offsets_mm={
+            plane_id: float(offset)
+            for plane_id, offset in zip(
+                plane_ids,
+                offsets_refined,
+                strict=True,
+            )
+        },
+        success=bool(optimization.success),
+        status=int(optimization.status),
+        message=str(optimization.message),
+        nfev=int(optimization.nfev),
+        njev=(None if optimization.njev is None else int(optimization.njev)),
+        cost=float(optimization.cost),
+        optimality=float(optimization.optimality),
+        initial_rms_mm=_rms(residual_initial),
+        final_rms_mm=_rms(residual_final),
+        delta_rotation_deg=float(
+            np.degrees(np.linalg.norm(optimization.x[:3]))
+        ),
+        delta_translation_mm=float(np.linalg.norm(optimization.x[3:6])),
+        mean_plane_normal_delta_deg=float(np.mean(normal_deltas_deg)),
+        max_plane_normal_delta_deg=float(np.max(normal_deltas_deg)),
+        mean_plane_offset_delta_mm=float(np.mean(offset_deltas_mm)),
+        max_plane_offset_delta_mm=float(np.max(offset_deltas_mm)),
+        jacobian_rank=jacobian_rank,
+        jacobian_condition=jacobian_condition,
+        scaled_jacobian_condition=scaled_jacobian_condition,
+        variable_count=variable_count,
         local_update=np.asarray(optimization.x, dtype=float).copy(),
     )
 
@@ -278,7 +506,7 @@ def _rms(values: np.ndarray) -> float:
 
 
 def _jacobian_diagnostics(jacobian: np.ndarray) -> tuple[int, float]:
-    if jacobian.ndim != 2 or jacobian.shape[1] != 6:
+    if jacobian.ndim != 2 or jacobian.shape[1] == 0:
         return 0, float("inf")
 
     singular_values = np.linalg.svd(jacobian, compute_uv=False)
@@ -286,3 +514,21 @@ def _jacobian_diagnostics(jacobian: np.ndarray) -> tuple[int, float]:
     if len(singular_values) == 0 or singular_values[-1] <= 0.0:
         return rank, float("inf")
     return rank, float(singular_values[0] / singular_values[-1])
+
+
+def _normal_tangent_basis(normal: np.ndarray) -> np.ndarray:
+    """Return a deterministic orthonormal 3x2 tangent basis at a unit normal."""
+    normal = np.asarray(normal, dtype=float).reshape(3)
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("plane normal must be finite and nonzero")
+    normal = normal / norm
+
+    # Select the coordinate axis least aligned with the normal to avoid a
+    # nearly zero cross product.
+    reference = np.eye(3)[int(np.argmin(np.abs(normal)))]
+    tangent_0 = np.cross(normal, reference)
+    tangent_0 /= np.linalg.norm(tangent_0)
+    tangent_1 = np.cross(normal, tangent_0)
+    tangent_1 /= np.linalg.norm(tangent_1)
+    return np.column_stack([tangent_0, tangent_1])

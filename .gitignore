@@ -1,27 +1,60 @@
-
-# Python cache
+# Python cache and local environments
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
-# Experiment outputs
+# Generated calibration, scan, benchmark, and experiment directories
+/runs/
+/robust_laser_handeye/results/
+/robust_laser_handeye/dataset/
+/real_laser_handeye/rbpodo/
 diagnostics/
+plots/
+*_plots/
 three_plane_benchmark_plots/
 
-# Archives
-*.zip
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Plot and data outputs
+# Generated numeric datasets and tabular outputs
 *.csv
+*.tsv
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# Point-cloud, robot-recording, database, and log outputs
+*.pcd
+*.ply
+*.las
+*.bag
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Generated plots, reports, and interactive visualizations
 *.png
 *.jpg
 *.jpeg
 *.svg
 *.pdf
 *.html
-*_plots/
-plots/
-diagnostics/
+
+# Large archives and media
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.mp4
+*.avi
+*.mov
+*.mkv

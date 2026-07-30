@@ -1,5 +1,16 @@
 # Robust 2D Laser Sensor Hand-Eye Calibration
 
+> The new Tan et al. (IEEE TIM 2025) three-step closed-form reproduction is
+> isolated in `laser_handeye/tan2025/`; setup, limitations, and commands are in
+> [`../paper/README.md`](../paper/README.md). The material below documents the
+> existing Sharifzadeh-style alternating single-plane implementation.
+
+Reusable noise-free acquisitions for translation/composite, single-plane
+circular, and three-plane experiments are generated with
+`examples/generate_calibration_dataset.py`. The portable manifest/NPZ contract
+and real-robot handoff are documented in
+[`laser_handeye/calibration_dataset/README.md`](laser_handeye/calibration_dataset/README.md).
+
 This repository reconstructs the simulation in *Robust hand-eye calibration
 of 2D laser sensors using a single-plane* and contains matched single-plane and
 three-plane benchmarks.
@@ -40,9 +51,9 @@ not presented as part of the paper's reduced nine-combination grid.
 
 ## Iteration and convergence tolerance
 
-For both `--plane-offset-mode joint` and `--plane-offset-mode fitted`, in both
-the single-plane and three-plane solvers, `--tol` controls early termination
-of the alternating linear iteration. After each iteration the solver computes
+For `--plane-offset-mode joint`, `difference`, and `fitted`, `--tol` controls
+early termination of the alternating linear iteration. After each iteration
+the solver computes
 
 ```text
 delta = ||T_new - T_previous||_F
@@ -74,7 +85,7 @@ The optional nonlinear refinement has separate stopping criteria and does not
 use `--tol`. Configure SciPy nonlinear least squares with `--nonlinear-ftol`,
 `--nonlinear-xtol` and `--nonlinear-gtol`; all three default to `1e-10`.
 `--nonlinear-max-nfev 200` limits its objective evaluations. These nonlinear
-options work after either a joint or fitted linear solve, although the
+options work after a joint, difference, or fitted linear solve, although the
 comparison commands below intentionally refine the legacy fitted result.
 
 ### Interpreting the convergence plots
@@ -165,6 +176,56 @@ colors endpoints by total error magnitude, and overlays the `+/-` sensor-Z
 gauge axis with translucent 15-degree gauge cones. Hovering an endpoint shows
 its `system_idx`, signed components, norm and angle to the gauge axis.
 
+## Bootstrap-planned single-plane experiment
+
+The original optimal simulator creates each requested sensor pose using the GT
+plane and converts it to a flange pose using the GT hand-eye. To model a real
+setup in which neither is available for exact trajectory planning, enable
+`--trajectory-planning bootstrap`:
+
+1. Acquire four preliminary parallel profiles in a short manually aimed raster.
+2. Reconstruct those profiles in the robot base frame using the initial
+   hand-eye and fit a plane with PCA.
+3. Build the requested `(d, theta, beta)` circular trajectory on that estimated
+   plane and convert every sensor command to a flange command with the same
+   initial hand-eye.
+4. Simulate measurements using the physical GT plane and GT hand-eye, then run
+   the existing unknown-plane calibration unchanged.
+
+The four bootstrap profiles locate the plane only; they are not added to the
+calibration scan set, so `n_scans` remains directly comparable to the original
+benchmark. In the simulator, their poses represent an operator manually aiming
+at the board. The GT plane is used only to ensure that these preliminary
+profiles hit the physical plane, not to compute the calibrated trajectory.
+
+```bash
+PYTHONPATH=. python3 examples/run_single_plane_optimal_benchmark.py \
+  --systems 100 \
+  --seed 7 \
+  --mode unknown \
+  --trajectory-planning bootstrap \
+  --bootstrap-scans 4 \
+  --bootstrap-line-half-length-mm 50 \
+  --bootstrap-height-mm 120 \
+  --bootstrap-theta-deg 30 \
+  --bootstrap-beta-deg 90 \
+  --init-mode relative \
+  --rel-offset 0.1 \
+  --noise-std 0.5 \
+  --reference-scans 24 \
+  --plane-offset-mode joint \
+  --max-iter 30 \
+  --tol 1e-9 \
+  --csv results/single_plane_bootstrap_planned.csv \
+  --verbose
+```
+
+The trial CSV records `bootstrap_plane_normal_error_deg`,
+`bootstrap_plane_offset_error_mm`, and the mean commanded-versus-actual sensor
+pose errors. Large initial hand-eye errors can produce a poor bootstrap plane;
+use `--rel-offset` (or the Carlson angle/translation ranges) to match the
+quality of the initial calibration available in the real system.
+
 ## Single-plane optimal comparison
 
 Run the following commands from the repository directory. All three use the
@@ -199,6 +260,104 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
   --csv results/single_plane_optimal_joint.csv \
   --verbose
 ```
+
+### Why `joint` and `difference` give the same hand-eye update
+
+For sensor point `i` acquired at flange pose `k`, the reconstructed base-frame
+point is
+
+```text
+p_b,i = R_be,k (x_i R1 + z_i R3 + t) + t_be,k.
+```
+
+The 2-D profile has sensor `y=0`, so the linear unknown vector is
+`w = [R1, R3, t]`. With `a_k = n^T R_be,k`, define the point row and right-hand
+side
+
+```text
+b_i = [x_i a_k, z_i a_k, a_k]
+c_i = -n^T t_be,k.
+```
+
+The unknown-plane constraint `n^T p_b,i = l` is therefore
+
+```text
+b_i w - l = c_i.
+```
+
+For one physical plane, stacking all points gives the `joint` least-squares
+problem
+
+```text
+min_(w,l) ||B w - 1 l - c||^2.                         (1)
+```
+
+For fixed `w`, differentiating (1) with respect to `l` gives
+
+```text
+l*(w) = mean(B w - c) = mean(B) w - mean(c).
+```
+
+Substituting `l*(w)` back into (1) analytically eliminates the offset:
+
+```text
+min_w ||(B - 1 mean(B)) w - (c - 1 mean(c))||^2.       (2)
+```
+
+Now subtract the constraint for point `j` from the constraint for point `i`:
+
+```text
+(b_i - b_j) w = c_i - c_j
+<=> n^T (p_b,i - p_b,j) = 0.                           (3)
+```
+
+The all-pairs objective from (3) satisfies
+
+```text
+sum_(i<j) (residual_i - residual_j)^2
+    = N sum_i (residual_i - mean(residual))^2.
+```
+
+The constant factor `N` does not change the least-squares minimizer. Therefore
+the centered system (2), all point-pair differences (3), and the `joint`
+problem (1) return the same `w`, up to floating-point roundoff. `joint` keeps
+one explicit offset column per plane; `difference` is the Schur-complement or
+variable-eliminated form of the same problem.
+
+The implementation does not create the `N(N-1)/2` point pairs. In
+`_build_grouped_difference_system_from_current_T` it instead performs the
+following independently for every physical plane:
+
+1. Reconstruct all points with the current hand-eye estimate and fit `n` by
+   PCA.
+2. Build `B` and `c` from all valid points in all scans of that plane.
+3. Compute `B_centered = B - mean(B, axis=0)` and
+   `c_centered = c - mean(c)`.
+4. Stack the centered plane systems and solve the nine hand-eye variables.
+5. Project the recovered rotation to SO(3), then re-solve translation with
+   that rotation fixed using the same centered equations.
+
+Use this explicit offset-free formulation with:
+
+```bash
+--solver-update-mode simultaneous --plane-offset-mode difference
+```
+
+Points from different flange poses must participate in the same plane-level
+centering. If differences are formed only between points from the same scan,
+`R_be,k`, `t_be,k`, and the hand-eye translation contribution are identical on
+both sides; translation cancels and cannot be calibrated.
+
+Offset elimination also does not add pose information. If the fixed-theta
+trajectory has a translation/offset gauge, `joint` exposes it in the augmented
+`[B, -1]` system while `difference` exposes the corresponding null or
+near-null direction in centered `B`. A second incidence magnitude or another
+independent pose excitation is still required.
+
+In the checked seed-7, 50-system observable benchmark, `joint` and
+`difference` had identical iteration counts. Their maximum differences were
+`3.2e-12 mm` in translation error, `1.2e-10 deg` in rotation error, and
+`2.4e-15 mm` in final plane RMS.
 
 ### 2. Legacy fit-then-solve update
 
@@ -262,11 +421,12 @@ PYTHONPATH=. python examples/run_single_plane_optimal_benchmark.py \
 ```
 
 `joint` estimates the hand-eye translation and plane offset in the same linear
-update and rejects unobservable data. The legacy `fitted` mode first fits the
-plane offset and then solves the hand-eye update, so it generally needs a much
-higher iteration limit; 3000 is a conservative cap for this single-plane
-configuration. For unknown-plane nonlinear refinement, `refit` re-estimates
-the plane for every candidate hand-eye transform.
+update. `difference` analytically eliminates that offset and returns the same
+hand-eye update. The legacy `fitted` mode first fits the plane offset and then
+solves the hand-eye update, so it generally needs a much higher iteration
+limit; 3000 is a conservative cap for this single-plane configuration. For
+unknown-plane nonlinear refinement, `refit` re-estimates the plane for every
+candidate hand-eye transform.
 
 ## Three-plane comparison
 
@@ -425,6 +585,36 @@ components parallel and perpendicular to `R_ef_s_true @ e_z`. The same values
 are written to the CSV as `gauge_parallel_error_mm`,
 `gauge_perpendicular_error_mm`, `gauge_axis_angle_deg` and
 `gauge_parallel_fraction`.
+
+## Strict theta-30 ring followed by Fisher NBV
+
+The separate hybrid experiment starts from the strict 9-line theta=30 grid
+(81 profiles, with the original benchmark's three distances and three beta
+values), adds one conservative theta=45 Fisher bridge, then selects further
+views from the full Fisher candidate bank:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 \
+  examples/run_theta30_then_fisher_nbv.py \
+  --trials 20 \
+  --seed 7 \
+  --added-views 5 \
+  --noise-std-mm 0.5 \
+  --initial-translation-range-mm 200 \
+  --initial-angle-range-deg 20 \
+  --output-dir results/theta30_then_fisher_nbv_verified
+```
+
+In the verified seed-7 run, one added view changes the structural joint rank
+from 8 to 9; two added views first put both median errors below 0.1 mm / 0.1
+deg; five put all 20 trials below both thresholds. See
+`fisher_next_view/HYBRID_THETA30.md` for the complete table and limitations.
+
+The initial 81 poses retain the original simulator's oracle acquisition: they
+are constructed from the GT plane and GT hand-eye. Only the added bridge/NBV
+poses are commanded from the current estimate. This experiment therefore
+measures calibration-stage scan efficiency, not autonomous hardware
+acquisition from a 200 mm / 20 deg initial error.
 
 ## Geometry and paper-reproduction notes
 

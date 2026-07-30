@@ -1,5 +1,7 @@
 numpy
 scipy
 matplotlib
+pandas
 pytest
+mujoco>=3.2,<4
 #open3d

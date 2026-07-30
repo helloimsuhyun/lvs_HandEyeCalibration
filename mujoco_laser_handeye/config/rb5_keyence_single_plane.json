@@ -1,0 +1,178 @@
+{
+  "robot": {
+    "adapter": "mujoco_laser_handeye.adapters:MujocoRB5Robot",
+    "kwargs": {
+      "T_tcp_sensor": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          120
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ],
+      "plane_center_mm": [
+        300.81,
+        305.575,
+        493.286
+      ],
+      "plane_rpy_deg": [
+        5.0,
+        5.0,
+        5.0
+      ],
+      "plane_size_mm": [
+        400.0,
+        500.0
+      ],
+      "plane_thickness_mm": 25.0,
+      "table_center_mm": [
+        450.0,
+        0.0,
+        165.0
+      ],
+      "table_size_mm": [
+        400.0,
+        450.0,
+        330.0
+      ],
+      "sensor_housing_size_mm": [
+        80.0,
+        40.0,
+        60.0
+      ],
+      "sensor_housing_center_z_mm": -35.0,
+      "collision_margin_mm": 2.0,
+      "initial_joint_positions_deg": [
+        0.0,
+        30.0,
+        30.0,
+        -60.0,
+        90.0,
+        0.0
+      ],
+      "ik_position_tolerance_mm": 2,
+      "ik_rotation_tolerance_deg": 0.3,
+      "joint_collision_step_deg": 2,
+      "viewer": false,
+      "realtime_scale": 0
+    }
+  },
+  "laser": {
+    "adapter": "mujoco_laser_handeye.adapters:MujocoKeyenceLaser",
+    "inject_robot": true,
+    "kwargs": {
+      "x_min_mm": -40.0,
+      "x_max_mm": 40.0,
+      "z_min_mm": 20.0,
+      "z_max_mm": 170.0,
+      "point_count": 321,
+      "noise_std_x_mm": 0.015,
+      "noise_std_z_mm": 0.035,
+      "dropout_probability": 0.01,
+      "seed": 7
+    }
+  },
+  "safety": {
+    "live_enabled": true,
+    "workspace_mm": {
+      "min": [
+        -900.0,
+        -900.0,
+        40.0
+      ],
+      "max": [
+        1050.0,
+        900.0,
+        1100.0
+      ]
+    },
+    "no_go_boxes_mm": [
+      {
+        "name": "table_and_fixture",
+        "min": [
+          245,
+          -230,
+          -10
+        ],
+        "max": [
+          655,
+          230,
+          335
+        ]
+      }
+    ],
+    "safe_transit_T_base_tcp": [
+      [
+        0,
+        -1,
+        0,
+        648.681958283
+      ],
+      [
+        1,
+        0,
+        0,
+        -110.7
+      ],
+      [
+        0,
+        0,
+        1,
+        843.960796608
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "approach_clearance_mm": 50,
+    "max_linear_step_mm": 25,
+    "max_angular_step_deg": 5,
+    "linear_speed_mm_s": 120,
+    "angular_speed_deg_s": 45,
+    "motion_timeout_s": 30,
+    "settle_time_s": 0,
+    "readback_position_tolerance_mm": 2.1,
+    "readback_rotation_tolerance_deg": 0.35,
+    "stationarity_position_tolerance_mm": 0.05,
+    "stationarity_rotation_tolerance_deg": 0.05,
+    "min_sensor_plane_clearance_mm": 15,
+    "initial_handeye_uncertainty_mm": 8,
+    "initial_handeye_uncertainty_deg": 3,
+    "require_controller_collision_check": true,
+    "controller_collision_check_acknowledged": true
+  },
+  "capture": {
+    "timeout_s": 1,
+    "profiles_per_pose": 1,
+    "min_points": 100,
+    "max_profile_age_ms": 1000,
+    "max_abs_sensor_y_mm": 0.1,
+    "max_initial_plane_rms_mm": 15,
+    "max_final_plane_rms_mm": 0.5,
+    "max_bootstrap_plane_rms_mm": 1,
+    "min_bootstrap_span_mm": 100,
+    "min_bootstrap_sensor_plane_distance_mm": 15,
+    "return_to_safe_between_scans": true
+  }
+}

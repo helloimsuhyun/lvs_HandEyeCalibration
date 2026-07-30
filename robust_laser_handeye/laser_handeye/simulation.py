@@ -429,12 +429,21 @@ def generate_circular_pattern_scans(
     plane_id: int = 0,
     projection_branch_mode: Literal["alternating", "positive"] = "alternating",
     pose_geometry: PoseGeometry = "observable_dihedral",
+    T_ef_s_command: np.ndarray | None = None,
+    actual_plane_n: np.ndarray | None = None,
+    actual_plane_l: float | None = None,
 ) -> list[LaserScan]:
     """Generate a paper-style circular-pattern synthetic scan dataset.
 
     The circular pattern has nine target lines, each 40 deg apart. For each line,
-    a set of scan parameters (d, theta, beta) is converted into a sensor pose;
-    the corresponding robot flange pose is then obtained from the GT hand-eye.
+    a set of scan parameters (d, theta, beta) is converted into a commanded
+    sensor pose.
+
+    By default, the corresponding robot flange pose is obtained from the GT
+    hand-eye and the profiles are measured on ``plane_R, plane_t``.  Supplying
+    ``T_ef_s_command`` models trajectory planning with an imperfect hand-eye.
+    Supplying ``actual_plane_n, actual_plane_l`` additionally separates the
+    plane used for planning from the physical plane used for measurement.
     """
     from .patterns import circular_lines, scan_parameter_grid
 
@@ -446,6 +455,21 @@ def generate_circular_pattern_scans(
     lines = circular_lines(radius_mm, n_lines=9)
     params = scan_parameter_grid() if scan_params is None else scan_params
     plane_n, plane_l = make_plane_from_pose(plane_R, plane_t)
+    command_handeye = (
+        np.asarray(T_ef_s_true, dtype=float).reshape(4, 4)
+        if T_ef_s_command is None
+        else np.asarray(T_ef_s_command, dtype=float).reshape(4, 4)
+    )
+    if (actual_plane_n is None) != (actual_plane_l is None):
+        raise ValueError(
+            "actual_plane_n and actual_plane_l must be supplied together"
+        )
+    if actual_plane_n is None:
+        measurement_plane_n = plane_n
+        measurement_plane_l = plane_l
+    else:
+        measurement_plane_n = _normalize(actual_plane_n)
+        measurement_plane_l = float(actual_plane_l)
 
     scans: list[LaserScan] = []
     for line_id, (line_p0, line_p1) in enumerate(lines):
@@ -475,14 +499,21 @@ def generate_circular_pattern_scans(
                     branch_sign=branch_sign,
                     pose_geometry=pose_geometry,
                 )
-                T_base_ef = T_base_s @ inv_T(T_ef_s_true)
+                T_base_ef = T_base_s @ inv_T(command_handeye)
                 if check_reachability and not is_reachable_simple(T_base_ef):
                     continue
+                T_base_s_actual = T_base_ef @ T_ef_s_true
+                relative_rotation = (
+                    T_base_s[:3, :3].T @ T_base_s_actual[:3, :3]
+                )
+                rotation_cosine = float(
+                    np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+                )
                 scan = simulate_profile_on_plane(
                     T_base_ef=T_base_ef,
                     T_ef_s_true=T_ef_s_true,
-                    plane_n=plane_n,
-                    plane_l=plane_l,
+                    plane_n=measurement_plane_n,
+                    plane_l=measurement_plane_l,
                     x_values=x_values,
                     noise_std=noise_std,
                     rng=rng,
@@ -494,6 +525,20 @@ def generate_circular_pattern_scans(
                         "theta_branch_sign": branch_sign,
                         "signed_theta_deg": branch_sign * prm["theta_deg"],
                         "pose_geometry": pose_geometry,
+                        "planned_with_estimated_handeye": (
+                            T_ef_s_command is not None
+                        ),
+                        "planned_with_estimated_plane": (
+                            actual_plane_n is not None
+                        ),
+                        "command_actual_translation_error_mm": float(
+                            np.linalg.norm(
+                                T_base_s_actual[:3, 3] - T_base_s[:3, 3]
+                            )
+                        ),
+                        "command_actual_rotation_error_deg": float(
+                            np.degrees(np.arccos(rotation_cosine))
+                        ),
                         **prm,
                     },
                 )
@@ -516,6 +561,9 @@ def generate_circular_reference_scans(
     check_reachability: bool = False,
     plane_id: int = 0,
     pose_geometry: PoseGeometry = "paper_incidence",
+    T_ef_s_command: np.ndarray | None = None,
+    actual_plane_n: np.ndarray | None = None,
+    actual_plane_l: float | None = None,
 ) -> list[LaserScan]:
     """Generate an explicit off-ring/reference subset around the circle.
 
@@ -534,6 +582,21 @@ def generate_circular_reference_scans(
     rng = np.random.default_rng() if rng is None else rng
     lines = circular_lines(radius_mm, n_lines=9)
     plane_n, plane_l = make_plane_from_pose(plane_R, plane_t)
+    command_handeye = (
+        np.asarray(T_ef_s_true, dtype=float).reshape(4, 4)
+        if T_ef_s_command is None
+        else np.asarray(T_ef_s_command, dtype=float).reshape(4, 4)
+    )
+    if (actual_plane_n is None) != (actual_plane_l is None):
+        raise ValueError(
+            "actual_plane_n and actual_plane_l must be supplied together"
+        )
+    if actual_plane_n is None:
+        measurement_plane_n = plane_n
+        measurement_plane_l = plane_l
+    else:
+        measurement_plane_n = _normalize(actual_plane_n)
+        measurement_plane_l = float(actual_plane_l)
     scans: list[LaserScan] = []
 
     for reference_id in range(int(n_scans)):
@@ -556,15 +619,22 @@ def generate_circular_reference_scans(
                 branch_sign=branch_sign,
                 pose_geometry=pose_geometry,
             )
-            T_base_ef = T_base_s @ inv_T(T_ef_s_true)
+            T_base_ef = T_base_s @ inv_T(command_handeye)
             if check_reachability and not is_reachable_simple(T_base_ef):
                 continue
+            T_base_s_actual = T_base_ef @ T_ef_s_true
+            relative_rotation = (
+                T_base_s[:3, :3].T @ T_base_s_actual[:3, :3]
+            )
+            rotation_cosine = float(
+                np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+            )
             scans.append(
                 simulate_profile_on_plane(
                     T_base_ef=T_base_ef,
                     T_ef_s_true=T_ef_s_true,
-                    plane_n=plane_n,
-                    plane_l=plane_l,
+                    plane_n=measurement_plane_n,
+                    plane_l=measurement_plane_l,
                     x_values=x_values,
                     noise_std=noise_std,
                     rng=rng,
@@ -577,6 +647,20 @@ def generate_circular_reference_scans(
                         "reference_parameter_id": parameter_id,
                         "theta_branch_sign": branch_sign,
                         "pose_geometry": pose_geometry,
+                        "planned_with_estimated_handeye": (
+                            T_ef_s_command is not None
+                        ),
+                        "planned_with_estimated_plane": (
+                            actual_plane_n is not None
+                        ),
+                        "command_actual_translation_error_mm": float(
+                            np.linalg.norm(
+                                T_base_s_actual[:3, 3] - T_base_s[:3, 3]
+                            )
+                        ),
+                        "command_actual_rotation_error_deg": float(
+                            np.degrees(np.arccos(rotation_cosine))
+                        ),
                         **prm,
                     },
                 )

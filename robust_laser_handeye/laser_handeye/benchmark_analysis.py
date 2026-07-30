@@ -129,7 +129,9 @@ def save_iteration_history_csv(results: Sequence[Any], path: Path) -> Path:
         "mode",
         "init_mode",
         "plane_offset_mode",
+        "solver_update_mode",
         "pose_geometry",
+        "trajectory_planning",
         "n_planes",
         "n_scans",
         "n_points_per_scan",
@@ -309,9 +311,11 @@ def save_experiment_summary_csv(
     if results:
         first = results[0]
         for attribute in (
-            "mode", "init_mode", "plane_offset_mode", "pose_geometry",
+            "mode", "init_mode", "plane_offset_mode", "solver_update_mode",
+            "pose_geometry",
+            "trajectory_planning",
             "n_planes", "n_scans", "n_points_per_scan",
-            "n_reference_scans",
+            "n_reference_scans", "n_bootstrap_scans",
         ):
             if hasattr(first, attribute):
                 row[attribute] = _csv_config_value(getattr(first, attribute))
@@ -361,6 +365,26 @@ def save_experiment_summary_csv(
         ("gauge_parallel_error_mm", "gauge_parallel_error_mm", True),
         ("gauge_perpendicular_error_mm", "gauge_perpendicular_error_mm", False),
         ("gauge_axis_angle_deg", "gauge_axis_angle_deg", False),
+        (
+            "bootstrap_plane_normal_error_deg",
+            "bootstrap_plane_normal_error_deg",
+            False,
+        ),
+        (
+            "bootstrap_plane_offset_error_mm",
+            "bootstrap_plane_offset_error_mm",
+            True,
+        ),
+        (
+            "command_actual_translation_error_mean_mm",
+            "command_actual_translation_error_mean_mm",
+            False,
+        ),
+        (
+            "command_actual_rotation_error_mean_deg",
+            "command_actual_rotation_error_mean_deg",
+            False,
+        ),
     )
     for attribute, prefix, signed in metric_specs:
         _add_metric_summary(

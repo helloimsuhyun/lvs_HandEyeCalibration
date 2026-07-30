@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -25,9 +26,11 @@ from laser_handeye.calibration import calibrate_planes, calibrate_with_known_pla
 from laser_handeye.data import LaserScan
 from laser_handeye.initialization import InitialGuessMode, make_initial_guess
 from laser_handeye.geometry import fit_plane_pca
+from laser_handeye.scene_generation import plane_basis
 from laser_handeye.nonlinear_refinement import RobustLoss, refine_handeye_nonlinear
 from scipy.spatial.transform import Rotation
 from laser_handeye.se3 import (
+    inv_T,
     rot_error_deg,
     rotation_vector_error_deg,
     transform_points,
@@ -36,7 +39,10 @@ from laser_handeye.patterns import scan_parameter_grid
 from laser_handeye.simulation import (
     generate_circular_pattern_scans,
     generate_circular_reference_scans,
+    is_reachable_simple,
     sample_random_handeye,
+    sensor_pose_from_target_line,
+    simulate_profile_on_plane,
 )
 
 
@@ -46,7 +52,14 @@ class SinglePlaneTrialResult:
     mode: str
     init_mode: str
     plane_offset_mode: str
+    solver_update_mode: str
     pose_geometry: str
+    trajectory_planning: str
+    n_bootstrap_scans: int
+    bootstrap_plane_normal_error_deg: float
+    bootstrap_plane_offset_error_mm: float
+    command_actual_translation_error_mean_mm: float
+    command_actual_rotation_error_mean_deg: float
     n_reference_scans: int
     n_planes: int
     n_scans: int
@@ -78,7 +91,10 @@ class SinglePlaneTrialResult:
     plane_offset_error_mm: float
     normal_sensor_z_dot_mean: float
     paper_success: bool
+    outlier: bool
+    outlier_reason: str
     final_linear_plane_rms_mm: float
+    final_self_fit_plane_rms_mm: float
     init_trans_err_norm_mm: float
     init_rot_err_angle_deg: float
     nonlinear_refined: bool = False
@@ -96,8 +112,138 @@ class SinglePlaneTrialResult:
     iter_gauge_perpendicular_error_mm: list[float] = field(default_factory=list)
     iter_plane_offset_estimate_mm: list[float] = field(default_factory=list)
     iter_plane_offset_error_mm: list[float] = field(default_factory=list)
+    iter_plane_normal_error_deg: list[float] = field(default_factory=list)
+    iter_true_plane_rms_mm: list[float] = field(default_factory=list)
     iter_err_t_sensor_z_mm: list[float] = field(default_factory=list)
     iter_normal_sensor_z_dot_mean: list[float] = field(default_factory=list)
+
+
+@dataclass
+class BootstrapPlaneResult:
+    """Plane reconstructed from the preliminary manually aimed profiles."""
+
+    scans: list[LaserScan]
+    plane_R: np.ndarray
+    plane_t: np.ndarray
+    plane_n: np.ndarray
+    plane_l: float
+    fit_rms_mm: float
+
+
+def classify_outlier(
+    *,
+    converged: bool,
+    translation_error_mm: float,
+    rotation_error_deg: float,
+    self_fit_plane_rms_mm: float,
+    translation_threshold_mm: float,
+    rotation_threshold_deg: float,
+    plane_rms_threshold_mm: float,
+) -> tuple[bool, str]:
+    """Classify a completed trial independently of paper_success.
+
+    ``paper_success`` reproduces the paper's strict component-wise 0.01-mm
+    criterion.  This classifier instead marks gross failures that require
+    separate basin/outlier analysis.
+    """
+    reasons: list[str] = []
+    if not converged:
+        reasons.append("nonconverged")
+    if (
+        np.isfinite(translation_error_mm)
+        and translation_error_mm > translation_threshold_mm
+    ):
+        reasons.append("large_translation")
+    if (
+        np.isfinite(rotation_error_deg)
+        and rotation_error_deg > rotation_threshold_deg
+    ):
+        reasons.append("large_rotation")
+    if (
+        np.isfinite(self_fit_plane_rms_mm)
+        and self_fit_plane_rms_mm > plane_rms_threshold_mm
+    ):
+        reasons.append("large_self_fit_plane_rms")
+    return bool(reasons), ";".join(reasons) if reasons else "none"
+
+
+def _history_value(values: list[float], index: int) -> float:
+    """Return one history value or NaN when histories have different lengths."""
+    if index < len(values):
+        return float(values[index])
+    return float("nan")
+
+
+def save_trial_iteration_diagnostics_csv(
+    result: SinglePlaneTrialResult,
+    out_path: Path,
+) -> Path:
+    """Save all scalar iteration diagnostics for one reproducible trial."""
+    histories = {
+        "translation_error_norm_mm": result.iter_translation_error_norm_mm,
+        "rotation_error_geodesic_deg": result.iter_rotation_geodesic_error_deg,
+        "gauge_parallel_abs_error_mm": result.iter_gauge_parallel_abs_error_mm,
+        "gauge_perpendicular_error_mm": result.iter_gauge_perpendicular_error_mm,
+        "self_fit_plane_rms_mm": result.plane_rms_history_mm,
+        "true_plane_rms_mm": result.iter_true_plane_rms_mm,
+        "plane_normal_error_deg": result.iter_plane_normal_error_deg,
+        "plane_offset_estimate_mm": result.iter_plane_offset_estimate_mm,
+        "plane_offset_error_mm": result.iter_plane_offset_error_mm,
+        "translation_error_sensor_z_mm": result.iter_err_t_sensor_z_mm,
+        "normal_sensor_z_dot_mean": result.iter_normal_sensor_z_dot_mean,
+        "T_frobenius_error": result.iter_T_frob_error,
+    }
+    n_rows = max((len(values) for values in histories.values()), default=0)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["system_idx", "iteration", *histories.keys()]
+    with out_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for iteration in range(n_rows):
+            row: dict[str, object] = {
+                "system_idx": result.system_idx,
+                "iteration": iteration,
+            }
+            for name, values in histories.items():
+                row[name] = _history_value(values, iteration)
+            writer.writerow(row)
+    return out_path
+
+
+def save_outlier_summary_csv(
+    results: list[SinglePlaneTrialResult],
+    out_path: Path,
+) -> Path:
+    """Save a compact table containing only numerically completed outliers."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "system_idx",
+        "outlier_reason",
+        "converged",
+        "iterations",
+        "init_trans_err_norm_mm",
+        "init_rot_err_angle_deg",
+        "trans_err_norm_mm",
+        "rot_err_angle_deg",
+        "final_self_fit_plane_rms_mm",
+        "plane_offset_error_mm",
+        "gauge_parallel_error_mm",
+        "gauge_perpendicular_error_mm",
+        "gauge_axis_angle_deg",
+        "rank_last",
+        "cond_last",
+    ]
+    with out_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            if not result.outlier:
+                continue
+            writer.writerow({name: getattr(result, name) for name in fieldnames})
+    return out_path
+
 
 def sample_random_plane_pose(
     rng: np.random.Generator,
@@ -266,6 +412,10 @@ def generate_optimal_single_plane_dataset(
     pose_geometry: str = "paper_incidence",
     reference_scan_params: list[dict] | None = None,
     reference_scan_count: int = 0,
+    reference_line_ids: tuple[int, ...] | None = None,
+    T_ef_s_command: np.ndarray | None = None,
+    actual_plane_n: np.ndarray | None = None,
+    actual_plane_l: float | None = None,
 ) -> dict[int, list[LaserScan]]:
     """Generate the circular-line scan set plus optional excitation.
 
@@ -292,6 +442,9 @@ def generate_optimal_single_plane_dataset(
         check_reachability=check_reachability,
         plane_id=0,
         pose_geometry=pose_geometry,
+        T_ef_s_command=T_ef_s_command,
+        actual_plane_n=actual_plane_n,
+        actual_plane_l=actual_plane_l,
     )
 
     theta_by_line_deg = _validate_theta_by_line(theta_by_line_deg)
@@ -344,22 +497,74 @@ def generate_optimal_single_plane_dataset(
             raise ValueError(
                 "reference_scan_params are required when reference_scan_count > 0"
             )
-        scans.extend(
-            generate_circular_reference_scans(
-                plane_R=plane_R,
-                plane_t=plane_t,
-                T_ef_s_true=T_ef_s_true,
-                radius_mm=radius_mm,
-                x_values=x_values,
-                scan_params=reference_scan_params,
-                n_scans=reference_scan_count,
-                noise_std=noise_std,
-                rng=rng,
-                check_reachability=check_reachability,
-                plane_id=0,
-                pose_geometry=pose_geometry,
+
+        if reference_line_ids is None:
+            raise ValueError(
+                "reference_line_ids are required for the defined additional-scan mode"
             )
+
+        line_ids = tuple(int(value) for value in reference_line_ids)
+        if not line_ids:
+            raise ValueError("reference_line_ids must not be empty")
+        if len(set(line_ids)) != len(line_ids):
+            raise ValueError("reference_line_ids must not contain duplicates")
+        invalid_line_ids = [value for value in line_ids if not 0 <= value < 9]
+        if invalid_line_ids:
+            raise ValueError(
+                "reference_line_ids must be in [0, 8], got "
+                + ", ".join(map(str, invalid_line_ids))
+            )
+
+        additional_all = generate_circular_pattern_scans(
+            plane_R=plane_R,
+            plane_t=plane_t,
+            T_ef_s_true=T_ef_s_true,
+            radius_mm=radius_mm,
+            x_values=x_values,
+            noise_std=noise_std,
+            rng=rng,
+            scan_params=reference_scan_params,
+            check_reachability=check_reachability,
+            plane_id=0,
+            pose_geometry=pose_geometry,
+            T_ef_s_command=T_ef_s_command,
+            actual_plane_n=actual_plane_n,
+            actual_plane_l=actual_plane_l,
         )
+
+        selected_additional: list[LaserScan] = []
+        selected_count_by_line = {line_id: 0 for line_id in line_ids}
+        for scan in additional_all:
+            line_id = int(scan.meta.get("line_id", -1))
+            if line_id not in selected_count_by_line:
+                continue
+            scan.meta["additional_scan"] = True
+            scan.meta["additional_line_id"] = line_id
+            scan.meta["assigned_theta_deg"] = _theta_from_scan_param(
+                reference_scan_params[int(scan.meta["parameter_id"])]
+            )
+            selected_additional.append(scan)
+            selected_count_by_line[line_id] += 1
+
+        expected_per_line = len(reference_scan_params)
+        for line_id in line_ids:
+            actual_count = selected_count_by_line[line_id]
+            if actual_count != expected_per_line:
+                raise RuntimeError(
+                    f"additional line {line_id}: expected {expected_per_line} scans, "
+                    f"got {actual_count}"
+                )
+
+        expected_total = len(line_ids) * expected_per_line
+        if reference_scan_count != expected_total:
+            raise ValueError(
+                "reference_scan_count does not match the defined additional scan: "
+                f"expected {expected_total} = {len(line_ids)} lines x "
+                f"{expected_per_line} parameter combinations, got "
+                f"{reference_scan_count}"
+            )
+
+        scans.extend(selected_additional)
 
     for scan_id, scan in enumerate(scans):
         scan.scan_id = scan_id
@@ -395,6 +600,140 @@ def _reconstruct_points_base(
     if not point_sets:
         return np.empty((0, 3), dtype=float)
     return np.vstack(point_sets)
+
+
+def generate_bootstrap_plane_scans(
+    *,
+    T_ef_s_true: np.ndarray,
+    T_ef_s_initial: np.ndarray,
+    plane_R_true: np.ndarray,
+    plane_t_true: np.ndarray,
+    plane_n_true: np.ndarray,
+    plane_l_true: float,
+    rng: np.random.Generator,
+    x_values: np.ndarray,
+    noise_std: float,
+    scan_count: int = 4,
+    line_half_length_mm: float = 50.0,
+    d_mm: float = 120.0,
+    theta_deg: float = 30.0,
+    beta_deg: float = 90.0,
+    pose_geometry: str = "paper_incidence",
+    check_reachability: bool = False,
+) -> list[LaserScan]:
+    """Acquire preliminary profiles used only to locate the physical plane.
+
+    The true plane is used here only to model an operator manually aiming the
+    sensor so that each preliminary profile crosses the board. Exact circular
+    trajectory parameters are not inferred from this oracle geometry. Robot
+    flange commands are computed with ``T_ef_s_initial`` and measurements are
+    generated with ``T_ef_s_true``, so mounting-estimate error is present in
+    both the preliminary profiles and the reconstructed bootstrap plane.
+    """
+    if scan_count < 3:
+        raise ValueError("bootstrap scan_count must be at least 3")
+    if line_half_length_mm <= 0.0:
+        raise ValueError("bootstrap line_half_length_mm must be positive")
+
+    scans: list[LaserScan] = []
+    line_offsets = np.linspace(
+        -float(line_half_length_mm),
+        float(line_half_length_mm),
+        scan_count,
+    )
+    for bootstrap_id, line_offset in enumerate(line_offsets):
+        # Model a short manual raster: four parallel profiles with one fixed
+        # sensor orientation and lateral translations across the plane. Keeping
+        # the preliminary flange rotations equal avoids turning initial
+        # hand-eye rotation error into four mutually inconsistent plane views.
+        line_p0 = np.array(
+            [-float(line_half_length_mm), line_offset],
+            dtype=float,
+        )
+        line_p1 = np.array(
+            [float(line_half_length_mm), line_offset],
+            dtype=float,
+        )
+        branch_sign = 1.0
+        T_base_s_command = sensor_pose_from_target_line(
+            plane_R=plane_R_true,
+            plane_t=plane_t_true,
+            line_p0=line_p0,
+            line_p1=line_p1,
+            d_mm=d_mm,
+            theta_deg=theta_deg,
+            beta_deg=beta_deg,
+            branch_sign=branch_sign,
+            pose_geometry=pose_geometry,
+        )
+        T_base_ef_command = T_base_s_command @ inv_T(T_ef_s_initial)
+        if check_reachability and not is_reachable_simple(T_base_ef_command):
+            continue
+
+        T_base_s_actual = T_base_ef_command @ T_ef_s_true
+        scan = simulate_profile_on_plane(
+            T_base_ef=T_base_ef_command,
+            T_ef_s_true=T_ef_s_true,
+            plane_n=plane_n_true,
+            plane_l=plane_l_true,
+            x_values=x_values,
+            noise_std=noise_std,
+            rng=rng,
+            plane_id=0,
+            scan_id=bootstrap_id,
+            meta={
+                "bootstrap_pose": True,
+                "bootstrap_id": bootstrap_id,
+                "theta_branch_sign": branch_sign,
+                "pose_geometry": pose_geometry,
+                "d_mm": float(d_mm),
+                "theta_deg": float(theta_deg),
+                "beta_deg": float(beta_deg),
+                "command_actual_translation_error_mm": float(
+                    np.linalg.norm(
+                        T_base_s_actual[:3, 3] - T_base_s_command[:3, 3]
+                    )
+                ),
+                "command_actual_rotation_error_deg": _rotation_angle_deg(
+                    T_base_s_command[:3, :3],
+                    T_base_s_actual[:3, :3],
+                ),
+            },
+        )
+        scans.append(scan)
+
+    if len(scans) < 3:
+        raise RuntimeError(
+            "fewer than three reachable bootstrap scans were acquired"
+        )
+    return scans
+
+
+def estimate_plane_frame_from_bootstrap_scans(
+    scans: list[LaserScan],
+    T_ef_s_initial: np.ndarray,
+) -> BootstrapPlaneResult:
+    """Estimate a complete planning frame from preliminary scan profiles."""
+    points_base = _reconstruct_points_base(scans, T_ef_s_initial)
+    if len(points_base) < 3:
+        raise ValueError(
+            "cannot estimate bootstrap plane from fewer than 3 points"
+        )
+
+    plane_n, plane_l, centroid, fit_rms_mm = fit_plane_pca(points_base)
+    tangent_u, tangent_v = plane_basis(plane_n)
+    plane_R = np.column_stack([tangent_u, tangent_v, plane_n])
+    # PCA's centroid lies on the least-squares plane up to floating point
+    # error. Project it explicitly and use it as the circular-pattern centre.
+    plane_t = centroid - (float(plane_n @ centroid) - plane_l) * plane_n
+    return BootstrapPlaneResult(
+        scans=list(scans),
+        plane_R=plane_R,
+        plane_t=plane_t,
+        plane_n=plane_n,
+        plane_l=float(plane_l),
+        fit_rms_mm=float(fit_rms_mm),
+    )
 
 
 def _final_self_fit_plane_rms_mm(
@@ -2338,6 +2677,7 @@ def _one_alternating_iteration(
     scans_by_plane: dict[int, list[LaserScan]],
     T_input: np.ndarray,
     plane_offset_mode: str = "fitted",
+    solver_update_mode: str = "simultaneous",
 ) -> np.ndarray:
     """Evaluate one full plane-fit/hand-eye alternating iteration F(T)."""
     one = calibrate_planes(
@@ -2346,6 +2686,7 @@ def _one_alternating_iteration(
         max_iter=1,
         tol=-1.0,
         plane_offset_mode=plane_offset_mode,
+        solver_update_mode=solver_update_mode,
     )
     return np.asarray(one.T_ef_s, dtype=float).reshape(4, 4)
 
@@ -2356,6 +2697,7 @@ def iteration_mapping_jacobian(
     rotation_eps_rad: float = 1e-6,
     translation_eps_mm: float = 1e-4,
     plane_offset_mode: str = "fitted",
+    solver_update_mode: str = "simultaneous",
 ) -> dict[str, object]:
     """Numerically linearize the actual one-step map T_{k+1}=F(T_k).
 
@@ -2370,6 +2712,7 @@ def iteration_mapping_jacobian(
         scans_by_plane,
         T_reference,
         plane_offset_mode=plane_offset_mode,
+        solver_update_mode=solver_update_mode,
     )
     eps = np.array(
         [rotation_eps_rad] * 3 + [translation_eps_mm] * 3, dtype=float
@@ -2383,11 +2726,13 @@ def iteration_mapping_jacobian(
             scans_by_plane,
             _apply_se3_local_perturbation(T_reference, d),
             plane_offset_mode=plane_offset_mode,
+            solver_update_mode=solver_update_mode,
         )
         F_minus = _one_alternating_iteration(
             scans_by_plane,
             _apply_se3_local_perturbation(T_reference, -d),
             plane_offset_mode=plane_offset_mode,
+            solver_update_mode=solver_update_mode,
         )
         y_plus = _se3_local_difference(F0, F_plus)
         y_minus = _se3_local_difference(F0, F_minus)
@@ -2428,6 +2773,7 @@ def print_iteration_convergence_diagnostics(
     T_history: list[np.ndarray],
     plane_rms_history: list[float],
     plane_offset_mode: str = "fitted",
+    solver_update_mode: str = "simultaneous",
 ) -> None:
     """Print empirical convergence ratios and the one-step-map Jacobian."""
     if T_history:
@@ -2472,6 +2818,7 @@ def print_iteration_convergence_diagnostics(
             scans_by_plane=scans_by_plane,
             T_reference=T_true,
             plane_offset_mode=plane_offset_mode,
+            solver_update_mode=solver_update_mode,
         )
         rho = float(mapping["spectral_radius"])
         defect = np.asarray(mapping["fixed_point_defect"], dtype=float)
@@ -2635,6 +2982,9 @@ def print_solver_diagnostics(
             plane_rms_history=rms_history,
             plane_offset_mode=str(
                 getattr(result, "plane_offset_mode", "fitted")
+            ),
+            solver_update_mode=str(
+                getattr(result, "solver_update_mode", "simultaneous")
             ),
         )
 
@@ -3005,6 +3355,7 @@ def make_and_save_sensor_pose_plot(
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
+        reference_line_ids=reference_line_ids,
     )
     return save_sensor_poses_by_line_plot(
         T_ef_s_true=T_true,
@@ -3039,6 +3390,7 @@ def make_and_save_translation_gauge_plot(
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
+    reference_line_ids: tuple[int, ...] | None,
 ) -> tuple[Path, dict[str, np.ndarray]]:
     """Generate one deterministic system and visualize its gauge sweep."""
     if shift_span_mm <= 0.0:
@@ -3113,6 +3465,7 @@ def make_and_save_translation_gauge_plot(
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
+        reference_line_ids=reference_line_ids,
     )
     shifts = np.linspace(
         -float(shift_span_mm),
@@ -3154,6 +3507,7 @@ def make_and_save_debug_scene_plot(
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
+    reference_line_ids: tuple[int, ...] | None,
 ) -> Path:
     """Generate and plot one optimal-parameter single-plane system."""
 
@@ -3189,6 +3543,7 @@ def make_and_save_debug_scene_plot(
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
+        reference_line_ids=reference_line_ids,
     )
 
     plot_arguments = {
@@ -3216,6 +3571,7 @@ def run_one_trial(
     init_translation_range_mm: float,
     init_angle_range_deg: float,
     plane_offset_mode: str,
+    solver_update_mode: str,
     nonlinear_refine: bool,
     nonlinear_plane_mode: str,
     nonlinear_max_nfev: int,
@@ -3237,11 +3593,23 @@ def run_one_trial(
     pose_geometry: str,
     reference_scan_params: list[dict],
     reference_scan_count: int,
+    reference_line_ids: tuple[int, ...] | None,
+    trajectory_planning: str = "ground_truth",
+    bootstrap_scan_count: int = 4,
+    bootstrap_line_half_length_mm: float = 50.0,
+    bootstrap_d_mm: float = 120.0,
+    bootstrap_theta_deg: float = 30.0,
+    bootstrap_beta_deg: float = 90.0,
     debug_diagnostics: bool = False,
     debug_known_baseline: bool = True,
     fix_true_plane_offset: bool = False,
     gt_rng: np.random.Generator | None = None,
     init_rng: np.random.Generator | None = None,
+    outlier_translation_threshold_mm: float = 5.0,
+    outlier_rotation_threshold_deg: float = 1.0,
+    outlier_plane_rms_threshold_mm: float = 2.0,
+    outlier_trace_dir: Path | None = None,
+    force_save_trace: bool = False,
 ) -> SinglePlaneTrialResult:
     T_true, true_angles_deg, true_translation_mm = sample_random_handeye(
         rng if gt_rng is None else gt_rng
@@ -3259,10 +3627,70 @@ def run_one_trial(
     )
     plane = (plane_n, plane_l)
 
+    if trajectory_planning not in ("ground_truth", "bootstrap"):
+        raise ValueError(
+            "trajectory_planning must be 'ground_truth' or 'bootstrap'"
+        )
+    if trajectory_planning == "bootstrap" and mode != "unknown":
+        raise ValueError("bootstrap trajectory planning requires mode='unknown'")
+
+    T_init: np.ndarray | None = None
+    bootstrap_result: BootstrapPlaneResult | None = None
+    bootstrap_normal_error_deg = float("nan")
+    bootstrap_offset_error_mm = float("nan")
+
+    if trajectory_planning == "bootstrap":
+        T_init = make_initial_guess(
+            reference_angles_deg=true_angles_deg,
+            reference_translation_mm=true_translation_mm,
+            rng=rng if init_rng is None else init_rng,
+            mode=init_mode,
+            rel_offset=rel_offset,
+            translation_range_mm=init_translation_range_mm,
+            angle_range_deg=init_angle_range_deg,
+        )
+        bootstrap_scans = generate_bootstrap_plane_scans(
+            T_ef_s_true=T_true,
+            T_ef_s_initial=T_init,
+            plane_R_true=plane_R,
+            plane_t_true=plane_t,
+            plane_n_true=plane_n,
+            plane_l_true=plane_l,
+            rng=rng,
+            x_values=x_values,
+            noise_std=noise_std,
+            scan_count=bootstrap_scan_count,
+            line_half_length_mm=bootstrap_line_half_length_mm,
+            d_mm=bootstrap_d_mm,
+            theta_deg=bootstrap_theta_deg,
+            beta_deg=bootstrap_beta_deg,
+            pose_geometry=pose_geometry,
+            check_reachability=check_reachability,
+        )
+        bootstrap_result = estimate_plane_frame_from_bootstrap_scans(
+            bootstrap_scans,
+            T_init,
+        )
+        bootstrap_normal_error_deg, bootstrap_offset_error_mm = _plane_difference(
+            (bootstrap_result.plane_n, bootstrap_result.plane_l),
+            plane,
+        )
+        planning_plane_R = bootstrap_result.plane_R
+        planning_plane_t = bootstrap_result.plane_t
+        command_handeye = T_init
+        actual_plane_n = plane_n
+        actual_plane_l = plane_l
+    else:
+        planning_plane_R = plane_R
+        planning_plane_t = plane_t
+        command_handeye = None
+        actual_plane_n = None
+        actual_plane_l = None
+
     scans_by_plane = generate_optimal_single_plane_dataset(
         T_ef_s_true=T_true,
-        plane_R=plane_R,
-        plane_t=plane_t,
+        plane_R=planning_plane_R,
+        plane_t=planning_plane_t,
         rng=rng,
         x_values=x_values,
         radius_mm=radius_mm,
@@ -3273,9 +3701,47 @@ def run_one_trial(
         pose_geometry=pose_geometry,
         reference_scan_params=reference_scan_params,
         reference_scan_count=reference_scan_count,
+        reference_line_ids=reference_line_ids,
+        T_ef_s_command=command_handeye,
+        actual_plane_n=actual_plane_n,
+        actual_plane_l=actual_plane_l,
+    )
+
+    command_translation_errors = np.asarray(
+        [
+            float(scan.meta.get("command_actual_translation_error_mm", np.nan))
+            for scan in scans_by_plane[0]
+        ],
+        dtype=float,
+    )
+    command_rotation_errors = np.asarray(
+        [
+            float(scan.meta.get("command_actual_rotation_error_deg", np.nan))
+            for scan in scans_by_plane[0]
+        ],
+        dtype=float,
+    )
+    command_actual_translation_error_mean_mm = float(
+        np.nanmean(command_translation_errors)
+    )
+    command_actual_rotation_error_mean_deg = float(
+        np.nanmean(command_rotation_errors)
     )
 
     if debug_diagnostics:
+        if bootstrap_result is not None:
+            print(
+                f"\n[debug trial {system_idx:04d}] bootstrap planning | "
+                f"scans={len(bootstrap_result.scans)} | "
+                f"fit_rms={bootstrap_result.fit_rms_mm:.6g} mm | "
+                f"normal_error={bootstrap_normal_error_deg:.6g} deg | "
+                f"offset_error={bootstrap_offset_error_mm:.6g} mm"
+            )
+            print(
+                "  commanded vs actual target sensor pose: "
+                f"mean_translation={command_actual_translation_error_mean_mm:.6g} mm, "
+                f"mean_rotation={command_actual_rotation_error_mean_deg:.6g} deg"
+            )
         print_dataset_diagnostics(
             system_idx=system_idx,
             scans_by_plane=scans_by_plane,
@@ -3301,7 +3767,6 @@ def run_one_trial(
     nonlinear_delta_translation_mm = float("nan")
     nonlinear_delta_rotation_deg = float("nan")
     final_linear_plane_rms_mm = float("nan")
-    T_init: np.ndarray | None = None
     history_initial_T: np.ndarray | None = None
     solver_result: object | None = None
     offset_anchor_applied = False
@@ -3352,15 +3817,16 @@ def run_one_trial(
         iter_T_frob_error = iter_frobenius_error(transform_history, T_true)
 
     elif mode == "unknown":
-        T_init = make_initial_guess(
-            reference_angles_deg=true_angles_deg,
-            reference_translation_mm=true_translation_mm,
-            rng=rng if init_rng is None else init_rng,
-            mode=init_mode,
-            rel_offset=rel_offset,
-            translation_range_mm=init_translation_range_mm,
-            angle_range_deg=init_angle_range_deg,
-        )
+        if T_init is None:
+            T_init = make_initial_guess(
+                reference_angles_deg=true_angles_deg,
+                reference_translation_mm=true_translation_mm,
+                rng=rng if init_rng is None else init_rng,
+                mode=init_mode,
+                rel_offset=rel_offset,
+                translation_range_mm=init_translation_range_mm,
+                angle_range_deg=init_angle_range_deg,
+            )
         history_initial_T = T_init
 
         init_trans_err_norm_mm = float(
@@ -3376,6 +3842,7 @@ def run_one_trial(
             max_iter=max_iter,
             tol=tol,
             plane_offset_mode=plane_offset_mode,
+            solver_update_mode=solver_update_mode,
         )
 
         final_linear_plane_rms_mm = _final_self_fit_plane_rms_mm(
@@ -3500,7 +3967,8 @@ def run_one_trial(
         raise ValueError("mode must be 'known' or 'unknown'")
 
     transform_states = list(transform_history)
-    if history_initial_T is not None:
+    has_explicit_initial_state = history_initial_T is not None
+    if has_explicit_initial_state:
         transform_states.insert(0, history_initial_T)
     component_histories = transform_error_component_histories(
         transform_states,
@@ -3516,11 +3984,18 @@ def run_one_trial(
 
     iter_plane_offset_estimate_mm: list[float] = []
     iter_plane_offset_error_mm: list[float] = []
+    iter_plane_normal_error_deg: list[float] = []
+    iter_true_plane_rms_mm: list[float] = []
     iter_err_t_sensor_z_mm: list[float] = []
     iter_normal_sensor_z_dot_mean: list[float] = []
+    plane_normal_history: list[np.ndarray] = []
     for state_index, transform in enumerate(transform_states):
-        if state_index < len(cached_plane_states):
-            estimated_plane = cached_plane_states[state_index]
+        # Solver plane histories correspond to post-update T_history states.
+        # When T_init is prepended, estimate its plane independently instead of
+        # shifting the solver histories by one iteration.
+        cached_index = state_index - 1 if has_explicit_initial_state else state_index
+        if 0 <= cached_index < len(cached_plane_states):
+            estimated_plane = cached_plane_states[cached_index]
         else:
             estimated_plane = estimate_plane_from_handeye(
                 scans=scans_by_plane[0],
@@ -3530,8 +4005,26 @@ def run_one_trial(
             estimated_plane,
             plane_n,
         )
+        plane_normal_history.append(np.asarray(estimated_normal, dtype=float))
+        normal_error_deg, _ = _plane_difference(
+            (estimated_normal, estimated_offset),
+            (plane_n, plane_l),
+        )
+        iter_plane_normal_error_deg.append(float(normal_error_deg))
         iter_plane_offset_estimate_mm.append(float(estimated_offset))
         iter_plane_offset_error_mm.append(float(estimated_offset - plane_l))
+
+        points_base_state = _reconstruct_points_base(
+            scans_by_plane[0],
+            transform,
+        )
+        true_plane_stats = _plane_residual_stats(
+            points_base_state,
+            plane_n,
+            plane_l,
+        )
+        iter_true_plane_rms_mm.append(float(true_plane_stats["rms"]))
+
         state_gauge = translation_error_sensor_z_components(transform, T_true)
         iter_err_t_sensor_z_mm.append(float(state_gauge["error_sensor"][2]))
         iter_normal_sensor_z_dot_mean.append(
@@ -3568,18 +4061,48 @@ def run_one_trial(
         T_true[:3, :3],
     )
     rotation_error_sensor = T_true[:3, :3].T @ rotation_vector_error
+    translation_error_norm_mm = float(np.linalg.norm(translation_error))
+    rotation_error_angle_deg = float(
+        rot_error_deg(T_est[:3, :3], T_true[:3, :3])
+    )
+    final_self_fit_plane_rms_mm = _final_self_fit_plane_rms_mm(
+        scans_by_plane,
+        T_est,
+    )
     paper_success = bool(
         converged
         and iterations <= 2000
         and np.all(np.abs(translation_error) < 0.01)
     )
+    outlier, outlier_reason = classify_outlier(
+        converged=converged,
+        translation_error_mm=translation_error_norm_mm,
+        rotation_error_deg=rotation_error_angle_deg,
+        self_fit_plane_rms_mm=final_self_fit_plane_rms_mm,
+        translation_threshold_mm=outlier_translation_threshold_mm,
+        rotation_threshold_deg=outlier_rotation_threshold_deg,
+        plane_rms_threshold_mm=outlier_plane_rms_threshold_mm,
+    )
 
-    return SinglePlaneTrialResult(
+    trial_result = SinglePlaneTrialResult(
         system_idx=system_idx,
         mode=mode,
         init_mode=init_mode,
         plane_offset_mode=plane_offset_mode,
+        solver_update_mode=solver_update_mode,
         pose_geometry=pose_geometry,
+        trajectory_planning=trajectory_planning,
+        n_bootstrap_scans=(
+            len(bootstrap_result.scans) if bootstrap_result is not None else 0
+        ),
+        bootstrap_plane_normal_error_deg=bootstrap_normal_error_deg,
+        bootstrap_plane_offset_error_mm=bootstrap_offset_error_mm,
+        command_actual_translation_error_mean_mm=(
+            command_actual_translation_error_mean_mm
+        ),
+        command_actual_rotation_error_mean_deg=(
+            command_actual_rotation_error_mean_deg
+        ),
         n_reference_scans=sum(
             bool(scan.meta.get("reference_pose", False))
             for scan in scans_by_plane[0]
@@ -3591,10 +4114,8 @@ def run_one_trial(
         iterations=iterations,
         rank_last=rank_last,
         cond_last=cond_last,
-        trans_err_norm_mm=float(np.linalg.norm(translation_error)),
-        rot_err_angle_deg=float(
-            rot_error_deg(T_est[:3, :3], T_true[:3, :3])
-        ),
+        trans_err_norm_mm=translation_error_norm_mm,
+        rot_err_angle_deg=rotation_error_angle_deg,
         err_tx_mm=float(translation_error[0]),
         err_ty_mm=float(translation_error[1]),
         err_tz_mm=float(translation_error[2]),
@@ -3622,7 +4143,10 @@ def run_one_trial(
         plane_offset_error_mm=plane_offset_error_mm,
         normal_sensor_z_dot_mean=normal_sensor_z_dot_mean,
         paper_success=paper_success,
+        outlier=outlier,
+        outlier_reason=outlier_reason,
         final_linear_plane_rms_mm=final_linear_plane_rms_mm,
+        final_self_fit_plane_rms_mm=final_self_fit_plane_rms_mm,
         init_trans_err_norm_mm=init_trans_err_norm_mm,
         init_rot_err_angle_deg=init_rot_err_angle_deg,
         nonlinear_refined=nonlinear_refine,
@@ -3648,9 +4172,72 @@ def run_one_trial(
         ],
         iter_plane_offset_estimate_mm=iter_plane_offset_estimate_mm,
         iter_plane_offset_error_mm=iter_plane_offset_error_mm,
+        iter_plane_normal_error_deg=iter_plane_normal_error_deg,
+        iter_true_plane_rms_mm=iter_true_plane_rms_mm,
         iter_err_t_sensor_z_mm=iter_err_t_sensor_z_mm,
         iter_normal_sensor_z_dot_mean=iter_normal_sensor_z_dot_mean,
     )
+
+    if outlier_trace_dir is not None and (outlier or force_save_trace):
+        trace_dir = Path(outlier_trace_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"trial_{system_idx:04d}"
+        save_trial_iteration_diagnostics_csv(
+            trial_result,
+            trace_dir / f"{prefix}_iterations.csv",
+        )
+        np.savez_compressed(
+            trace_dir / f"{prefix}_trace.npz",
+            system_idx=np.asarray(system_idx, dtype=int),
+            outlier=np.asarray(outlier, dtype=bool),
+            outlier_reason=np.asarray(outlier_reason),
+            T_true=np.asarray(T_true, dtype=float),
+            T_init=(
+                np.asarray(T_init, dtype=float)
+                if T_init is not None
+                else np.full((4, 4), np.nan, dtype=float)
+            ),
+            T_final=np.asarray(T_est, dtype=float),
+            T_history=np.asarray(transform_states, dtype=float),
+            plane_normal_true=np.asarray(plane_n, dtype=float),
+            plane_offset_true_mm=np.asarray(plane_l, dtype=float),
+            plane_normal_history=np.asarray(plane_normal_history, dtype=float),
+            plane_offset_history_mm=np.asarray(
+                iter_plane_offset_estimate_mm, dtype=float
+            ),
+            translation_error_history_mm=np.asarray(
+                component_histories["translation_norm_mm"], dtype=float
+            ),
+            rotation_error_history_deg=np.asarray(
+                component_histories["rotation_geodesic_deg"], dtype=float
+            ),
+            self_fit_plane_rms_history_mm=np.asarray(
+                plane_rms_history_mm, dtype=float
+            ),
+            true_plane_rms_history_mm=np.asarray(
+                iter_true_plane_rms_mm, dtype=float
+            ),
+            plane_normal_error_history_deg=np.asarray(
+                iter_plane_normal_error_deg, dtype=float
+            ),
+            plane_offset_error_history_mm=np.asarray(
+                iter_plane_offset_error_mm, dtype=float
+            ),
+            sensor_z_translation_error_history_mm=np.asarray(
+                iter_err_t_sensor_z_mm, dtype=float
+            ),
+            outlier_translation_threshold_mm=np.asarray(
+                outlier_translation_threshold_mm, dtype=float
+            ),
+            outlier_rotation_threshold_deg=np.asarray(
+                outlier_rotation_threshold_deg, dtype=float
+            ),
+            outlier_plane_rms_threshold_mm=np.asarray(
+                outlier_plane_rms_threshold_mm, dtype=float
+            ),
+        )
+
+    return trial_result
 
 
 def main() -> None:
@@ -3659,6 +4246,15 @@ def main() -> None:
     )
     parser.add_argument("--systems", type=int, default=100)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--only-trial",
+        type=int,
+        default=None,
+        help=(
+            "run only this zero-based system index while preserving the same "
+            "SeedSequence([seed, system_idx]) reproducibility"
+        ),
+    )
     parser.add_argument("--mode", choices=["known", "unknown"], default="unknown")
     parser.add_argument("--profile-points", type=int, default=100)
     parser.add_argument("--profile-half-width", type=float, default=25.0)
@@ -3716,13 +4312,64 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--trajectory-planning",
+        choices=["ground_truth", "bootstrap"],
+        default="ground_truth",
+        help=(
+            "ground_truth reproduces the original simulator and converts exact "
+            "sensor poses with GT hand-eye; bootstrap first estimates the plane "
+            "from preliminary profiles and commands all calibration poses with "
+            "the initial hand-eye"
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap-scans",
+        type=int,
+        default=4,
+        help="number of preliminary plane-localization profiles",
+    )
+    parser.add_argument(
+        "--bootstrap-line-half-length-mm",
+        type=float,
+        default=50.0,
+        help="half length of each manually aimed bootstrap target line",
+    )
+    parser.add_argument(
+        "--bootstrap-height-mm",
+        type=float,
+        default=120.0,
+        help="nominal d used only for preliminary plane-localization poses",
+    )
+    parser.add_argument(
+        "--bootstrap-theta-deg",
+        type=float,
+        default=30.0,
+    )
+    parser.add_argument(
+        "--bootstrap-beta-deg",
+        type=float,
+        default=90.0,
+    )
+    parser.add_argument(
         "--reference-scans",
         type=int,
-        default=24,
+        default=None,
         help=(
-            "number of explicitly counted auxiliary second-theta scans used "
-            "to break the fixed-theta translation/plane-offset gauge; 0 runs "
-            "the strict but rank-deficient 81-scan grid"
+            "deprecated explicit count. In additional-line mode the count is "
+            "derived automatically as len(--additional-lines) x "
+            "len(--reference-heights-mm) x len(--reference-beta-deg). "
+            "Set 0 to disable additional scans."
+        ),
+    )
+    parser.add_argument(
+        "--additional-lines",
+        type=int,
+        nargs="+",
+        default=[1, 2, 5, 6],
+        metavar="LINE_ID",
+        help=(
+            "circular-pattern line IDs used for the additional theta scan. "
+            "Line IDs are 0..8. Default: 1 2 5 6"
         ),
     )
     parser.add_argument(
@@ -3776,12 +4423,25 @@ def main() -> None:
     parser.add_argument("--init-angle-range-deg", type=float, default=30.0)
     parser.add_argument(
         "--plane-offset-mode",
-        choices=["joint", "fitted"],
+        choices=["joint", "fitted", "difference"],
         default="joint",
         help=(
             "joint estimates hand-eye translation and unknown plane offsets "
             "in the same linear update and rejects rank-deficient data; "
-            "fitted uses the legacy fit-then-solve offset iteration"
+            "fitted uses the legacy fit-then-solve offset iteration; "
+            "difference eliminates the offset with centered all-point "
+            "constraints equivalent to n.T @ (p_i - p_j) = 0"
+        ),
+    )
+    parser.add_argument(
+        "--solver-update-mode",
+        choices=["simultaneous", "separated"],
+        default="simultaneous",
+        help=(
+            "simultaneous solves rotation and translation from one PCA plane; "
+            "separated performs PCA -> rotation-only least squares with fixed "
+            "translation -> SO(3) projection -> PCA -> translation-only least "
+            "squares with fixed rotation"
         ),
     )
     parser.add_argument(
@@ -3872,6 +4532,33 @@ def main() -> None:
         default=121,
         help="number of translation samples in the gauge plot",
     )
+    parser.add_argument(
+        "--outlier-translation-threshold-mm",
+        type=float,
+        default=5.0,
+        help="gross-outlier threshold for final translation error norm",
+    )
+    parser.add_argument(
+        "--outlier-rotation-threshold-deg",
+        type=float,
+        default=1.0,
+        help="gross-outlier threshold for final geodesic rotation error",
+    )
+    parser.add_argument(
+        "--outlier-plane-rms-threshold-mm",
+        type=float,
+        default=2.0,
+        help="gross-outlier threshold for final self-fitted plane RMS",
+    )
+    parser.add_argument(
+        "--outlier-trace-dir",
+        type=Path,
+        default=None,
+        help=(
+            "directory for per-outlier iteration CSV and full NPZ traces; "
+            "defaults to <csv_stem>_outliers"
+        ),
+    )
     parser.add_argument("--plot-dir", type=Path, default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -3912,8 +4599,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.reference_scans < 0:
+    if args.systems <= 0:
+        parser.error("--systems must be positive")
+    if args.only_trial is not None and args.only_trial < 0:
+        parser.error("--only-trial must be non-negative")
+    if args.outlier_translation_threshold_mm <= 0.0:
+        parser.error("--outlier-translation-threshold-mm must be positive")
+    if args.outlier_rotation_threshold_deg <= 0.0:
+        parser.error("--outlier-rotation-threshold-deg must be positive")
+    if args.outlier_plane_rms_threshold_mm <= 0.0:
+        parser.error("--outlier-plane-rms-threshold-mm must be positive")
+    if args.reference_scans is not None and args.reference_scans < 0:
         parser.error("--reference-scans must be non-negative")
+
+    additional_line_ids = tuple(int(value) for value in args.additional_lines)
+    if len(set(additional_line_ids)) != len(additional_line_ids):
+        parser.error("--additional-lines must not contain duplicates")
+    if any(value < 0 or value > 8 for value in additional_line_ids):
+        parser.error("--additional-lines values must be in [0, 8]")
+    if args.bootstrap_scans < 3:
+        parser.error("--bootstrap-scans must be at least 3")
+    if args.bootstrap_line_half_length_mm <= 0.0:
+        parser.error("--bootstrap-line-half-length-mm must be positive")
+    if args.bootstrap_height_mm <= 0.0:
+        parser.error("--bootstrap-height-mm must be positive")
+    if args.trajectory_planning == "bootstrap" and args.mode != "unknown":
+        parser.error("--trajectory-planning bootstrap requires --mode unknown")
     if args.debug_gauge_span_mm <= 0.0:
         parser.error("--debug-gauge-span-mm must be positive")
     if args.debug_gauge_samples < 3:
@@ -3921,6 +4632,17 @@ def main() -> None:
     plane_center_z_range_mm = (
         args.plane_center_z_min_mm,
         args.plane_center_z_max_mm,
+    )
+    system_indices = (
+        [int(args.only_trial)]
+        if args.only_trial is not None
+        else list(range(args.systems))
+    )
+    requested_systems = len(system_indices)
+    outlier_trace_dir = (
+        args.outlier_trace_dir
+        if args.outlier_trace_dir is not None
+        else args.csv.parent / f"{args.csv.stem}_outliers"
     )
 
     x_values = np.linspace(
@@ -3951,9 +4673,24 @@ def main() -> None:
         theta_deg=(float(args.reference_theta_deg),),
         beta_deg=tuple(args.reference_beta_deg),
     )
+    derived_additional_scan_count = (
+        len(additional_line_ids) * len(reference_scan_params)
+    )
+    if args.reference_scans is None:
+        reference_scan_count = derived_additional_scan_count
+    elif args.reference_scans == 0:
+        reference_scan_count = 0
+        additional_line_ids = tuple()
+    elif args.reference_scans != derived_additional_scan_count:
+        parser.error(
+            "--reference-scans must equal the defined additional scan count "
+            f"{derived_additional_scan_count}, or be 0 to disable it"
+        )
+    else:
+        reference_scan_count = int(args.reference_scans)
     nominal_scan_count = (
         _nominal_target_scan_count(scan_params, theta_by_line_deg)
-        + args.reference_scans
+        + reference_scan_count
     )
     incidence_source = (
         theta_by_line_deg
@@ -3963,7 +4700,7 @@ def main() -> None:
     incidence_magnitudes = {
         round(abs(float(value)), 12) for value in incidence_source
     }
-    if args.reference_scans > 0:
+    if reference_scan_count > 0:
         incidence_magnitudes.add(
             round(abs(float(args.reference_theta_deg)), 12)
         )
@@ -3975,9 +4712,9 @@ def main() -> None:
         print(
             "[single-plane-optimal] WARNING: fixed-|theta| paper-incidence "
             "data cannot separate sensor-optical-axis translation from the "
-            "unknown plane offset. Use --plane-offset-mode joint to reject "
-            "this gauge, and add scans at a different |theta| for absolute "
-            "translation."
+            "unknown plane offset. Joint/difference makes the offset coupling "
+            "explicit but cannot create the missing information; add scans at "
+            "a different |theta| for absolute translation."
         )
 
     if args.debug_scene_plot is not None:
@@ -4002,7 +4739,8 @@ def main() -> None:
             theta_by_line_deg=theta_by_line_deg,
             pose_geometry=args.pose_geometry,
             reference_scan_params=reference_scan_params,
-            reference_scan_count=args.reference_scans,
+            reference_scan_count=reference_scan_count,
+            reference_line_ids=additional_line_ids,
         )
         print(f"saved debug scene plot: {debug_path}")
 
@@ -4029,7 +4767,8 @@ def main() -> None:
             theta_by_line_deg=theta_by_line_deg,
             pose_geometry=args.pose_geometry,
             reference_scan_params=reference_scan_params,
-            reference_scan_count=args.reference_scans,
+            reference_scan_count=reference_scan_count,
+            reference_line_ids=additional_line_ids,
             frame_scale_mm=args.debug_sensor_frame_scale_mm,
         )
         print(f"saved sensor pose plot: {pose_path}")
@@ -4058,7 +4797,8 @@ def main() -> None:
                 theta_by_line_deg=theta_by_line_deg,
                 pose_geometry=args.pose_geometry,
                 reference_scan_params=reference_scan_params,
-                reference_scan_count=args.reference_scans,
+                reference_scan_count=reference_scan_count,
+                reference_line_ids=additional_line_ids,
             )
         except ValueError as exc:
             parser.error(str(exc))
@@ -4095,17 +4835,19 @@ def main() -> None:
 
     if args.verbose:
         print(
-            f"[single-plane-optimal] start | systems={args.systems} | mode={args.mode} | "
+            f"[single-plane-optimal] start | systems={requested_systems} | mode={args.mode} | "
             f"nominal_scans={nominal_scan_count} | noise={args.noise_std} mm | "
             f"init_mode={args.init_mode} | nonlinear={args.nonlinear_refine} "
             f"({args.nonlinear_plane_mode}) | offset_mode={args.plane_offset_mode} | "
+            f"solver_update={args.solver_update_mode} | "
+            f"trajectory_planning={args.trajectory_planning} | "
             f"fix_true_plane_offset={args.fix_true_plane_offset}"
         )
         print(
             f"[single-plane-optimal] grid | d={tuple(args.heights_mm)} | "
             f"theta_pool={target_theta_pool} | beta={tuple(args.beta_deg)} | "
             f"generated_combinations={len(scan_params)} | "
-            f"retained_target_scans={nominal_scan_count - args.reference_scans} | "
+            f"retained_target_scans={nominal_scan_count - reference_scan_count} | "
             f"geometry={args.pose_geometry}"
         )
         if theta_by_line_deg is not None:
@@ -4117,21 +4859,38 @@ def main() -> None:
                 )
             )
         print(
-            "[single-plane-optimal] observability extension | "
-            f"reference_scans={args.reference_scans} | "
-            f"reference_d={tuple(args.reference_heights_mm)} | "
-            f"reference_theta={args.reference_theta_deg:g} | "
-            f"reference_beta={tuple(args.reference_beta_deg)}"
+            "[single-plane-optimal] defined additional scan | "
+            f"lines={additional_line_ids} | "
+            f"additional_scans={reference_scan_count} | "
+            f"d={tuple(args.reference_heights_mm)} | "
+            f"theta={args.reference_theta_deg:g} | "
+            f"beta={tuple(args.reference_beta_deg)}"
         )
-    elif args.reference_scans > 0:
+        if args.trajectory_planning == "bootstrap":
+            print(
+                "[single-plane-optimal] bootstrap plane localization | "
+                f"scans={args.bootstrap_scans} | "
+                f"line_half_length={args.bootstrap_line_half_length_mm:g} mm | "
+                f"d={args.bootstrap_height_mm:g} mm | "
+                f"theta={args.bootstrap_theta_deg:g} deg | "
+                f"beta={args.bootstrap_beta_deg:g} deg"
+            )
+    elif reference_scan_count > 0:
         print(
             "[single-plane-optimal] note: adding "
-            f"{args.reference_scans} auxiliary theta="
-            f"{args.reference_theta_deg:g} deg observability scans; this is "
-            "an engineering extension, not the paper's reduced 81-scan grid"
+            f"{reference_scan_count} scans at theta="
+            f"{args.reference_theta_deg:g} deg on circular lines "
+            f"{additional_line_ids}; this is an engineering extension to the "
+            "paper-style 81-scan baseline"
+        )
+    if not args.verbose and args.trajectory_planning == "bootstrap":
+        print(
+            "[single-plane-optimal] bootstrap planning: estimating the plane "
+            f"from {args.bootstrap_scans} preliminary profiles and commanding "
+            "the calibration trajectory with the initial hand-eye"
         )
 
-    for system_idx in range(args.systems):
+    for completed_idx, system_idx in enumerate(system_indices, start=1):
         gt_seed, scene_seed, init_seed = np.random.SeedSequence(
             [args.seed, system_idx]
         ).spawn(3)
@@ -4152,6 +4911,7 @@ def main() -> None:
                 init_translation_range_mm=args.init_translation_range_mm,
                 init_angle_range_deg=args.init_angle_range_deg,
                 plane_offset_mode=args.plane_offset_mode,
+                solver_update_mode=args.solver_update_mode,
                 nonlinear_refine=args.nonlinear_refine,
                 nonlinear_plane_mode=args.nonlinear_plane_mode,
                 nonlinear_max_nfev=args.nonlinear_max_nfev,
@@ -4172,15 +4932,39 @@ def main() -> None:
                 theta_by_line_deg=theta_by_line_deg,
                 pose_geometry=args.pose_geometry,
                 reference_scan_params=reference_scan_params,
-                reference_scan_count=args.reference_scans,
+                reference_scan_count=reference_scan_count,
+                reference_line_ids=additional_line_ids,
+                trajectory_planning=args.trajectory_planning,
+                bootstrap_scan_count=args.bootstrap_scans,
+                bootstrap_line_half_length_mm=(
+                    args.bootstrap_line_half_length_mm
+                ),
+                bootstrap_d_mm=args.bootstrap_height_mm,
+                bootstrap_theta_deg=args.bootstrap_theta_deg,
+                bootstrap_beta_deg=args.bootstrap_beta_deg,
                 debug_diagnostics=(
                     args.debug_diagnostics
-                    and (args.debug_all_trials or system_idx == args.debug_trial)
+                    and (
+                        args.debug_all_trials
+                        or args.only_trial is not None
+                        or system_idx == args.debug_trial
+                    )
                 ),
                 debug_known_baseline=not args.no_debug_known_baseline,
                 fix_true_plane_offset=args.fix_true_plane_offset,
                 gt_rng=gt_rng,
                 init_rng=init_rng,
+                outlier_translation_threshold_mm=(
+                    args.outlier_translation_threshold_mm
+                ),
+                outlier_rotation_threshold_deg=(
+                    args.outlier_rotation_threshold_deg
+                ),
+                outlier_plane_rms_threshold_mm=(
+                    args.outlier_plane_rms_threshold_mm
+                ),
+                outlier_trace_dir=outlier_trace_dir,
+                force_save_trace=args.only_trial is not None,
             )
             results.append(result)
         except Exception as exc:
@@ -4203,8 +4987,8 @@ def main() -> None:
                 traceback.print_exc()
 
         if args.verbose and (
-            (system_idx + 1) % log_every == 0
-            or system_idx + 1 == args.systems
+            completed_idx % log_every == 0
+            or completed_idx == requested_systems
         ):
             elapsed = time.perf_counter() - start_time
 
@@ -4217,7 +5001,7 @@ def main() -> None:
                 converged = sum(result.converged for result in results)
                 succeeded = sum(result.paper_success for result in results)
                 print(
-                    f"[single-plane-optimal] progress {system_idx + 1}/{args.systems} | "
+                    f"[single-plane-optimal] progress {completed_idx}/{requested_systems} | "
                     f"ok={len(results)} | fail={failures} | "
                     f"conv={converged}/{len(results)} | "
                     f"paper_success={succeeded}/{len(results)} | "
@@ -4226,7 +5010,7 @@ def main() -> None:
                 )
             else:
                 print(
-                    f"[single-plane-optimal] progress {system_idx + 1}/{args.systems} | "
+                    f"[single-plane-optimal] progress {completed_idx}/{requested_systems} | "
                     f"ok=0 | fail={failures} | elapsed={elapsed:.1f}s"
                 )
 
@@ -4247,7 +5031,7 @@ def main() -> None:
     save_experiment_summary_csv(
         results,
         summary_csv,
-        requested_systems=args.systems,
+        requested_systems=requested_systems,
         failed_systems=failures,
         config={
             **vars(args),
@@ -4264,6 +5048,14 @@ def main() -> None:
 
     save_results_csv(results, args.csv)
     print(f"saved trials: {args.csv}")
+    outliers_csv = args.csv.with_name(f"{args.csv.stem}_outliers.csv")
+    save_outlier_summary_csv(results, outliers_csv)
+    print(f"saved outlier summary: {outliers_csv}")
+    outlier_count = sum(result.outlier for result in results)
+    print(
+        f"outliers={outlier_count}/{len(results)} | "
+        f"trace_dir={outlier_trace_dir}"
+    )
     iterations_csv = args.csv.with_name(f"{args.csv.stem}_iterations.csv")
     save_iteration_history_csv(results, iterations_csv)
     print(f"saved iterations: {iterations_csv}")

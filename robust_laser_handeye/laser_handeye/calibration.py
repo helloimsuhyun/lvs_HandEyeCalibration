@@ -10,7 +10,7 @@ from .geometry import fit_plane_pca, scaled_normal_from_plane
 from .se3 import make_T, project_to_so3, transform_points
 
 
-PlaneOffsetMode = Literal["fitted", "joint"]
+PlaneOffsetMode = Literal["fitted", "joint", "difference"]
 
 
 @dataclass
@@ -120,6 +120,25 @@ def solve_rotation_translation_linear(A: np.ndarray, y: np.ndarray) -> np.ndarra
 
     t = w[6:9]
     return make_T(R, t)
+
+
+def solve_translation_with_fixed_rotation_linear(
+    A: np.ndarray,
+    y: np.ndarray,
+    rotation: np.ndarray,
+) -> np.ndarray:
+    """Estimate only translation in a standard ``[R1, R3, t]`` system."""
+    A = np.asarray(A, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    rotation = np.asarray(rotation, dtype=float).reshape(3, 3)
+    if A.ndim != 2 or A.shape[1] != 9 or A.shape[0] != len(y):
+        raise ValueError("A must have shape (N, 9) and match y")
+
+    rotation_parameters = np.concatenate(
+        [rotation[:, 0], rotation[:, 2]]
+    )
+    translation_rhs = y - A[:, :6] @ rotation_parameters
+    return _solve_column_equilibrated(A[:, 6:9], translation_rhs)
 
 
 # 각 평면별 스캔 데이터 형식을 정리
@@ -262,6 +281,107 @@ def _build_grouped_joint_offset_system_from_current_T(
     )
 
 
+def _build_grouped_difference_system_from_current_T(
+    scans_by_plane: Mapping[int, list[LaserScan]] | Sequence[list[LaserScan]],
+    T_ef_s: np.ndarray,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[float],
+    list[np.ndarray],
+    list[float],
+    list[tuple[int, list[LaserScan]]],
+]:
+    """Build the offset-free point-difference constraints for every plane.
+
+    For one reconstructed physical plane, an uncentered point row has the form
+
+        b_i [R1, R3, t] = -n.T @ t_be_i + l.
+
+    Stacking rows as ``B w - 1*l = c`` gives the same system used by
+    ``plane_offset_mode='joint'``.  For fixed ``w``, its least-squares offset
+    is
+
+        l*(w) = mean(B w - c) = mean(B) w - mean(c).
+
+    Substitution gives
+
+        (B - mean(B)) w = c - mean(c),
+
+    so this builder is the explicit variable-elimination (Schur-complement)
+    form of the joint system, not a different hand-eye objective.
+
+    Subtracting any two rows eliminates the unknown offset ``l`` and gives
+    ``n.T @ (p_i - p_j) = 0``.  Explicitly materializing every pair is
+    quadratic in the number of points.  Mean-centering ``b_i`` and its
+    right-hand side within each physical plane spans the same constraint space
+    and has the identical ordinary least-squares minimizer because
+
+        sum_(i<j) (residual_i - residual_j)^2
+            = N * sum_i (residual_i - mean(residual))^2.
+
+    Points from different scan poses are centered together.  Centering only
+    within each individual scan would also cancel the hand-eye translation and
+    therefore could not calibrate it.
+    """
+    groups = _normalize_scan_groups(scans_by_plane)
+    centered_blocks: list[np.ndarray] = []
+    centered_rhs_blocks: list[np.ndarray] = []
+    rms_all: list[float] = []
+    normals_unit: list[np.ndarray] = []
+    fitted_offsets: list[float] = []
+
+    for _plane_id, scans in groups:
+        points_base = reconstruct_points_base(scans, T_ef_s)
+        normal, offset, _centroid, plane_rms = fit_plane_pca(points_base)
+        normals_unit.append(normal)
+        fitted_offsets.append(float(offset))
+        rms_all.append(float(plane_rms))
+
+        plane_blocks: list[np.ndarray] = []
+        plane_rhs_blocks: list[np.ndarray] = []
+        for scan in scans:
+            points_s = scan.valid_points_s
+            if len(points_s) == 0:
+                continue
+
+            R_be = scan.T_base_ef[:3, :3]
+            t_be = scan.T_base_ef[:3, 3]
+            a = normal @ R_be
+            count = len(points_s)
+            plane_blocks.append(
+                np.column_stack(
+                    [
+                        points_s[:, 0, None] * a[None, :],
+                        points_s[:, 2, None] * a[None, :],
+                        np.broadcast_to(a, (count, 3)),
+                    ]
+                )
+            )
+            plane_rhs_blocks.append(
+                np.full(count, -float(normal @ t_be), dtype=float)
+            )
+
+        if not plane_blocks:
+            raise ValueError("no finite laser points are available")
+
+        plane_matrix = np.vstack(plane_blocks)
+        plane_rhs = np.concatenate(plane_rhs_blocks)
+        centered_blocks.append(
+            plane_matrix - np.mean(plane_matrix, axis=0, keepdims=True)
+        )
+        centered_rhs_blocks.append(plane_rhs - np.mean(plane_rhs))
+
+    return (
+        np.vstack(centered_blocks),
+        np.concatenate(centered_rhs_blocks),
+        rms_all,
+        normals_unit,
+        fitted_offsets,
+        groups,
+    )
+
+
 def _solve_column_equilibrated(A: np.ndarray, y: np.ndarray) -> np.ndarray:
     """Solve least squares after deterministic column-norm equilibration."""
     A = np.asarray(A, dtype=float)
@@ -305,6 +425,65 @@ def translation_plane_offset_observability_matrix(
     if not rows:
         raise ValueError("at least one scan pose is required")
     return np.vstack(rows)
+
+
+def translation_difference_observability_matrix(
+    groups: list[tuple[int, list[LaserScan]]],
+    normals_unit: list[np.ndarray],
+) -> np.ndarray:
+    """Return offset-eliminated scan rows for hand-eye translation.
+
+    Each plane's rows ``n_j.T @ R_be`` are centered independently.  This is
+    the scan-level counterpart of the all-point difference system and exposes
+    translation directions that would otherwise be hidden by the eliminated
+    plane offset.
+    """
+    if len(groups) != len(normals_unit):
+        raise ValueError("one fitted normal is required per plane group")
+
+    centered_groups: list[np.ndarray] = []
+    for (_plane_id, scans), normal in zip(groups, normals_unit):
+        normal = np.asarray(normal, dtype=float).reshape(3)
+        normal /= np.linalg.norm(normal)
+        rows = np.asarray(
+            [normal @ scan.T_base_ef[:3, :3] for scan in scans],
+            dtype=float,
+        )
+        if len(rows) == 0:
+            continue
+        centered_groups.append(rows - np.mean(rows, axis=0, keepdims=True))
+
+    if not centered_groups:
+        raise ValueError("at least one scan pose is required")
+    return np.vstack(centered_groups)
+
+
+def _check_difference_translation_observability(
+    groups: list[tuple[int, list[LaserScan]]],
+    normals_unit: list[np.ndarray],
+    max_condition: float,
+) -> tuple[int, float]:
+    matrix = translation_difference_observability_matrix(
+        groups,
+        normals_unit,
+    )
+    rank = _relative_rank(matrix)
+    condition = _column_normalized_condition(matrix)
+    if rank < 3 or condition > float(max_condition):
+        failed_checks: list[str] = []
+        if rank < 3:
+            failed_checks.append(f"rank {rank} < 3")
+        if condition > float(max_condition):
+            failed_checks.append(
+                f"normalized condition {condition:.6g} > {max_condition:.6g}"
+            )
+        raise np.linalg.LinAlgError(
+            "offset-free translation observability check failed ("
+            + "; ".join(failed_checks)
+            + "); point differences remove the plane offset but cannot "
+            "recover a translation direction absent from the robot poses"
+        )
+    return rank, condition
 
 
 def _relative_rank(A: np.ndarray, relative_tolerance: float = 1e-10) -> int:
@@ -473,13 +652,17 @@ def calibrate_planes(
     update. ``'joint'`` keeps the fitted normal but estimates the plane offset
     in the same linear system as hand-eye. The latter requires one additional
     independent equation per physical plane and converges much faster for the
-    single-plane problem.
+    single-plane problem. ``'difference'`` removes the offset analytically by
+    mean-centering all point equations within each physical plane, which is
+    equivalent to applying ``n.T @ (p_i - p_j) = 0`` to every point pair.
 
     """
     if max_iter <= 0:
         raise ValueError("max_iter must be positive")
-    if plane_offset_mode not in ("fitted", "joint"):
-        raise ValueError("plane_offset_mode must be 'fitted' or 'joint'")
+    if plane_offset_mode not in ("fitted", "joint", "difference"):
+        raise ValueError(
+            "plane_offset_mode must be 'fitted', 'joint' or 'difference'"
+        )
     if max_translation_offset_condition <= 1.0:
         raise ValueError("max_translation_offset_condition must be > 1")
 
@@ -523,12 +706,16 @@ def calibrate_planes(
             )
             required_translation_offset_rank = 3 + len(groups)
             if (
-                translation_offset_rank < required_translation_offset_rank
+                translation_offset_rank
+                < required_translation_offset_rank
                 or translation_offset_condition
                 > float(max_translation_offset_condition)
             ):
-                failed_checks: list[str] = []
-                if translation_offset_rank < required_translation_offset_rank:
+                failed_checks = []
+                if (
+                    translation_offset_rank
+                    < required_translation_offset_rank
+                ):
                     failed_checks.append(
                         f"rank {translation_offset_rank} < "
                         f"{required_translation_offset_rank}"
@@ -548,6 +735,24 @@ def calibrate_planes(
                     + "); vary the theta/"
                     "incidence magnitude or add an off-ring reference pose"
                 )
+        elif plane_offset_mode == "difference":
+            (
+                A,
+                y,
+                rms_all,
+                normals_unit,
+                fitted_offsets,
+                groups,
+            ) = _build_grouped_difference_system_from_current_T(
+                scans_by_plane,
+                T,
+            )
+            _check_difference_translation_observability(
+                groups,
+                normals_unit,
+                max_translation_offset_condition,
+            )
+            required_rank = int(min_rank)
         else:
             (
                 A,
@@ -562,7 +767,9 @@ def calibrate_planes(
             for normal_scaled in normals_scaled:
                 offset = float(np.linalg.norm(normal_scaled))
                 if offset <= np.finfo(float).eps:
-                    raise np.linalg.LinAlgError("fitted plane offset is zero")
+                    raise np.linalg.LinAlgError(
+                        "fitted plane offset is zero"
+                    )
                 normals_unit.append(normal_scaled / offset)
                 fitted_offsets.append(offset)
 
@@ -591,19 +798,44 @@ def calibrate_planes(
                 )
             )
             T_new[:3, 3] = translation
-            plane_offsets = [float(value) for value in plane_offsets_array]
+            plane_offsets = [
+                float(value) for value in plane_offsets_array
+            ]
+        elif plane_offset_mode == "difference":
+            T_new = solve_rotation_translation_linear(A, y)
+            T_new[:3, 3] = (
+                solve_translation_with_fixed_rotation_linear(
+                    A,
+                    y,
+                    T_new[:3, :3],
+                )
+            )
         else:
             T_new = solve_rotation_translation_linear(A, y)
-            T_new[:3, 3] = refine_translation_with_fixed_rotation_grouped(
-                groups=groups,
-                normals_scaled=normals_scaled,
-                R_ef_s=T_new[:3, :3],
+            T_new[:3, 3] = (
+                refine_translation_with_fixed_rotation_grouped(
+                    groups=groups,
+                    normals_scaled=normals_scaled,
+                    R_ef_s=T_new[:3, :3],
+                )
             )
 
         delta = float(np.linalg.norm(T_new - T))
-        # rms_all was evaluated at the transform entering this update.  These
-        # entries therefore represent T_initial, T_after_1, ..., T_after_(N-1).
-        plane_rms_history.append(float(np.mean(rms_all)))
+
+        # rms_all is evaluated at the transform entering this update.
+        current_rms = float(np.mean(rms_all))
+        previous_rms = (
+            plane_rms_history[-1]
+            if plane_rms_history
+            else None
+        )
+        rms_improvement = (
+            previous_rms - current_rms
+            if previous_rms is not None
+            else float("nan")
+        )
+
+        plane_rms_history.append(current_rms)
         plane_normals_history.append(
             [np.asarray(normal, dtype=float).copy() for normal in normals_unit]
         )
@@ -611,6 +843,32 @@ def calibrate_planes(
         delta_history.append(delta)
         rank_history.append(rank)
         cond_history.append(cond)
+
+        # Print early behavior in detail, then one line every 10 iterations.
+        # Also print the iteration that satisfies the convergence threshold
+        # and the final requested iteration when convergence is not reached.
+        should_print = (
+            k < 10
+            or (k + 1) % 10 == 0
+            or delta < tol
+            or (k + 1) == max_iter
+        )
+        if should_print:
+            improvement_text = (
+                "nan"
+                if not np.isfinite(rms_improvement)
+                else f"{rms_improvement:.12g}"
+            )
+            print(
+                f"iter {k + 1:4d}: "
+                f"RMS={current_rms:.12g} mm, "
+                f"dRMS={improvement_text} mm, "
+                f"delta={delta:.12g}, "
+                f"tol={tol:.12g}, "
+                f"rank={rank}, "
+                f"cond={cond:.6g}",
+                flush=True,
+            )
 
         T = T_new
         T_history.append(T.copy())
@@ -663,7 +921,7 @@ def calibrate_single_plane(
     max_iter: int = 100,
     tol: float = 1e-9,
     min_rank: int = 9,
-    plane_offset_mode: PlaneOffsetMode = "joint",
+    plane_offset_mode: PlaneOffsetMode = "fitted",
     max_translation_offset_condition: float = 1e6,
 ) -> CalibrationResult:
     """
