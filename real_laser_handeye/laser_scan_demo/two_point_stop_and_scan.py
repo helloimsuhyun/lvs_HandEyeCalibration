@@ -60,7 +60,7 @@ import warnings
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
 DEFAULT_HANDEYE = Path("runs/real/real_initial/T_tcp_sensor_calibrated.csv")
@@ -277,6 +277,13 @@ class TwoPointScanViewer:
 
         self.display_profile_stride = max(1, int(display_profile_stride))
 
+        # Cached world-frame geometry used by the manual Fit view action.
+        # These arrays contain display data only and do not affect saved measurements.
+        self.latest_display_cloud = np.empty((0, 3), dtype=np.float32)
+        self.latest_tcp_path = np.empty((0, 3), dtype=np.float32)
+        self.latest_taught_positions = np.empty((0, 3), dtype=np.float32)
+        self.latest_current_tcp = np.empty((0, 3), dtype=np.float32)
+
         self.teach_first_requested = False
         self.teach_second_requested = False
         self.start_scan_requested = False
@@ -310,6 +317,11 @@ class TwoPointScanViewer:
         self.start_scan_button = QtWidgets.QPushButton("3. Start stop-and-scan: second -> first")
         self.new_step_button = QtWidgets.QPushButton("New step")
         self.undo_step_button = QtWidgets.QPushButton("Undo last step")
+        self.fit_view_button = QtWidgets.QPushButton("Fit view")
+        self.fit_view_button.setToolTip(
+            "Fit the 3D camera to the accumulated scan cloud. "
+            "Before scanning, taught TCP positions are used instead."
+        )
         self.save_button = QtWidgets.QPushButton("Save")
         self.finish_button = QtWidgets.QPushButton("Save and finish")
         self.abort_button = QtWidgets.QPushButton("Abort move")
@@ -318,6 +330,7 @@ class TwoPointScanViewer:
         self.teach_first_button.setShortcut("1")
         self.teach_second_button.setShortcut("2")
         self.start_scan_button.setShortcut("Space")
+        self.fit_view_button.setShortcut("F")
         self.save_button.setShortcut("Ctrl+S")
         self.quit_button.setShortcut("Ctrl+Q")
 
@@ -326,6 +339,7 @@ class TwoPointScanViewer:
         self.start_scan_button.clicked.connect(self._start_scan)
         self.new_step_button.clicked.connect(self._new_step)
         self.undo_step_button.clicked.connect(self._undo_step)
+        self.fit_view_button.clicked.connect(self._fit_view)
         self.save_button.clicked.connect(self._save)
         self.finish_button.clicked.connect(self._finish)
         self.abort_button.clicked.connect(self._abort)
@@ -337,6 +351,7 @@ class TwoPointScanViewer:
             self.start_scan_button,
             self.new_step_button,
             self.undo_step_button,
+            self.fit_view_button,
             self.save_button,
             self.finish_button,
             self.abort_button,
@@ -460,6 +475,91 @@ class TwoPointScanViewer:
                 )
             )
 
+    @staticmethod
+    def _finite_xyz(points: np.ndarray | None) -> np.ndarray:
+        if points is None:
+            return np.empty((0, 3), dtype=np.float64)
+        array = np.asarray(points, dtype=float)
+        if array.ndim != 2 or array.shape[1] != 3 or len(array) == 0:
+            return np.empty((0, 3), dtype=np.float64)
+        array = array[np.all(np.isfinite(array), axis=1)]
+        return np.ascontiguousarray(array, dtype=np.float64)
+
+    def _fit_view_points(self) -> tuple[np.ndarray, str]:
+        # The measured cloud is the best representation of what the user wants to inspect.
+        cloud = self._finite_xyz(self.latest_display_cloud)
+        if len(cloud):
+            return cloud, "accumulated scan cloud"
+
+        # Before the first capture, use all available robot-side geometry.
+        fallback_groups = [
+            self._finite_xyz(self.latest_taught_positions),
+            self._finite_xyz(self.latest_tcp_path),
+            self._finite_xyz(self.latest_current_tcp),
+        ]
+        fallback_groups = [group for group in fallback_groups if len(group)]
+        if fallback_groups:
+            return np.concatenate(fallback_groups, axis=0), "taught/TCP positions"
+
+        return np.empty((0, 3), dtype=np.float64), "no geometry"
+
+    def focus_camera_on_points(
+        self,
+        points: np.ndarray,
+        *,
+        min_distance_mm: float = 250.0,
+        radius_distance_scale: float = 2.8,
+        robust_percentile: float = 1.0,
+    ) -> bool:
+        """Fit the camera orbit center and distance to world-frame points.
+
+        The current azimuth and elevation are preserved, so pressing Fit view does
+        not discard the user's preferred viewing direction. For a sufficiently large
+        cloud, percentile bounds suppress isolated outliers that would otherwise
+        produce an excessively zoomed-out view.
+        """
+        points = self._finite_xyz(points)
+        if len(points) == 0:
+            return False
+
+        # Bound the cost of percentile computation for very large display clouds.
+        if len(points) > 50_000:
+            stride = max(1, math.ceil(len(points) / 50_000))
+            fit_points = points[::stride]
+        else:
+            fit_points = points
+
+        if len(fit_points) >= 20 and 0.0 < robust_percentile < 50.0:
+            lower = np.percentile(fit_points, robust_percentile, axis=0)
+            upper = np.percentile(fit_points, 100.0 - robust_percentile, axis=0)
+        else:
+            lower = np.min(fit_points, axis=0)
+            upper = np.max(fit_points, axis=0)
+
+        center = 0.5 * (lower + upper)
+        radius = 0.5 * float(np.linalg.norm(upper - lower))
+        distance = max(float(min_distance_mm), radius_distance_scale * max(radius, 1.0))
+
+        self.view.setCameraPosition(
+            pos=QtGui.QVector3D(
+                float(center[0]),
+                float(center[1]),
+                float(center[2]),
+            ),
+            distance=float(distance),
+        )
+        self.process_events()
+        return True
+
+    def _fit_view(self) -> None:
+        points, source = self._fit_view_points()
+        if self.focus_camera_on_points(points):
+            self.set_status(f"3D view fitted to {source} ({len(points)} points).")
+        else:
+            self.set_status(
+                "Fit view is unavailable: teach positions or capture scan data first."
+            )
+
     def _teach_first(self) -> None:
         self.teach_first_requested = True
 
@@ -547,6 +647,17 @@ class TwoPointScanViewer:
                 else np.asarray(second[:3], dtype=np.float32).reshape(1, 3)
             )
         )
+        taught_positions = []
+        if first is not None:
+            taught_positions.append(np.asarray(first[:3], dtype=np.float32))
+        if second is not None:
+            taught_positions.append(np.asarray(second[:3], dtype=np.float32))
+        self.latest_taught_positions = (
+            np.asarray(taught_positions, dtype=np.float32).reshape(-1, 3)
+            if taught_positions
+            else np.empty((0, 3), dtype=np.float32)
+        )
+
         if first is not None and second is not None:
             # Arrowless line: visually represents scan direction second -> first.
             self.planned_line_item.setData(
@@ -581,17 +692,22 @@ class TwoPointScanViewer:
         tcp_path: np.ndarray,
         current_T_base_tcp: np.ndarray | None,
     ) -> None:
-        self.cloud_item.setData(pos=np.asarray(cloud, dtype=np.float32))
+        self.latest_display_cloud = np.asarray(cloud, dtype=np.float32).reshape(-1, 3)
+        self.latest_tcp_path = np.asarray(tcp_path, dtype=np.float32).reshape(-1, 3)
+
+        self.cloud_item.setData(pos=self.latest_display_cloud)
         self.latest_profile_item.setData(
-            pos=np.asarray(latest_profile, dtype=np.float32)
+            pos=np.asarray(latest_profile, dtype=np.float32).reshape(-1, 3)
         )
-        self.tcp_path_item.setData(pos=np.asarray(tcp_path, dtype=np.float32))
+        self.tcp_path_item.setData(pos=self.latest_tcp_path)
         if current_T_base_tcp is None:
-            self.current_tcp_item.setData(pos=np.empty((0, 3), dtype=np.float32))
+            self.latest_current_tcp = np.empty((0, 3), dtype=np.float32)
+            self.current_tcp_item.setData(pos=self.latest_current_tcp)
         else:
-            self.current_tcp_item.setData(
-                pos=np.asarray(current_T_base_tcp[:3, 3], dtype=np.float32).reshape(1, 3)
-            )
+            self.latest_current_tcp = np.asarray(
+                current_T_base_tcp[:3, 3], dtype=np.float32
+            ).reshape(1, 3)
+            self.current_tcp_item.setData(pos=self.latest_current_tcp)
 
     def process_events(self) -> None:
         self.app.processEvents()
@@ -1635,8 +1751,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile-stale-after-s", type=float, default=0.5)
 
-    parser.add_argument("--scan-speed-mm-s", type=float, default=20.0)
-    parser.add_argument("--scan-accel-mm-s2", type=float, default=20.0)
+    parser.add_argument("--scan-speed-mm-s", type=float, default=5.0)
+    parser.add_argument("--scan-accel-mm-s2", type=float, default=5.0)
     parser.add_argument("--alignment-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--alignment-accel-mm-s2", type=float, default=10.0)
     parser.add_argument(
@@ -1651,7 +1767,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional fixed number of waypoints, overriding --waypoint-spacing-mm.",
     )
     parser.add_argument("--max-waypoints", type=int, default=500)
-    parser.add_argument("--settle-at-waypoint-s", type=float, default=0.30)
+    parser.add_argument("--settle-at-waypoint-s", type=float, default=0.50)
     parser.add_argument("--profiles-per-waypoint", type=int, default=10)
     parser.add_argument(
         "--capture-aggregate",
@@ -1659,11 +1775,11 @@ def parse_args() -> argparse.Namespace:
         default="mean",
     )
     parser.add_argument("--capture-timeout-s", type=float, default=5.0)
-    parser.add_argument("--max-capture-translation-mm", type=float, default=0.10)
-    parser.add_argument("--max-capture-rotation-deg", type=float, default=0.05)
+    parser.add_argument("--max-capture-translation-mm", type=float, default=0.03)
+    parser.add_argument("--max-capture-rotation-deg", type=float, default=0.02)
     parser.add_argument("--move-timeout-s", type=float, default=60.0)
     parser.add_argument("--position-tolerance-mm", type=float, default=0.02)
-    parser.add_argument("--rotation-tolerance-deg", type=float, default=0.2)
+    parser.add_argument("--rotation-tolerance-deg", type=float, default=0.02)
     parser.add_argument("--arrival-stable-count", type=int, default=10)
     parser.add_argument("--robot-poll-interval-s", type=float, default=0.05)
 

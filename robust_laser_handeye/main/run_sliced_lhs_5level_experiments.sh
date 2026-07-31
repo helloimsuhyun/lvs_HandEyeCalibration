@@ -33,6 +33,8 @@ PROFILE_HALF_WIDTH_MM="${PROFILE_HALF_WIDTH_MM:-25}"
 TANGENT_RANGE_MM="${TANGENT_RANGE_MM:-100}"
 PROFILE_DEPTH_MIN_MM="${PROFILE_DEPTH_MIN_MM:-60}"
 PROFILE_DEPTH_MAX_MM="${PROFILE_DEPTH_MAX_MM:-150}"
+CENTER_DEPTH_MIN_MM="${CENTER_DEPTH_MIN_MM:-60}"
+CENTER_DEPTH_MAX_MM="${CENTER_DEPTH_MAX_MM:-150}"
 
 TARGET_U_MIN_MM="${TARGET_U_MIN_MM:-0}"
 TARGET_U_MAX_MM="${TARGET_U_MAX_MM:-0}"
@@ -188,6 +190,8 @@ ensure_sliced_pair() {
     --tangent-range-mm "${TANGENT_RANGE_MM}"
     --profile-depth-range-mm \
       "${PROFILE_DEPTH_MIN_MM}" "${PROFILE_DEPTH_MAX_MM}"
+    --center-depth-range-mm \
+      "${CENTER_DEPTH_MIN_MM}" "${CENTER_DEPTH_MAX_MM}"
     --uniform-target-u-range-mm \
       "${TARGET_U_MIN_MM}" "${TARGET_U_MAX_MM}"
     --uniform-target-v-range-mm \

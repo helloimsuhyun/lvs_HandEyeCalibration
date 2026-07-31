@@ -1,17 +1,20 @@
+1. random pose
+
 MAX_TRIALS=100 \
 bash main/run_pose_diversity_comparison.sh
-
 
 MAX_TRIALS=100 \
 bash main/run_fixed_line_noise_comparison.sh
 
-
 MAX_TRIALS=100 \
 bash main/run_fixed_noise_line_count_comparison.sh
 
-
 MAX_TRIALS=100 \
 bash main/run_fair_plane_initialization_levels.sh
+
+2. uniform pose
+
+
 
 MAX_TRIALS=100 \
 bash main/run_fisher_random_policy_comparison.sh

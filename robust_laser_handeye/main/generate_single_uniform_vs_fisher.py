@@ -40,6 +40,7 @@ PYTHONPATH=. python3 main/generate_single_uniform_vs_fisher.py \
   --profile-half-width-mm 25 \
   --tangent-range-mm 100 \
   --profile-depth-range-mm 60 150 \
+  --candidate-center-depth-range-mm 90 120 \
   --candidate-target-u-range-mm -70 70 \
   --candidate-target-v-range-mm -70 70 \
   --candidate-view-tilt-range-deg 5 80 \
@@ -148,7 +149,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-half-width-mm", type=float, default=25.0)
     parser.add_argument("--tangent-range-mm", type=float, default=100.0)
     parser.add_argument(
-        "--profile-depth-range-mm", type=float, nargs=2, default=(60.0, 150.0)
+        "--profile-depth-range-mm",
+        type=float,
+        nargs=2,
+        default=(60.0, 150.0),
+        help=(
+            "Valid sensor-Z ROI for every point in a simulated laser profile."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-center-depth-range-mm",
+        type=float,
+        nargs=2,
+        default=(90.0, 120.0),
+        help=(
+            "Plane-relative center-ray depth used to generate candidate poses. "
+            "This is separate from --profile-depth-range-mm."
+        ),
     )
 
     parser.add_argument(
@@ -259,14 +276,55 @@ def _validate_args(
     if args.profile_half_width_mm <= 0.0 or args.tangent_range_mm <= 0.0:
         raise SystemExit("profile half-width and tangent range must be positive")
 
-    depth = _finite_pair(args.profile_depth_range_mm, "profile depth range")
+    profile_depth = _finite_pair(
+        args.profile_depth_range_mm, "profile depth ROI"
+    )
+    center_depth = _finite_pair(
+        args.candidate_center_depth_range_mm,
+        "candidate center depth range",
+    )
     tilt = _finite_pair(
         args.candidate_view_tilt_range_deg, "candidate tilt range"
     )
-    if depth[0] <= 0.0 or depth[0] == depth[1]:
-        raise SystemExit("profile depth range must be positive and non-zero")
+    if profile_depth[0] <= 0.0 or profile_depth[0] == profile_depth[1]:
+        raise SystemExit("profile depth ROI must be positive and non-zero")
+    if center_depth[0] <= 0.0 or center_depth[0] == center_depth[1]:
+        raise SystemExit(
+            "candidate center depth range must be positive and non-zero"
+        )
+    if (
+        center_depth[0] < profile_depth[0]
+        or center_depth[1] > profile_depth[1]
+    ):
+        raise SystemExit(
+            "candidate center depth range must lie inside the profile depth ROI"
+        )
     if tilt[0] < 0.0 or tilt[1] >= 89.0:
         raise SystemExit("candidate tilt range must lie within [0, 89)")
+
+    # Conservative guarantee for every azimuth/roll combination:
+    # |Delta z|max <= profile_half_width * tan(max_tilt).
+    max_profile_depth_swing = (
+        float(args.profile_half_width_mm)
+        * np.tan(np.deg2rad(tilt[1]))
+    )
+    safe_center_min = profile_depth[0] + max_profile_depth_swing
+    safe_center_max = profile_depth[1] - max_profile_depth_swing
+    if safe_center_min >= safe_center_max:
+        raise SystemExit(
+            "No center-depth interval can contain the complete profile. "
+            "Reduce profile half-width or maximum tilt, or widen the depth ROI."
+        )
+    if (
+        center_depth[0] < safe_center_min - 1e-9
+        or center_depth[1] > safe_center_max + 1e-9
+    ):
+        raise SystemExit(
+            "candidate center depth range is not conservatively feasible for "
+            "the configured profile half-width and maximum tilt. "
+            f"Safe range: [{safe_center_min:.3f}, "
+            f"{safe_center_max:.3f}] mm"
+        )
 
     positive = {
         "--min-abs-plane-normal-z": args.min_abs_plane_normal_z,
@@ -295,7 +353,7 @@ def _validate_args(
         profile_points=int(args.profile_points),
         profile_half_width_mm=float(args.profile_half_width_mm),
         tangent_range_mm=float(args.tangent_range_mm),
-        profile_depth_range_mm=depth,
+        profile_depth_range_mm=profile_depth,
         # These global ranges are unused by this generator but remain explicit
         # for compatibility with the common dataset metadata structure.
         view_tilt_range_deg=tilt,
@@ -329,7 +387,7 @@ def _validate_args(
         target_v_range_mm=_finite_pair(
             args.candidate_target_v_range_mm, "candidate target V range"
         ),
-        depth_range_mm=depth,
+        depth_range_mm=center_depth,
         tilt_range_deg=tilt,
         azimuth_range_deg=fair.view_azimuth_range_deg,
         roll_range_deg=fair.sensor_roll_range_deg,
