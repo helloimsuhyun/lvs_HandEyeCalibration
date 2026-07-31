@@ -14,7 +14,7 @@ from .se3 import make_T, transform_points
 
 
 Plane = tuple[np.ndarray, float]
-PlaneMode = Literal["refit", "fixed"]
+PlaneMode = Literal["refit", "fixed", "fixed_normals"]
 RobustLoss = Literal["linear", "soft_l1", "huber", "cauchy", "arctan"]
 ScanGroups = Mapping[int, Sequence[LaserScan]] | Sequence[Sequence[LaserScan]]
 PlaneGroups = Mapping[int, Plane] | Sequence[Plane]
@@ -107,18 +107,29 @@ def refine_handeye_nonlinear(
     parameters are optimized.
 
     ``plane_mode='fixed'`` uses the supplied plane equations ``n.T @ p = l``.
-    This is appropriate when the planes are independently known.
+    This is appropriate when the complete planes are independently known.
+
+    ``plane_mode='fixed_normals'`` keeps only the supplied unit normals fixed.
+    For every candidate hand-eye transform, each plane offset is profiled out
+    as ``mean(p @ n)``.  With ``loss='linear'``, this is the exact
+    least-squares minimizer of the offset for the candidate transform and fixed
+    normal.  With a robust loss, the arithmetic mean is still used, so this
+    mode is not exact variable elimination for the robust objective.
     """
     groups = _normalize_scan_groups(scans_by_plane)
     T_reference = _validate_transform(T_init, "T_init")
 
-    if plane_mode not in ("refit", "fixed"):
-        raise ValueError("plane_mode must be 'refit' or 'fixed'")
+    if plane_mode not in ("refit", "fixed", "fixed_normals"):
+        raise ValueError(
+            "plane_mode must be 'refit', 'fixed' or 'fixed_normals'"
+        )
 
     fixed_planes: dict[int, Plane] | None = None
-    if plane_mode == "fixed":
+    if plane_mode in ("fixed", "fixed_normals"):
         if planes is None:
-            raise ValueError("planes are required when plane_mode='fixed'")
+            raise ValueError(
+                f"planes are required when plane_mode={plane_mode!r}"
+            )
         fixed_planes = _normalize_planes(planes, groups)
     elif planes is not None:
         raise ValueError("planes must be omitted when plane_mode='refit'")
@@ -396,6 +407,11 @@ def point_to_plane_residuals(
             if fixed_planes is None or plane_id not in fixed_planes:
                 raise ValueError(f"missing fixed plane for plane_id={plane_id}")
             normal, distance_mm = fixed_planes[plane_id]
+            if plane_mode == "fixed_normals":
+                # For ordinary least squares and a fixed unit normal, the
+                # arithmetic mean is the exact minimizer of
+                # sum_i (p_i.T @ n - distance_mm)^2.
+                distance_mm = float(np.mean(points_base @ normal))
 
         residual_blocks.append(points_base @ normal - distance_mm)
 

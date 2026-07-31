@@ -1621,6 +1621,49 @@ def save_observability_uncertainty_outputs(
         for label, row in zip(labels, correlation):
             writer.writerow([label, *[float(value) for value in row]])
 
+    # Save an immediately readable per-parameter uncertainty summary.
+    # These values describe local first-order uncertainty around the final
+    # estimate; they are not absolute errors relative to ground truth.
+    parameter_std_csv = output_base.with_suffix(".parameter_std.csv")
+    std_rotation_deg = analysis["std_rotation_deg"]
+    std_translation_mm = analysis["std_translation_mm"]
+    std_rows = [
+        ("rx", "deg", float(std_rotation_deg["rx"])),
+        ("ry", "deg", float(std_rotation_deg["ry"])),
+        ("rz", "deg", float(std_rotation_deg["rz"])),
+        ("tx", "mm", float(std_translation_mm["tx"])),
+        ("ty", "mm", float(std_translation_mm["ty"])),
+        ("tz", "mm", float(std_translation_mm["tz"])),
+    ]
+    with parameter_std_csv.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            [
+                "parameter",
+                "unit",
+                "std_1sigma",
+                "approx_95pct_half_width",
+                "approx_95pct_lower_relative",
+                "approx_95pct_upper_relative",
+            ]
+        )
+        for parameter, unit, std_value in std_rows:
+            half_width_95 = 1.96 * std_value
+            writer.writerow(
+                [
+                    parameter,
+                    unit,
+                    std_value,
+                    half_width_95,
+                    -half_width_95,
+                    half_width_95,
+                ]
+            )
+
     spectrum_plot: str | None = None
     weak_plot: str | None = None
     try:
@@ -1664,6 +1707,7 @@ def save_observability_uncertainty_outputs(
         "weak_mode_csv": str(weak_csv),
         "covariance_csv": str(covariance_csv),
         "correlation_csv": str(correlation_csv),
+        "parameter_std_csv": str(parameter_std_csv),
         "spectrum_plot": spectrum_plot,
         "weak_mode_plot": weak_plot,
     }
@@ -1956,6 +2000,18 @@ def run_calibration(args: argparse.Namespace) -> np.ndarray:
                     'std_translation_mm'
                 ].items()
             )
+        )
+        print(
+            f"  saved parameter std CSV: "
+            f"{uncertainty_outputs['parameter_std_csv']}"
+        )
+        print(
+            f"  saved covariance CSV   : "
+            f"{uncertainty_outputs['covariance_csv']}"
+        )
+        print(
+            f"  saved correlation CSV  : "
+            f"{uncertainty_outputs['correlation_csv']}"
         )
 
     diagnostics_path = args.output.with_suffix(".diagnostics.json")

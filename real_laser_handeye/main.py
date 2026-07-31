@@ -33,10 +33,10 @@ except ImportError:  # Direct execution: python real_laser_handeye/main.py
 
 try:
     from .laser_adapter import LaserAdapter
-    from .__robot_adapter import RobotAdapter
+    from .robot_adapter import RobotAdapter
 except ImportError:  # Direct execution: python real_laser_handeye/main.py
     from laser_adapter import LaserAdapter
-    from real_laser_handeye.__robot_adapter import RobotAdapter
+    from real_laser_handeye.robot_adapter import RobotAdapter
 
 
 
@@ -674,9 +674,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("runs/real/T_tcp_sensor_calibrated.csv"),
     )
-    parser.add_argument("--robot-host", default="192.168.0.10")
+    parser.add_argument("--robot-host", default="169.254.186.20")
     parser.add_argument("--robot-port", type=int)
-    parser.add_argument("--laser-ip", default="192.168.1.1")
+    parser.add_argument("--laser-ip", default="169.254.186.182")
     parser.add_argument("--laser-control-port", type=int, default=24691)
     parser.add_argument("--laser-high-speed-port", type=int, default=24692)
     parser.add_argument("--batch-profiles", type=int, default=5)

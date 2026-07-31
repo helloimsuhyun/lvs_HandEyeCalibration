@@ -690,7 +690,10 @@ def _validate_result(args: argparse.Namespace) -> None:
             "config.max_scans_per_trial",
             args.max_scans_per_trial,
         )
-    if args.mode == "iterative_joint_nonlinear":
+    if args.mode in {
+        "iterative_refit_nonlinear",
+        "iterative_joint_nonlinear",
+    }:
         _expect_equal(
             summary,
             "config.nonlinear_loss",
@@ -705,6 +708,21 @@ def _validate_result(args: argparse.Namespace) -> None:
             summary,
             "config.nonlinear_max_nfev",
             args.nonlinear_max_nfev,
+        )
+        _expect_number(
+            summary,
+            "config.nonlinear_ftol",
+            args.nonlinear_ftol,
+        )
+        _expect_number(
+            summary,
+            "config.nonlinear_xtol",
+            args.nonlinear_xtol,
+        )
+        _expect_number(
+            summary,
+            "config.nonlinear_gtol",
+            args.nonlinear_gtol,
         )
 
     configured_collection = _resolve_config_path(
@@ -961,7 +979,11 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--summary", type=Path, required=True)
     result.add_argument(
         "--mode",
-        choices=("iterative", "iterative_joint_nonlinear"),
+        choices=(
+            "iterative",
+            "iterative_refit_nonlinear",
+            "iterative_joint_nonlinear",
+        ),
         default="iterative",
     )
     result.add_argument("--collection", type=Path, required=True)
@@ -995,6 +1017,9 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--nonlinear-loss", default="linear")
     result.add_argument("--nonlinear-f-scale-mm", type=float, default=1.0)
     result.add_argument("--nonlinear-max-nfev", type=int, default=300)
+    result.add_argument("--nonlinear-ftol", type=float, default=1e-10)
+    result.add_argument("--nonlinear-xtol", type=float, default=1e-10)
+    result.add_argument("--nonlinear-gtol", type=float, default=1e-10)
     result.set_defaults(run=_validate_result)
 
     return parser

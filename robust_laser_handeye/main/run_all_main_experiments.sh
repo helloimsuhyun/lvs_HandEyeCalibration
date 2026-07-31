@@ -41,13 +41,20 @@ GENERATION_SEED="${GENERATION_SEED:-17}"
 CALIBRATION_SEED="${CALIBRATION_SEED:-1701}"
 MAX_ITER="${MAX_ITER:-3000}"
 TOL="${TOL:-1e-5}"
+CALIBRATION_MODE="${CALIBRATION_MODE:-iterative}"
+NONLINEAR_LOSS="${NONLINEAR_LOSS:-linear}"
+NONLINEAR_F_SCALE_MM="${NONLINEAR_F_SCALE_MM:-1.0}"
+NONLINEAR_MAX_NFEV="${NONLINEAR_MAX_NFEV:-300}"
+NONLINEAR_FTOL="${NONLINEAR_FTOL:-1e-10}"
+NONLINEAR_XTOL="${NONLINEAR_XTOL:-1e-10}"
+NONLINEAR_GTOL="${NONLINEAR_GTOL:-1e-10}"
 MAKE_PLOTS="${MAKE_PLOTS:-1}"
 FORCE_REGENERATE="${FORCE_REGENERATE:-0}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
 
 MASTER_DATASET_ROOT="${MASTER_DATASET_ROOT:-dataset}"
 MASTER_RESULT_ROOT="${MASTER_RESULT_ROOT:-results}"
-MASTER_LOG_ROOT="${MASTER_LOG_ROOT:-results/all_main_experiment_logs}"
+MASTER_LOG_ROOT="${MASTER_LOG_ROOT:-${MASTER_RESULT_ROOT}/all_main_experiment_logs}"
 DRY_RUN="${DRY_RUN:-0}"
 
 INIT_T_TAG="${INIT_TRANSLATION_RANGE_MM//./p}"
@@ -82,6 +89,14 @@ if [[ "${FISHER_OBJECTIVE}" != "d_optimal" \
   exit 1
 fi
 
+case "${CALIBRATION_MODE}" in
+  iterative|iterative_refit_nonlinear|iterative_joint_nonlinear) ;;
+  *)
+    echo "ERROR: unsupported CALIBRATION_MODE: ${CALIBRATION_MODE}" >&2
+    exit 1
+    ;;
+esac
+
 if [[ "${INIT_ROTATION_PERTURBATION}" != "axis_angle" \
       && "${INIT_ROTATION_PERTURBATION}" != "euler_xyz" ]]; then
   echo "ERROR: INIT_ROTATION_PERTURBATION must be axis_angle or euler_xyz." >&2
@@ -110,6 +125,13 @@ export \
   CALIBRATION_SEED \
   MAX_ITER \
   TOL \
+  CALIBRATION_MODE \
+  NONLINEAR_LOSS \
+  NONLINEAR_F_SCALE_MM \
+  NONLINEAR_MAX_NFEV \
+  NONLINEAR_FTOL \
+  NONLINEAR_XTOL \
+  NONLINEAR_GTOL \
   MAKE_PLOTS \
   FORCE_REGENERATE \
   FORCE_RERUN
@@ -164,6 +186,10 @@ echo "============================================================"
 echo "All main experiments"
 echo "============================================================"
 echo "Trials per condition : ${MAX_TRIALS}"
+echo "Calibration mode     : ${CALIBRATION_MODE}"
+if [[ "${CALIBRATION_MODE}" != "iterative" ]]; then
+  echo "Nonlinear solver     : loss=${NONLINEAR_LOSS}, max_nfev=${NONLINEAR_MAX_NFEV}"
+fi
 echo "Initialization       : ${INIT_TRANSLATION_RANGE_MM} mm / ${INIT_ANGLE_RANGE_DEG} deg max"
 echo "Perturbation model   : translation=${INIT_TRANSLATION_PERTURBATION}, rotation=${INIT_ROTATION_PERTURBATION}"
 if [[ "${RUN_FISHER_RANDOM}" == "1" ]]; then

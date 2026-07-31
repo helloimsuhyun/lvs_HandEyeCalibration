@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hide-outliers",
         action="store_true",
-        help="Hide individual boxplot fliers.",
+        help=(
+            "Hide trials explicitly flagged as calibration outliers while "
+            "retaining ordinary Tukey boxplot fliers."
+        ),
     )
     parser.add_argument(
         "--log-translation",
@@ -113,6 +116,34 @@ def parse_bool_series(series: pd.Series) -> pd.Series:
         .str.lower()
         .isin({"true", "1", "yes", "y"})
     )
+
+
+def boxplot_values(
+    frame: pd.DataFrame,
+    column: str,
+    hide_outliers: bool,
+) -> np.ndarray:
+    """Return finite plot values, optionally excluding explicit failures."""
+    values = pd.to_numeric(frame[column], errors="coerce")
+    keep = np.isfinite(values)
+    if hide_outliers and "outlier" in frame.columns:
+        keep &= ~parse_bool_series(frame["outlier"])
+    return values[keep].to_numpy(dtype=float)
+
+
+def paired_boxplot_values(
+    frame: pd.DataFrame,
+    column: str,
+    hide_outliers: bool,
+) -> np.ndarray:
+    """Return paired values, hiding pairs containing an explicit failure."""
+    values = pd.to_numeric(frame[column], errors="coerce")
+    keep = np.isfinite(values)
+    if hide_outliers:
+        for outlier_column in ("outlier_single", "outlier_three"):
+            if outlier_column in frame.columns:
+                keep &= ~parse_bool_series(frame[outlier_column])
+    return values[keep].to_numpy(dtype=float)
 
 
 def load_trials_for_rates(path: Path) -> pd.DataFrame:
@@ -450,11 +481,11 @@ def draw_grouped_boxplot(
     width = 0.30
 
     single_data = [
-        frame[column].dropna().to_numpy(dtype=float)
+        boxplot_values(frame, column, hide_outliers)
         for frame in frames_by_method["single_plane"]
     ]
     three_data = [
-        frame[column].dropna().to_numpy(dtype=float)
+        boxplot_values(frame, column, hide_outliers)
         for frame in frames_by_method["three_plane"]
     ]
 
@@ -463,8 +494,8 @@ def draw_grouped_boxplot(
         positions=centers - offset,
         widths=width,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -478,8 +509,8 @@ def draw_grouped_boxplot(
         positions=centers + offset,
         widths=width,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -528,11 +559,12 @@ def draw_paired_boxplot(
     data = []
 
     for condition in conditions:
-        values = pd.to_numeric(
-            paired.loc[paired["condition"].eq(condition["name"]), column],
-            errors="coerce",
-        ).to_numpy()
-        data.append(values[np.isfinite(values)])
+        group = paired.loc[
+            paired["condition"].eq(condition["name"])
+        ]
+        data.append(
+            paired_boxplot_values(group, column, hide_outliers)
+        )
 
     positions = np.arange(len(conditions), dtype=float)
 
@@ -541,8 +573,8 @@ def draw_paired_boxplot(
         positions=positions,
         widths=0.55,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -858,16 +890,21 @@ def save_iteration_plot(
     ):
         data = []
         for frame in frames_by_method[method]:
-            values = pd.to_numeric(frame["iterations"], errors="coerce").to_numpy()
-            data.append(values[np.isfinite(values)])
+            data.append(
+                boxplot_values(
+                    frame,
+                    "iterations",
+                    args.hide_outliers,
+                )
+            )
 
         box = axis.boxplot(
             data,
             positions=centers + position_offset,
             widths=width,
             patch_artist=True,
-            showmeans=not args.hide_outliers,
-            showfliers=not args.hide_outliers,
+            showmeans=True,
+            showfliers=True,
             manage_ticks=False,
             meanprops={
                 "marker": "D",

@@ -7,7 +7,7 @@
 - Robot: `169.254.186.20`
 - Keyence laser: `169.254.186.182`
 
-`__robot_adapter.py`에는 사용하는 로봇에 맞게 `T_base_tcp`(4x4,
+`robot_adapter.py`에는 사용하는 로봇에 맞게 `T_base_tcp`(4x4,
 translation 단위 mm)를 반환하는 함수를 구현해야 한다.
 `laser_adapter.py`에는 profile 데이터를 반환하는 `read_profile` 함수를
 구현해야 한다.
@@ -48,19 +48,26 @@ PYTHONPATH=. python3 -m real_laser_handeye.main session \
 ### 스캔 mode 1: 위치 교시
 
 ```bash
-PYTHONPATH=. python real_laser_handeye/laser_scan_demo/two_point_stop_and_scan.py \
-  --handeye runs/real/real_initial/T_tcp_sensor_calibrated.csv \
+ PYTHONPATH=. python3 real_laser_handeye/laser_scan_demo/two_point_stop_and_scan.py \
+  --handeye /home/choisuhyun/lvs_HandEyeCalibration/runs/real/real_initial/T_tcp_sensor_calibrate_initial_value.csv \
   --save-path runs/real/two_point_stop_and_scan.npz \
   --robot-host 169.254.186.20 \
   --laser-ip 169.254.186.182 \
   --batch-profiles 1 \
-  --waypoint-spacing-mm 0.5 \
+  --waypoint-spacing-mm 1.0 \
   --profiles-per-waypoint 10 \
   --capture-aggregate mean \
   --scan-speed-mm-s 5 \
   --scan-accel-mm-s2 5 \
   --alignment-speed-mm-s 10 \
   --alignment-accel-mm-s2 10 \
+  --position-tolerance-mm 0.02 \
+  --rotation-tolerance-deg 0.2 \
+  --arrival-stable-count 10 \
+  --settle-at-waypoint-s 0.7 \
+  --max-capture-translation-mm 0.2 \
+  --max-capture-rotation-deg 0.5 \
+  --move-timeout-s 60 \
   --auto-save \
   --save-on-exit
 ```

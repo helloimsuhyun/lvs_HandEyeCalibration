@@ -60,7 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hide-outliers",
         action="store_true",
-        help="Hide boxplot fliers.",
+        help=(
+            "Hide trials explicitly flagged as calibration outliers while "
+            "retaining ordinary Tukey boxplot fliers."
+        ),
     )
     parser.add_argument("--dpi", type=int, default=300)
     return parser.parse_args()
@@ -126,8 +129,21 @@ def _rate(rows: Rows, field: str) -> float:
     return float(np.mean([_as_bool(row.get(field, False)) for row in rows]))
 
 
-def _values(rows: Rows, field: str) -> np.ndarray:
-    values = np.asarray([_as_float(row.get(field)) for row in rows])
+def _values(
+    rows: Rows,
+    field: str,
+    hide_outliers: bool = False,
+) -> np.ndarray:
+    values = np.asarray(
+        [
+            _as_float(row.get(field))
+            for row in rows
+            if not (
+                hide_outliers
+                and _as_bool(row.get("outlier", False))
+            )
+        ]
+    )
     return values[np.isfinite(values)]
 
 
@@ -202,6 +218,7 @@ def _paired_errors(
     frames: dict[str, Rows],
     geometry: str,
     success_only: bool,
+    hide_outliers: bool = False,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     random_rows = {
         int(row["trial_index"]): row
@@ -217,10 +234,17 @@ def _paired_errors(
             success_only=success_only,
         )
     }
-    return [
-        (random_rows[trial_id], fisher_rows[trial_id])
-        for trial_id in sorted(random_rows.keys() & fisher_rows.keys())
-    ]
+    result = []
+    for trial_id in sorted(random_rows.keys() & fisher_rows.keys()):
+        random_row = random_rows[trial_id]
+        fisher_row = fisher_rows[trial_id]
+        if hide_outliers and (
+            _as_bool(random_row.get("outlier", False))
+            or _as_bool(fisher_row.get("outlier", False))
+        ):
+            continue
+        result.append((random_row, fisher_row))
+    return result
 
 
 def _success_pairs(
@@ -331,7 +355,7 @@ def _boxplot(
         values,
         labels=labels,
         patch_artist=True,
-        showfliers=not hide_outliers,
+        showfliers=True,
     )
     for patch, color in zip(artists["boxes"], colors):
         patch.set_facecolor(color)
@@ -360,6 +384,7 @@ def _plot_final_errors(
             data = _values(
                 _error_rows(frames[method], success_only),
                 metric,
+                hide_outliers=hide_outliers,
             )
             if log_errors:
                 data = data[data > 0.0]
@@ -441,7 +466,12 @@ def _plot_paired_ratios(
         values = [
             np.log10(
                 _error_ratios(
-                    _paired_errors(frames, geometry, success_only),
+                    _paired_errors(
+                        frames,
+                        geometry,
+                        success_only,
+                        hide_outliers=hide_outliers,
+                    ),
                     metric,
                 )
             )

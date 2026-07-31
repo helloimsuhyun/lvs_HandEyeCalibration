@@ -29,6 +29,21 @@ INIT_TRANSLATION_PERTURBATION="${INIT_TRANSLATION_PERTURBATION:-direction_norm}"
 
 MAX_ITER="${MAX_ITER:-3000}"
 TOL="${TOL:-1e-5}"
+CALIBRATION_MODE="${CALIBRATION_MODE:-iterative}"
+NONLINEAR_LOSS="${NONLINEAR_LOSS:-linear}"
+NONLINEAR_F_SCALE_MM="${NONLINEAR_F_SCALE_MM:-1.0}"
+NONLINEAR_MAX_NFEV="${NONLINEAR_MAX_NFEV:-300}"
+NONLINEAR_FTOL="${NONLINEAR_FTOL:-1e-10}"
+NONLINEAR_XTOL="${NONLINEAR_XTOL:-1e-10}"
+NONLINEAR_GTOL="${NONLINEAR_GTOL:-1e-10}"
+NONLINEAR_ARGS=(
+  --nonlinear-loss "${NONLINEAR_LOSS}"
+  --nonlinear-f-scale-mm "${NONLINEAR_F_SCALE_MM}"
+  --nonlinear-max-nfev "${NONLINEAR_MAX_NFEV}"
+  --nonlinear-ftol "${NONLINEAR_FTOL}"
+  --nonlinear-xtol "${NONLINEAR_XTOL}"
+  --nonlinear-gtol "${NONLINEAR_GTOL}"
+)
 
 DATASET_ROOT="${DATASET_ROOT:-dataset/fair_plane_noise_fixed_line_shared_global}"
 INIT_T_TAG="${INIT_TRANSLATION_RANGE_MM//./p}"
@@ -66,6 +81,14 @@ if [[ "${MAKE_PLOTS}" != "0" && "${MAKE_PLOTS}" != "1" ]]; then
   echo "ERROR: MAKE_PLOTS must be 0 or 1." >&2
   exit 1
 fi
+
+case "${CALIBRATION_MODE}" in
+  iterative|iterative_refit_nonlinear|iterative_joint_nonlinear) ;;
+  *)
+    echo "ERROR: unsupported CALIBRATION_MODE: ${CALIBRATION_MODE}" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "${PLOT_SUCCESS_ONLY}" != "0" && "${PLOT_SUCCESS_ONLY}" != "1" ]]; then
   echo "ERROR: PLOT_SUCCESS_ONLY must be 0 or 1." >&2
@@ -206,7 +229,8 @@ for SIGMA in ${NOISE_LEVELS}; do
     PYTHONPATH=. python3 "${CALIBRATOR}" \
       --collection "${SINGLE_COLLECTION}" \
       --output-dir "${SINGLE_RESULT}" \
-      --mode iterative \
+      --mode "${CALIBRATION_MODE}" \
+      "${NONLINEAR_ARGS[@]}" \
       --seed "${CALIBRATION_SEED}" \
       --noise-axis "${NOISE_AXIS}" \
       --noise-std-mm "${SIGMA}" \
@@ -220,6 +244,8 @@ for SIGMA in ${NOISE_LEVELS}; do
   fi
 
   if ! PYTHONPATH=. python3 "${VALIDATOR}" result \
+    --mode "${CALIBRATION_MODE}" \
+    "${NONLINEAR_ARGS[@]}" \
     --summary "${SINGLE_RESULT}/summary.json" \
     --collection "${SINGLE_COLLECTION}" \
     --trials "${MAX_TRIALS}" \
@@ -243,7 +269,8 @@ for SIGMA in ${NOISE_LEVELS}; do
     PYTHONPATH=. python3 "${CALIBRATOR}" \
       --collection "${THREE_COLLECTION}" \
       --output-dir "${THREE_RESULT}" \
-      --mode iterative \
+      --mode "${CALIBRATION_MODE}" \
+      "${NONLINEAR_ARGS[@]}" \
       --seed "${CALIBRATION_SEED}" \
       --noise-axis "${NOISE_AXIS}" \
       --noise-std-mm "${SIGMA}" \
@@ -257,6 +284,8 @@ for SIGMA in ${NOISE_LEVELS}; do
   fi
 
   if ! PYTHONPATH=. python3 "${VALIDATOR}" result \
+    --mode "${CALIBRATION_MODE}" \
+    "${NONLINEAR_ARGS[@]}" \
     --summary "${THREE_RESULT}/summary.json" \
     --collection "${THREE_COLLECTION}" \
     --trials "${MAX_TRIALS}" \

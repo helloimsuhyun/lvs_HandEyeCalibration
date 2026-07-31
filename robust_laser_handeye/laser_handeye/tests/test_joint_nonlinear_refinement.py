@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from laser_handeye.nonlinear_refinement import (
+    point_to_plane_residuals,
+    refine_handeye_nonlinear,
     refine_handeye_planes_nonlinear,
 )
 from laser_handeye.se3 import euler_xyz_deg, make_T, rot_error_deg
@@ -89,3 +91,59 @@ def test_joint_refinement_estimates_unit_normals_and_handeye(
     )
     assert translation_error < 0.02
     assert rotation_error < 0.03
+
+
+def test_fixed_normals_profiles_offset_for_each_handeye_candidate() -> None:
+    groups, _T_true, T_initial = _synthetic_problem(1)
+    normal = np.array([0.1, 0.2, 1.0], dtype=float)
+    normal /= np.linalg.norm(normal)
+    normalized_groups = list(groups.items())
+
+    residuals_near = point_to_plane_residuals(
+        normalized_groups,
+        T_initial,
+        plane_mode="fixed_normals",
+        fixed_planes={0: (normal, 10.0)},
+    )
+    residuals_far = point_to_plane_residuals(
+        normalized_groups,
+        T_initial,
+        plane_mode="fixed_normals",
+        fixed_planes={0: (normal, 10_000.0)},
+    )
+    fixed_offset_residuals = point_to_plane_residuals(
+        normalized_groups,
+        T_initial,
+        plane_mode="fixed",
+        fixed_planes={0: (normal, 10.0)},
+    )
+
+    assert np.allclose(residuals_near, residuals_far)
+    assert np.isclose(np.mean(residuals_near), 0.0, atol=1e-12)
+    assert np.sum(residuals_near**2) < np.sum(fixed_offset_residuals**2)
+
+    result_near = refine_handeye_nonlinear(
+        groups,
+        T_initial,
+        plane_mode="fixed_normals",
+        planes={0: (normal, 10.0)},
+        loss="linear",
+        max_nfev=100,
+    )
+    result_far = refine_handeye_nonlinear(
+        groups,
+        T_initial,
+        plane_mode="fixed_normals",
+        planes={0: (normal, 10_000.0)},
+        loss="linear",
+        max_nfev=100,
+    )
+
+    assert result_near.success
+    assert result_far.success
+    assert np.allclose(result_near.T_ef_s, result_far.T_ef_s, atol=1e-9)
+    assert np.isclose(
+        result_near.final_rms_mm,
+        result_far.final_rms_mm,
+        atol=1e-12,
+    )

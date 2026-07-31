@@ -1662,9 +1662,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-capture-translation-mm", type=float, default=0.10)
     parser.add_argument("--max-capture-rotation-deg", type=float, default=0.05)
     parser.add_argument("--move-timeout-s", type=float, default=60.0)
-    parser.add_argument("--position-tolerance-mm", type=float, default=1.0)
-    parser.add_argument("--rotation-tolerance-deg", type=float, default=1.0)
-    parser.add_argument("--arrival-stable-count", type=int, default=5)
+    parser.add_argument("--position-tolerance-mm", type=float, default=0.02)
+    parser.add_argument("--rotation-tolerance-deg", type=float, default=0.2)
+    parser.add_argument("--arrival-stable-count", type=int, default=10)
     parser.add_argument("--robot-poll-interval-s", type=float, default=0.05)
 
     parser.add_argument("--min-scan-distance-mm", type=float, default=2.0)

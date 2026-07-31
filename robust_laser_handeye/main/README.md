@@ -2,6 +2,14 @@
 
 `generate_synthetic_calibration_dataset.py`는 레이저 프로파일 센서 hand–eye calibration 실험에 사용할 **noise-free synthetic dataset collection**을 생성합니다.
 
+## 반복 선형해 기반 비선형 refinement ablation
+
+반복 교대 선형해를 비선형 초기값으로 사용할 때의 효과와
+plane normal을 고정/refit/joint 최적화하는 선택은
+[`NONLINEAR_REFINEMENT_ABLATION.md`](NONLINEAR_REFINEMENT_ABLATION.md)에
+정리되어 있습니다. 동일 trial에서 여섯 arm을 실행하는 재현 runner는
+`run_nonlinear_refinement_ablation.py`입니다.
+
 이 스크립트는 데이터 생성만 수행합니다.
 
 - 측정 노이즈 추가
@@ -172,6 +180,22 @@ PLOT_SUCCESS_ONLY=1 PLOT_DPI=150 \
 
 ```bash
 bash main/run_all_main_experiments.sh
+```
+
+같은 모든 실험에서 alternating 결과를 초기값으로 사용해
+`plane_mode="refit"` nonlinear refinement까지 적용하려면:
+
+```bash
+bash main/run_all_main_experiments_refit.sh
+```
+
+이 전용 runner의 결과와 로그는 기본적으로 `result_refit/` 아래에
+저장됩니다. 기존 dataset은 재사용하며, 기존 iterative 결과가 들어 있는
+`results/`는 변경하지 않습니다. 예를 들어 빠른 확인은 다음과 같습니다.
+
+```bash
+MAX_TRIALS=3 MAKE_PLOTS=0 \
+  bash main/run_all_main_experiments_refit.sh
 ```
 
 Fisher-vs-random을 제외한 네 실험만 모두 실행하려면:

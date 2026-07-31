@@ -73,7 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hide-outliers",
         action="store_true",
-        help="Hide individual boxplot fliers.",
+        help=(
+            "Hide trials explicitly flagged as calibration outliers while "
+            "retaining ordinary Tukey boxplot fliers."
+        ),
     )
     parser.add_argument(
         "--log-translation",
@@ -455,6 +458,7 @@ def collect_paired_errors(
 def _finite_values(
     frame: pd.DataFrame,
     column: str,
+    hide_outliers: bool = False,
 ) -> np.ndarray:
     if column not in frame.columns:
         return np.array([], dtype=float)
@@ -462,8 +466,28 @@ def _finite_values(
     values = pd.to_numeric(
         frame[column],
         errors="coerce",
-    ).to_numpy(dtype=float)
-    return values[np.isfinite(values)]
+    )
+    keep = np.isfinite(values)
+    if hide_outliers and "outlier" in frame.columns:
+        keep &= ~parse_bool_series(frame["outlier"])
+    return values[keep].to_numpy(dtype=float)
+
+
+def _paired_finite_values(
+    frame: pd.DataFrame,
+    column: str,
+    hide_outliers: bool,
+) -> np.ndarray:
+    if column not in frame.columns:
+        return np.array([], dtype=float)
+
+    values = pd.to_numeric(frame[column], errors="coerce")
+    keep = np.isfinite(values)
+    if hide_outliers:
+        for outlier_column in ("outlier_single", "outlier_three"):
+            if outlier_column in frame.columns:
+                keep &= ~parse_bool_series(frame[outlier_column])
+    return values[keep].to_numpy(dtype=float)
 
 
 def _boxplot_values(values: np.ndarray) -> np.ndarray:
@@ -529,7 +553,13 @@ def draw_grouped_boxplot(
 
     for method, position_offset, color in method_specs:
         data = [
-            _boxplot_values(_finite_values(frame, column))
+            _boxplot_values(
+                _finite_values(
+                    frame,
+                    column,
+                    hide_outliers=hide_outliers,
+                )
+            )
             for frame in frames_by_method[method]
         ]
 
@@ -538,8 +568,8 @@ def draw_grouped_boxplot(
             positions=centers + position_offset,
             widths=width,
             patch_artist=True,
-            showmeans=not hide_outliers,
-            showfliers=not hide_outliers,
+            showmeans=True,
+            showfliers=True,
             manage_ticks=False,
             meanprops={
                 "marker": "D",
@@ -588,14 +618,14 @@ def draw_paired_boxplot(
         if paired.empty or column not in paired.columns:
             values = np.array([], dtype=float)
         else:
-            values = pd.to_numeric(
-                paired.loc[
-                    paired["pose_level"].eq(level["name"]),
-                    column,
-                ],
-                errors="coerce",
-            ).to_numpy(dtype=float)
-            values = values[np.isfinite(values)]
+            group = paired.loc[
+                paired["pose_level"].eq(level["name"])
+            ]
+            values = _paired_finite_values(
+                group,
+                column,
+                hide_outliers,
+            )
 
         sample_counts.append(len(values))
         data.append(_boxplot_values(values))
@@ -608,8 +638,8 @@ def draw_paired_boxplot(
         positions=positions,
         widths=0.55,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -1150,7 +1180,13 @@ def save_iterations_plot(
     for method_index, (method, _) in enumerate(METHODS):
         position_offset = (-offset, +offset)[method_index]
         data = [
-            _boxplot_values(_finite_values(frame, "iterations"))
+            _boxplot_values(
+                _finite_values(
+                    frame,
+                    "iterations",
+                    hide_outliers=args.hide_outliers,
+                )
+            )
             for frame in frames_by_method[method]
         ]
 
@@ -1159,8 +1195,8 @@ def save_iterations_plot(
             positions=centers + position_offset,
             widths=width,
             patch_artist=True,
-            showmeans=not args.hide_outliers,
-            showfliers=not args.hide_outliers,
+            showmeans=True,
+            showfliers=True,
             manage_ticks=False,
             meanprops={
                 "marker": "D",
@@ -1222,7 +1258,13 @@ def save_condition_plot(
     for method_index, (method, _) in enumerate(METHODS):
         position_offset = (-offset, +offset)[method_index]
         data = [
-            _boxplot_values(_finite_values(frame, "condition_last"))
+            _boxplot_values(
+                _finite_values(
+                    frame,
+                    "condition_last",
+                    hide_outliers=args.hide_outliers,
+                )
+            )
             for frame in frames_by_method[method]
         ]
 
@@ -1231,8 +1273,8 @@ def save_condition_plot(
             positions=centers + position_offset,
             widths=width,
             patch_artist=True,
-            showmeans=not args.hide_outliers,
-            showfliers=not args.hide_outliers,
+            showmeans=True,
+            showfliers=True,
             manage_ticks=False,
             meanprops={
                 "marker": "D",

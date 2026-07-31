@@ -60,6 +60,7 @@ from laser_handeye.calibration_dataset import (
 from laser_handeye.geometry import fit_plane_pca
 from laser_handeye.initialization import make_initial_guess
 from laser_handeye.nonlinear_refinement import (
+    refine_handeye_nonlinear,
     refine_handeye_planes_nonlinear,
 )
 from laser_handeye.se3 import (
@@ -158,6 +159,8 @@ MODE_ALIASES = {
     "iteraive": "iterative",
     "iterative_joint_nonlinear": "iterative_joint_nonlinear",
     "iterative_to_joint_nonlinear": "iterative_joint_nonlinear",
+    "iterative_refit_nonlinear": "iterative_refit_nonlinear",
+    "iterative_to_refit_nonlinear": "iterative_refit_nonlinear",
     "closed": "closed",
     "closed_to_iterative": "closed_to_iterative",
     "closed_to_tieraive": "closed_to_iterative",
@@ -306,6 +309,7 @@ def _calibration_mode(text: str) -> str:
             (
                 "iterative",
                 "iterative_joint_nonlinear",
+                "iterative_refit_nonlinear",
                 "closed",
                 "closed_to_iterative",
             )
@@ -325,14 +329,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=_calibration_mode,
         default="iterative",
         metavar=(
-            "{iterative,iterative_joint_nonlinear,closed,"
+            "{iterative,iterative_joint_nonlinear,"
+            "iterative_refit_nonlinear,closed,"
             "closed_to_iterative}"
         ),
         help=(
             "iterative: existing alternating solver; closed: Tan 2025 closed-form; "
             "closed_to_iterative: closed-form result used as iterative initialization; "
             "iterative_joint_nonlinear: alternating result initializes a joint "
-            "nonlinear refinement of SE(3), plane normals, and plane offsets"
+            "nonlinear refinement of SE(3), plane normals, and plane offsets; "
+            "iterative_refit_nonlinear: alternating result initializes a "
+            "six-parameter SE(3) refinement that refits planes at every candidate"
         ),
     )
     parser.add_argument("--only-trial", type=int, default=None)
@@ -396,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--nonlinear-loss",
         choices=("linear", "soft_l1", "huber", "cauchy", "arctan"),
         default="linear",
-        help="least-squares loss for iterative_joint_nonlinear",
+        help="least-squares loss for iterative nonlinear modes",
     )
     parser.add_argument("--nonlinear-f-scale-mm", type=float, default=1.0)
     parser.add_argument("--nonlinear-max-nfev", type=_positive_int, default=300)
@@ -1225,7 +1232,11 @@ def _run_trial(
             true_planes,
         )
 
-    elif args.mode in {"iterative", "iterative_joint_nonlinear"}:
+    elif args.mode in {
+        "iterative",
+        "iterative_refit_nonlinear",
+        "iterative_joint_nonlinear",
+    }:
         T_init = _generic_initial_guess(
             T_true,
             np.random.default_rng(init_seed),
@@ -1269,20 +1280,47 @@ def _run_trial(
             true_planes,
         )
 
-        if args.mode == "iterative_joint_nonlinear":
+        if args.mode in {
+            "iterative_refit_nonlinear",
+            "iterative_joint_nonlinear",
+        }:
             nonlinear_refined = True
             nonlinear_started = time.perf_counter()
-            nonlinear_result = refine_handeye_planes_nonlinear(
-                scans_by_plane,
-                T_est,
-                initial_planes=alternating_planes,
-                loss=args.nonlinear_loss,
-                f_scale_mm=args.nonlinear_f_scale_mm,
-                max_nfev=args.nonlinear_max_nfev,
-                ftol=args.nonlinear_ftol,
-                xtol=args.nonlinear_xtol,
-                gtol=args.nonlinear_gtol,
-            )
+            if args.mode == "iterative_joint_nonlinear":
+                nonlinear_result = refine_handeye_planes_nonlinear(
+                    scans_by_plane,
+                    T_est,
+                    initial_planes=alternating_planes,
+                    loss=args.nonlinear_loss,
+                    f_scale_mm=args.nonlinear_f_scale_mm,
+                    max_nfev=args.nonlinear_max_nfev,
+                    ftol=args.nonlinear_ftol,
+                    xtol=args.nonlinear_xtol,
+                    gtol=args.nonlinear_gtol,
+                )
+                refined_planes = {
+                    plane_id: (
+                        nonlinear_result.plane_normals[plane_id],
+                        nonlinear_result.plane_offsets_mm[plane_id],
+                    )
+                    for plane_id in nonlinear_result.plane_normals
+                }
+            else:
+                nonlinear_result = refine_handeye_nonlinear(
+                    scans_by_plane,
+                    T_est,
+                    plane_mode="refit",
+                    loss=args.nonlinear_loss,
+                    f_scale_mm=args.nonlinear_f_scale_mm,
+                    max_nfev=args.nonlinear_max_nfev,
+                    ftol=args.nonlinear_ftol,
+                    xtol=args.nonlinear_xtol,
+                    gtol=args.nonlinear_gtol,
+                )
+                refined_planes = _estimate_planes(
+                    scans_by_plane,
+                    nonlinear_result.T_ef_s,
+                )
             nonlinear_runtime_s = time.perf_counter() - nonlinear_started
             T_est = nonlinear_result.T_ef_s
             converged = bool(nonlinear_result.success)
@@ -1300,36 +1338,49 @@ def _run_trial(
                 nonlinear_result.delta_rotation_deg
             )
             nonlinear_mean_normal_delta = float(
-                nonlinear_result.mean_plane_normal_delta_deg
+                getattr(
+                    nonlinear_result,
+                    "mean_plane_normal_delta_deg",
+                    nan,
+                )
             )
             nonlinear_max_normal_delta = float(
-                nonlinear_result.max_plane_normal_delta_deg
+                getattr(
+                    nonlinear_result,
+                    "max_plane_normal_delta_deg",
+                    nan,
+                )
             )
             nonlinear_mean_offset_delta = float(
-                nonlinear_result.mean_plane_offset_delta_mm
+                getattr(
+                    nonlinear_result,
+                    "mean_plane_offset_delta_mm",
+                    nan,
+                )
             )
             nonlinear_max_offset_delta = float(
-                nonlinear_result.max_plane_offset_delta_mm
+                getattr(
+                    nonlinear_result,
+                    "max_plane_offset_delta_mm",
+                    nan,
+                )
             )
             nonlinear_jacobian_rank = int(
                 nonlinear_result.jacobian_rank
             )
             nonlinear_variable_count = int(
-                nonlinear_result.variable_count
+                getattr(nonlinear_result, "variable_count", 6)
             )
             nonlinear_jacobian_condition = float(
                 nonlinear_result.jacobian_condition
             )
             nonlinear_scaled_jacobian_condition = float(
-                nonlinear_result.scaled_jacobian_condition
-            )
-            refined_planes = {
-                plane_id: (
-                    nonlinear_result.plane_normals[plane_id],
-                    nonlinear_result.plane_offsets_mm[plane_id],
+                getattr(
+                    nonlinear_result,
+                    "scaled_jacobian_condition",
+                    nan,
                 )
-                for plane_id in nonlinear_result.plane_normals
-            }
+            )
             (
                 nonlinear_plane_normal_error,
                 nonlinear_plane_offset_error,
@@ -1339,19 +1390,15 @@ def _run_trial(
             )
             nonlinear_plane_normals_json = json.dumps(
                 {
-                    str(plane_id): normal.tolist()
-                    for plane_id, normal in (
-                        nonlinear_result.plane_normals.items()
-                    )
+                    str(plane_id): np.asarray(normal).tolist()
+                    for plane_id, (normal, _offset) in refined_planes.items()
                 },
                 sort_keys=True,
             )
             nonlinear_plane_offsets_json = json.dumps(
                 {
-                    str(plane_id): offset
-                    for plane_id, offset in (
-                        nonlinear_result.plane_offsets_mm.items()
-                    )
+                    str(plane_id): float(offset)
+                    for plane_id, (_normal, offset) in refined_planes.items()
                 },
                 sort_keys=True,
             )
@@ -1614,7 +1661,17 @@ def _summary(
         delta_t = alternating_t - refined_t
         delta_r = alternating_r - refined_r
 
-        summary["joint_nonlinear_comparison"] = {
+        comparison_key = (
+            "refit_nonlinear_comparison"
+            if refined[0].mode == "iterative_refit_nonlinear"
+            else "joint_nonlinear_comparison"
+        )
+        summary[comparison_key] = {
+            "plane_mode": (
+                "refit"
+                if refined[0].mode == "iterative_refit_nonlinear"
+                else "joint"
+            ),
             "paired_trials": int(len(delta_t)),
             "nonlinear_successful_trials": int(
                 sum(row.nonlinear_success for row in refined)
@@ -1699,6 +1756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.mode in {
         "iterative",
+        "iterative_refit_nonlinear",
         "iterative_joint_nonlinear",
         "closed_to_iterative",
     }:
@@ -1757,8 +1815,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"final_r={row.rotation_error_deg:.6g} deg"
             )
             if row.nonlinear_refined:
+                nonlinear_label = (
+                    "refit"
+                    if row.mode == "iterative_refit_nonlinear"
+                    else "joint"
+                )
                 print(
-                    "    alternating -> joint nonlinear: "
+                    f"    alternating -> {nonlinear_label} nonlinear: "
                     f"t {row.alternating_translation_error_mm:.6g} -> "
                     f"{row.translation_error_mm:.6g} mm, "
                     f"r {row.alternating_rotation_error_deg:.6g} -> "
@@ -1819,10 +1882,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"p95={summary['rotation_error_deg']['p95']}, "
         f"max={summary['rotation_error_deg']['max']}"
     )
-    if "joint_nonlinear_comparison" in summary:
-        comparison = summary["joint_nonlinear_comparison"]
+    comparison_key = next(
+        (
+            key
+            for key in (
+                "refit_nonlinear_comparison",
+                "joint_nonlinear_comparison",
+            )
+            if key in summary
+        ),
+        None,
+    )
+    if comparison_key is not None:
+        comparison = summary[comparison_key]
         print(
-            "alternating -> joint nonlinear median: "
+            f"alternating -> {comparison['plane_mode']} nonlinear median: "
             f"translation "
             f"{comparison['alternating_translation_error_mm_median']} -> "
             f"{comparison['refined_translation_error_mm_median']} mm, "

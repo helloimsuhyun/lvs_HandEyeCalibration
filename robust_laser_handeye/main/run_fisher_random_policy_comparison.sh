@@ -66,6 +66,21 @@ SELECTION_ESTIMATOR_MAX_ITER="${SELECTION_ESTIMATOR_MAX_ITER:-60}"
 SELECTION_ESTIMATOR_TOL="${SELECTION_ESTIMATOR_TOL:-1e-7}"
 MAX_ITER="${MAX_ITER:-3000}"
 TOL="${TOL:-1e-5}"
+CALIBRATION_MODE="${CALIBRATION_MODE:-iterative}"
+NONLINEAR_LOSS="${NONLINEAR_LOSS:-linear}"
+NONLINEAR_F_SCALE_MM="${NONLINEAR_F_SCALE_MM:-1.0}"
+NONLINEAR_MAX_NFEV="${NONLINEAR_MAX_NFEV:-300}"
+NONLINEAR_FTOL="${NONLINEAR_FTOL:-1e-10}"
+NONLINEAR_XTOL="${NONLINEAR_XTOL:-1e-10}"
+NONLINEAR_GTOL="${NONLINEAR_GTOL:-1e-10}"
+NONLINEAR_ARGS=(
+  --nonlinear-loss "${NONLINEAR_LOSS}"
+  --nonlinear-f-scale-mm "${NONLINEAR_F_SCALE_MM}"
+  --nonlinear-max-nfev "${NONLINEAR_MAX_NFEV}"
+  --nonlinear-ftol "${NONLINEAR_FTOL}"
+  --nonlinear-xtol "${NONLINEAR_XTOL}"
+  --nonlinear-gtol "${NONLINEAR_GTOL}"
+)
 
 DATASET_ROOT="${DATASET_ROOT:-dataset/fisher_random_policy_comparison}"
 RESULT_ROOT="${RESULT_ROOT:-results/fisher_random_policy_comparison}"
@@ -135,6 +150,14 @@ for required_file in \
     exit 1
   fi
 done
+
+case "${CALIBRATION_MODE}" in
+  iterative|iterative_refit_nonlinear|iterative_joint_nonlinear) ;;
+  *)
+    echo "ERROR: unsupported CALIBRATION_MODE: ${CALIBRATION_MODE}" >&2
+    exit 1
+    ;;
+esac
 
 for integer_setting in \
   "${TOTAL_SCANS}" \
@@ -425,7 +448,8 @@ for method in "${METHODS[@]}"; do
     PYTHONPATH=. python3 "${CALIBRATOR}" \
       --collection "${collection}" \
       --output-dir "${result_dir}" \
-      --mode iterative \
+      --mode "${CALIBRATION_MODE}" \
+      "${NONLINEAR_ARGS[@]}" \
       --seed "${CALIBRATION_SEED}" \
       --noise-axis "${NOISE_AXIS}" \
       --noise-std-mm 0 \
@@ -441,6 +465,8 @@ for method in "${METHODS[@]}"; do
   fi
 
   if ! PYTHONPATH=. python3 "${VALIDATOR}" result \
+    --mode "${CALIBRATION_MODE}" \
+    "${NONLINEAR_ARGS[@]}" \
     --summary "${result_dir}/summary.json" \
     --collection "${collection}" \
     --trials "${MAX_TRIALS}" \

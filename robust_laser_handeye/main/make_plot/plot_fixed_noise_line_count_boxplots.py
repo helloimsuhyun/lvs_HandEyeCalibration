@@ -73,8 +73,10 @@ def parse_args() -> argparse.Namespace:
         dest="hide_outliers",
         action="store_true",
         help=(
-            "Hide individual boxplot fliers. This is the default so a rare "
-            "catastrophic calibration does not collapse the useful y-axis."
+            "Hide trials explicitly flagged as calibration outliers while "
+            "retaining ordinary Tukey boxplot fliers. This is the default so "
+            "a rare catastrophic calibration does not collapse the useful "
+            "y-axis."
         ),
     )
     outlier_group.add_argument(
@@ -82,8 +84,8 @@ def parse_args() -> argparse.Namespace:
         dest="hide_outliers",
         action="store_false",
         help=(
-            "Show individual boxplot fliers and include them in axis "
-            "autoscaling."
+            "Include explicitly flagged calibration outliers in the boxplots "
+            "and axis autoscaling."
         ),
     )
     parser.set_defaults(hide_outliers=True)
@@ -118,6 +120,34 @@ def bool_series(series: pd.Series) -> pd.Series:
         .str.lower()
         .isin({"true", "1", "yes"})
     )
+
+
+def boxplot_values(
+    frame: pd.DataFrame,
+    column: str,
+    hide_outliers: bool,
+) -> np.ndarray:
+    """Return finite plot values, optionally excluding explicit failures."""
+    values = pd.to_numeric(frame[column], errors="coerce")
+    keep = np.isfinite(values)
+    if hide_outliers and "outlier" in frame.columns:
+        keep &= ~bool_series(frame["outlier"])
+    return values[keep].to_numpy(dtype=float)
+
+
+def paired_boxplot_values(
+    frame: pd.DataFrame,
+    column: str,
+    hide_outliers: bool,
+) -> np.ndarray:
+    """Return paired values, hiding pairs containing an explicit failure."""
+    values = pd.to_numeric(frame[column], errors="coerce")
+    keep = np.isfinite(values)
+    if hide_outliers:
+        for outlier_column in ("outlier_single", "outlier_three"):
+            if outlier_column in frame.columns:
+                keep &= ~bool_series(frame[outlier_column])
+    return values[keep].to_numpy(dtype=float)
 
 
 def load_trials(path: Path, success_only: bool) -> pd.DataFrame:
@@ -238,6 +268,7 @@ def collect_metric(
     scan_counts: list[int],
     column: str,
     success_only: bool,
+    hide_outliers: bool,
 ) -> dict[str, list[np.ndarray]]:
     result = {method_dir: [] for method_dir, _ in METHODS}
 
@@ -245,7 +276,13 @@ def collect_metric(
         for method_dir, _ in METHODS:
             csv_path = result_root / f"N{count}" / method_dir / "trials.csv"
             frame = load_trials(csv_path, success_only)
-            result[method_dir].append(frame[column].to_numpy(dtype=float))
+            result[method_dir].append(
+                boxplot_values(
+                    frame,
+                    column,
+                    hide_outliers,
+                )
+            )
 
     return result
 
@@ -272,6 +309,7 @@ def pair_count_condition(
     optional = [
         "init_translation_error_mm",
         "init_rotation_error_deg",
+        "outlier",
     ]
 
     single_columns = base + [
@@ -299,7 +337,10 @@ def pair_count_condition(
         - paired["rotation_error_deg_three"]
     )
 
-    for column in optional:
+    for column in (
+        "init_translation_error_mm",
+        "init_rotation_error_deg",
+    ):
         left = f"{column}_single"
         right = f"{column}_three"
 
@@ -432,8 +473,8 @@ def draw_grouped_boxes(
         positions=centers - offset,
         widths=width,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -447,8 +488,8 @@ def draw_grouped_boxes(
         positions=centers + offset,
         widths=width,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -495,14 +536,16 @@ def draw_paired_boxes(
     data: list[np.ndarray] = []
 
     for scan_count in scan_counts:
-        values = pd.to_numeric(
-            paired.loc[
-                paired["scan_count"].eq(scan_count),
+        group = paired.loc[
+            paired["scan_count"].eq(scan_count)
+        ]
+        data.append(
+            paired_boxplot_values(
+                group,
                 value_column,
-            ],
-            errors="coerce",
-        ).to_numpy()
-        data.append(values[np.isfinite(values)])
+                hide_outliers,
+            )
+        )
 
     positions = np.arange(len(scan_counts), dtype=float)
 
@@ -511,8 +554,8 @@ def draw_paired_boxes(
         positions=positions,
         widths=0.55,
         patch_artist=True,
-        showmeans=not hide_outliers,
-        showfliers=not hide_outliers,
+        showmeans=True,
+        showfliers=True,
         manage_ticks=False,
         meanprops={
             "marker": "D",
@@ -722,12 +765,14 @@ def main() -> None:
         scan_counts,
         "translation_error_mm",
         args.success_only,
+        args.hide_outliers,
     )
     rotation = collect_metric(
         result_root,
         scan_counts,
         "rotation_error_deg",
         args.success_only,
+        args.hide_outliers,
     )
 
     save_grouped_plot(
