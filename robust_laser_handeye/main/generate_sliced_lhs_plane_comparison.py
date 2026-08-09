@@ -153,6 +153,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shared-feasibility-target-range-mm",
+        type=float,
+        nargs=4,
+        action="append",
+        default=[],
+        metavar=("U_MIN", "U_MAX", "V_MIN", "V_MAX"),
+        help=(
+            "Additional target U/V range that must accept the same normalized "
+            "sliced design. Repeat this option to obtain matched designs across "
+            "target-range conditions."
+        ),
+    )
+    parser.add_argument(
         "--max-design-attempts",
         type=_positive_int,
         default=200,
@@ -270,6 +283,24 @@ def _validated_configs(
     )
 
     feasibility_configs = [output_config]
+
+    def config_key(
+        config: uniform.UniformConfig,
+    ) -> tuple[tuple[float, float], ...]:
+        return (
+            config.target_u_range_mm,
+            config.target_v_range_mm,
+            config.depth_range_mm,
+            config.tilt_range_deg,
+            config.azimuth_range_deg,
+            config.roll_range_deg,
+        )
+
+    def add_feasibility_config(candidate: uniform.UniformConfig) -> None:
+        existing_keys = {config_key(config) for config in feasibility_configs}
+        if config_key(candidate) not in existing_keys:
+            feasibility_configs.append(candidate)
+
     for t0, t1, a0, a1, r0, r1 in args.shared_feasibility_pose_range:
         candidate = replace(
             output_config,
@@ -277,34 +308,45 @@ def _validated_configs(
             azimuth_range_deg=(a0, a1),
             roll_range_deg=(r0, r1),
         )
-        key = (
-            candidate.tilt_range_deg,
-            candidate.azimuth_range_deg,
-            candidate.roll_range_deg,
+        add_feasibility_config(candidate)
+
+    for u0, u1, v0, v1 in args.shared_feasibility_target_range_mm:
+        candidate = replace(
+            output_config,
+            target_u_range_mm=_finite_pair((u0, u1), "shared target U range"),
+            target_v_range_mm=_finite_pair((v0, v1), "shared target V range"),
         )
-        existing_keys = {
-            (cfg.tilt_range_deg, cfg.azimuth_range_deg, cfg.roll_range_deg)
-            for cfg in feasibility_configs
-        }
-        if key not in existing_keys:
-            feasibility_configs.append(candidate)
+        add_feasibility_config(candidate)
 
     return fair_config, output_config, feasibility_configs
 
 
-def _active_parameter_indices(config: uniform.UniformConfig) -> list[int]:
-    bounds = (
-        config.target_u_range_mm,
-        config.target_v_range_mm,
-        config.depth_range_mm,
-        config.tilt_range_deg,
-        config.azimuth_range_deg,
-        config.roll_range_deg,
-    )
+def _active_parameter_indices(
+    configs: Sequence[uniform.UniformConfig],
+) -> list[int]:
+    bounds_by_config = [
+        (
+            config.target_u_range_mm,
+            config.target_v_range_mm,
+            config.depth_range_mm,
+            config.tilt_range_deg,
+            config.azimuth_range_deg,
+            config.roll_range_deg,
+        )
+        for config in configs
+    ]
     indices = [
         index
-        for index, (lower, upper) in enumerate(bounds)
-        if not np.isclose(lower, upper, rtol=0.0, atol=0.0)
+        for index in range(len(PARAMETER_NAMES))
+        if any(
+            not np.isclose(
+                bounds[index][0],
+                bounds[index][1],
+                rtol=0.0,
+                atol=0.0,
+            )
+            for bounds in bounds_by_config
+        )
     ]
     if not indices:
         raise ValueError("at least one relative-pose parameter must vary")
@@ -592,7 +634,7 @@ def _sample_jointly_feasible_sliced_design(
     feasibility_mode: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     points_per_slice = fair_config.total_scans // SLICE_COUNT
-    active_indices = _active_parameter_indices(output_config)
+    active_indices = _active_parameter_indices(feasibility_configs)
     rejection_messages: list[str] = []
 
     for attempt in range(max_attempts):

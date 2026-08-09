@@ -52,6 +52,22 @@ PYTHONPATH=. python3 real_laser_handeye/laser_scan_demo/two_point_stop_and_scan.
   --capture-aggregate mean \
   --auto-save \
   --save-on-exit
+
+PYTHONPATH=. python3 real_laser_handeye/laser_scan_demo/two_point_stop_and_scan.py \
+  --handeye /home/choisuhyun/lvs_HandEyeCalibration/runs/real/real_initial/T_tcp_sensor_calibrate_initial_value.csv \
+  --save-path runs/real/block.npz \
+  --robot-host 169.254.186.20 \
+  --laser-ip 169.254.186.182 \
+  --batch-profiles 1 \
+  --scan-speed-mm-s 5 \
+  --scan-accel-mm-s2 5 \
+  --alignment-speed-mm-s 10 \
+  --alignment-accel-mm-s2 10 \
+  --waypoint-spacing-mm 1.0 \
+  --profiles-per-waypoint 10 \
+  --capture-aggregate mean \
+  --auto-save \
+  --save-on-exit
 ```
 
 

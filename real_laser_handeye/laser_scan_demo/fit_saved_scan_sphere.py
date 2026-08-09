@@ -5,7 +5,7 @@ Example
 -------
 PYTHONPATH=. python3 real_laser_handeye/laser_scan_demo/fit_saved_scan_sphere.py \
   --input runs/real/two_point_stop_and_scan.npz \
-  --z-min -12 \
+  --auto-floor-z-min \
   --z-min-margin-mm 0 \
   --point-size 2
 """
@@ -20,8 +20,10 @@ import numpy as np
 
 try:
     import open3d as o3d
-except ModuleNotFoundError:
+    _OPEN3D_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # Open3D may fail through optional ML dependencies.
     o3d = None
+    _OPEN3D_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -88,6 +90,17 @@ class PreprocessStats:
     group_stats: list[dict[str, object]]
 
 
+@dataclass(frozen=True)
+class FloorZDetection:
+    floor_z_mm: float
+    z_min_mm: float
+    clearance_mm: float
+    profile_quantile: float
+    candidate_profile_count: int
+    inlier_profile_count: int
+    robust_sigma_mm: float
+
+
 def _sorted_capture_keys(keys: set[str]) -> list[str]:
     return sorted(
         key
@@ -151,6 +164,60 @@ def load_saved_points(path: Path, source: str) -> LoadedPoints:
         clean_names.append(name)
 
     return _make_loaded(clean_groups, clean_names)
+
+
+def detect_floor_z_min(
+    loaded: LoadedPoints,
+    *,
+    known_radius_mm: float,
+    profile_quantile: float = 0.10,
+    clearance_mm: float | None = None,
+) -> FloorZDetection:
+    """Detect the horizontal floor band and return an automatic Z crop.
+
+    Each laser profile contributes one low-Z quantile so long profiles cannot
+    dominate the estimate. A median/MAD gate rejects profiles containing deep
+    spikes or object-only samples. The crop is placed above the detected floor;
+    by default the clearance is 80% of the known sphere radius.
+    """
+    if known_radius_mm <= 0:
+        raise ValueError("known radius must be positive")
+    if not 0.0 < profile_quantile < 0.5:
+        raise ValueError("floor profile quantile must be in (0, 0.5)")
+    if clearance_mm is None:
+        clearance_mm = 0.8 * known_radius_mm
+    if clearance_mm < 0:
+        raise ValueError("floor clearance must be non-negative")
+
+    candidates = np.asarray(
+        [
+            np.quantile(group[:, 2], profile_quantile)
+            for group in loaded.groups
+            if len(group)
+        ],
+        dtype=float,
+    )
+    candidates = candidates[np.isfinite(candidates)]
+    if len(candidates) < 3:
+        raise RuntimeError("too few profiles for automatic floor detection")
+    initial_median = float(np.median(candidates))
+    initial_mad = float(np.median(np.abs(candidates - initial_median)))
+    robust_sigma = 1.4826 * initial_mad
+    gate_mm = max(0.25, 3.5 * max(robust_sigma, 1e-6))
+    inliers = np.abs(candidates - initial_median) <= gate_mm
+    if np.count_nonzero(inliers) < max(3, int(math.ceil(0.35 * len(candidates)))):
+        inliers = np.ones(len(candidates), dtype=bool)
+    floor_z = float(np.median(candidates[inliers]))
+    inlier_mad = float(np.median(np.abs(candidates[inliers] - floor_z)))
+    return FloorZDetection(
+        floor_z_mm=floor_z,
+        z_min_mm=float(floor_z + clearance_mm),
+        clearance_mm=float(clearance_mm),
+        profile_quantile=float(profile_quantile),
+        candidate_profile_count=int(len(candidates)),
+        inlier_profile_count=int(np.count_nonzero(inliers)),
+        robust_sigma_mm=float(1.4826 * inlier_mad),
+    )
 
 
 def apply_crop_to_groups(
@@ -703,7 +770,8 @@ def _require_open3d() -> None:
     if o3d is None:
         raise RuntimeError(
             "Open3D visualization is not installed. Install it with "
-            "`python -m pip install open3d==0.19.0` or run with --no-gui."
+            "`python -m pip install open3d==0.19.0` or run with --no-gui. "
+            f"Import error: {_OPEN3D_IMPORT_ERROR}"
         )
 
 
@@ -1170,6 +1238,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-min", type=float)
     parser.add_argument("--z-max", type=float)
     parser.add_argument(
+        "--auto-floor-z-min",
+        action="store_true",
+        help=(
+            "Detect the dominant horizontal floor Z band from per-profile "
+            "low quantiles and use floor Z plus a clearance as --z-min"
+        ),
+    )
+    parser.add_argument(
+        "--floor-clearance-mm",
+        type=float,
+        help=(
+            "Clearance above the detected floor used by --auto-floor-z-min; "
+            "default is 0.8 * --radius-mm"
+        ),
+    )
+    parser.add_argument(
+        "--floor-profile-quantile",
+        type=float,
+        default=0.10,
+        help="Low-Z quantile contributed by each profile for floor detection",
+    )
+    parser.add_argument(
         "--result-json",
         type=Path,
         default=Path("runs/real/sphere_fit_both_result.json"),
@@ -1223,8 +1313,23 @@ def main() -> None:
         raise ValueError("--radius-mm must be positive")
     if args.inlier_threshold_mm <= 0 or args.ransac_threshold_mm <= 0:
         raise ValueError("inlier thresholds must be positive")
+    if args.auto_floor_z_min and args.z_min is not None:
+        raise ValueError("use either --auto-floor-z-min or --z-min, not both")
+    if args.floor_clearance_mm is not None and args.floor_clearance_mm < 0:
+        raise ValueError("--floor-clearance-mm must be non-negative")
+    if not 0.0 < args.floor_profile_quantile < 0.5:
+        raise ValueError("--floor-profile-quantile must be in (0, 0.5)")
 
     loaded_original = load_saved_points(args.input, args.source)
+    floor_detection: FloorZDetection | None = None
+    if args.auto_floor_z_min:
+        floor_detection = detect_floor_z_min(
+            loaded_original,
+            known_radius_mm=args.radius_mm,
+            profile_quantile=args.floor_profile_quantile,
+            clearance_mm=args.floor_clearance_mm,
+        )
+        args.z_min = floor_detection.z_min_mm
     loaded_cropped = apply_crop_to_groups(loaded_original, args)
 
     if args.keep_profile_z_min:
@@ -1324,6 +1429,21 @@ def main() -> None:
         "z_min_removal_enabled": not args.keep_profile_z_min,
         "z_min_margin_mm": args.z_min_margin_mm,
         "min_profile_inlier_ratio": args.min_profile_inlier_ratio,
+        "z_min_mm": args.z_min,
+        "auto_floor_z_min": args.auto_floor_z_min,
+        "floor_detection": (
+            None
+            if floor_detection is None
+            else {
+                "floor_z_mm": floor_detection.floor_z_mm,
+                "effective_z_min_mm": floor_detection.z_min_mm,
+                "clearance_mm": floor_detection.clearance_mm,
+                "profile_quantile": floor_detection.profile_quantile,
+                "candidate_profile_count": floor_detection.candidate_profile_count,
+                "inlier_profile_count": floor_detection.inlier_profile_count,
+                "robust_sigma_mm": floor_detection.robust_sigma_mm,
+            }
+        ),
     }
     save_results(
         args.result_json,
@@ -1336,6 +1456,19 @@ def main() -> None:
     )
 
     print(f"input: {args.input}")
+    if floor_detection is not None:
+        print(
+            "auto floor Z [mm]: "
+            f"{floor_detection.floor_z_mm:.6f} "
+            f"(robust sigma={floor_detection.robust_sigma_mm:.6f}, "
+            f"profiles={floor_detection.inlier_profile_count}/"
+            f"{floor_detection.candidate_profile_count})"
+        )
+        print(
+            "automatic z-min [mm]: "
+            f"{floor_detection.z_min_mm:.6f} "
+            f"(clearance={floor_detection.clearance_mm:.6f})"
+        )
     print(f"original profile groups: {len(loaded_cropped.groups)}")
     print(f"filtered profile groups: {len(filtered.groups)}")
     print(f"input points: {preprocessing.input_points}")
