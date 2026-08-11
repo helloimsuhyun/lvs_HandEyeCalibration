@@ -40,7 +40,7 @@ from laser_handeye.simulation import sample_random_handeye
 
 
 SCHEMA = "laser_handeye.sliced_lhs_equal_budget_comparison"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SLICE_COUNT = 3
 
 PARAMETER_NAMES = (
@@ -811,6 +811,7 @@ def _build_trial(
         "single_assignment": "all slices mapped to plane 0",
         "three_assignment": "slice k mapped to physical plane k",
         "equal_total_scan_budget": True,
+        "view_pose_convention": dict(uniform.VIEW_POSE_CONVENTION),
         "uniform_config": asdict(output_config),
         **design_stats,
     }
@@ -953,6 +954,7 @@ def _new_collection_manifest(
         "profile_state": "ideal",
         "noise_applied": False,
         "robot_ik_and_collision_checked": False,
+        "view_pose_convention": dict(uniform.VIEW_POSE_CONVENTION),
         "fair_config": asdict(fair_config),
         "uniform_config": asdict(output_config),
         "scans_per_trial": fair_config.total_scans,

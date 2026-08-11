@@ -66,6 +66,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from main import generate_independent_random_plane_comparison as base
+from main import generate_plane_uniform_comparison as pose_geometry
 
 from laser_handeye.active_fisher import estimate_joint_calibration
 from laser_handeye.calibration_dataset import (
@@ -78,7 +79,7 @@ from laser_handeye.simulation import sample_random_handeye
 
 
 SCHEMA = "laser_handeye.single_plane_uniform_vs_active_fisher"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -464,16 +465,14 @@ def _make_sensor_pose_relative_to_plane(
     common_center: np.ndarray,
     pose: PlaneRelativeCandidate,
 ) -> np.ndarray:
-    azimuth = np.deg2rad(pose.view_azimuth_deg)
-    tilt = np.deg2rad(pose.view_tilt_deg)
     roll = np.deg2rad(pose.sensor_roll_deg)
 
-    view_from_target = (
-        np.sin(tilt) * np.cos(azimuth) * frame.u
-        + np.sin(tilt) * np.sin(azimuth) * frame.v
-        + np.cos(tilt) * frame.n
+    z_axis = pose_geometry._sensor_z_axis_from_view_angles(
+        frame,
+        pose.view_tilt_deg,
+        pose.view_azimuth_deg,
+        name="plane-relative canonical sensor +Z view direction",
     )
-    z_axis = -base._normalize(view_from_target, "plane-relative view direction")
 
     x_reference = frame.u - float(frame.u @ z_axis) * z_axis
     if np.linalg.norm(x_reference) <= 1e-10:
@@ -545,6 +544,7 @@ def _simulate_candidate_scan(
             "candidate_parameterization": "u_v_depth_tilt_azimuth_roll",
             "target_u_mm": pose.target_u_mm,
             "target_v_mm": pose.target_v_mm,
+            "view_pose_convention": dict(pose_geometry.VIEW_POSE_CONVENTION),
             "relative_pose_parameters": {
                 "target_u_mm": pose.target_u_mm,
                 "target_v_mm": pose.target_v_mm,
@@ -552,6 +552,10 @@ def _simulate_candidate_scan(
                 "view_tilt_deg": pose.view_tilt_deg,
                 "view_azimuth_deg": pose.view_azimuth_deg,
                 "sensor_roll_deg": pose.sensor_roll_deg,
+                "view_u_mm": pose.target_u_mm,
+                "view_v_mm": pose.target_v_mm,
+                "view_distance_mm": pose.center_depth_mm,
+                "view_roll_deg": pose.sensor_roll_deg,
             },
         }
     )
@@ -1045,6 +1049,7 @@ def _prepare_collection(
         "profile_state": "measured",
         "noise_applied": selection_config.measurement_noise_std_mm > 0.0,
         "robot_ik_and_collision_checked": False,
+        "view_pose_convention": dict(pose_geometry.VIEW_POSE_CONVENTION),
         "fair_config": asdict(fair_config),
         "candidate_config": asdict(candidate_config),
         "pose_selection_config": asdict(selection_config),

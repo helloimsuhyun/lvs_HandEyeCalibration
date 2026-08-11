@@ -79,7 +79,24 @@ from laser_handeye.simulation import sample_random_handeye
 
 
 SCHEMA = "laser_handeye.uniform_relative_pose_comparison"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+VIEW_POSE_CONVENTION = {
+    "origin": (
+        "simulated sensor origin; physical and sensor-coordinate origins "
+        "coincide (offset 0 mm)"
+    ),
+    "u_v": "sensor +Z axis / target-plane intersection coordinates",
+    "distance": (
+        "Euclidean simulated-sensor-origin to axis/plane intersection distance; "
+        "center_depth_mm is the legacy-compatible field name"
+    ),
+    "tilt": "angle(sensor -Z, oriented target-plane normal)",
+    "azimuth": "target-plane azimuth of projected sensor +Z",
+    "roll": (
+        "signed angle about sensor +Z from projected target +U to sensor +X"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -107,6 +124,24 @@ class UniformConfig:
     roll_range_deg: tuple[float, float]
     max_batches: int
     batch_multiplier: int
+
+
+def _sensor_z_axis_from_view_angles(
+    frame: base.PlaneFrame,
+    view_tilt_deg: float,
+    view_azimuth_deg: float,
+    *,
+    name: str = "canonical sensor +Z view direction",
+) -> np.ndarray:
+    """Return sensor +Z using the canonical target-plane view convention."""
+    tilt = np.deg2rad(float(view_tilt_deg))
+    azimuth = np.deg2rad(float(view_azimuth_deg))
+    sensor_z = (
+        np.sin(tilt) * np.cos(azimuth) * frame.u
+        + np.sin(tilt) * np.sin(azimuth) * frame.v
+        - np.cos(tilt) * frame.n
+    )
+    return base._normalize(sensor_z, name)
 
 
 def _positive_int(text: str) -> int:
@@ -295,16 +330,14 @@ def _make_sensor_pose_relative_to_plane(
     pose: UniformRelativePose,
 ) -> np.ndarray:
     """Construct T_base_sensor from one plane-relative pose parameterization."""
-    azimuth = np.deg2rad(pose.view_azimuth_deg)
-    tilt = np.deg2rad(pose.view_tilt_deg)
     roll = np.deg2rad(pose.sensor_roll_deg)
 
-    view_from_target = (
-        np.sin(tilt) * np.cos(azimuth) * frame.u
-        + np.sin(tilt) * np.sin(azimuth) * frame.v
-        + np.cos(tilt) * frame.n
+    z_axis = _sensor_z_axis_from_view_angles(
+        frame,
+        pose.view_tilt_deg,
+        pose.view_azimuth_deg,
+        name="plane-relative canonical sensor +Z view direction",
     )
-    z_axis = -base._normalize(view_from_target, "plane-relative view direction")
 
     x_reference = frame.u - float(frame.u @ z_axis) * z_axis
     if np.linalg.norm(x_reference) <= 1e-10:
@@ -538,6 +571,7 @@ def _simulate_uniform_scan(
             "relative_pose_source_sample_id": pose.sample_id,
             "target_u_mm": pose.target_u_mm,
             "target_v_mm": pose.target_v_mm,
+            "view_pose_convention": dict(VIEW_POSE_CONVENTION),
             "relative_pose_parameters": {
                 "target_u_mm": pose.target_u_mm,
                 "target_v_mm": pose.target_v_mm,
@@ -545,6 +579,10 @@ def _simulate_uniform_scan(
                 "view_tilt_deg": pose.view_tilt_deg,
                 "view_azimuth_deg": pose.view_azimuth_deg,
                 "sensor_roll_deg": pose.sensor_roll_deg,
+                "view_u_mm": pose.target_u_mm,
+                "view_v_mm": pose.target_v_mm,
+                "view_distance_mm": pose.center_depth_mm,
+                "view_roll_deg": pose.sensor_roll_deg,
             },
         }
     )
@@ -714,6 +752,7 @@ def _build_uniform_datasets(
         "relative_pose_base_set_identical_between_uniform_branches": True,
         "three_uniform_full_pose_set_applied_to_every_plane": True,
         "three_uniform_replication_factor": len(frames),
+        "view_pose_convention": dict(VIEW_POSE_CONVENTION),
         "uniform_config": asdict(uniform_config),
         "uniform_block_statistics": block_stats,
     }
@@ -1029,6 +1068,7 @@ def _prepare_collection(
         "profile_state": "ideal",
         "noise_applied": False,
         "robot_ik_and_collision_checked": False,
+        "view_pose_convention": dict(VIEW_POSE_CONVENTION),
         "fair_config": asdict(fair_config),
         "uniform_config": asdict(uniform_config),
         "scans_per_trial": (
