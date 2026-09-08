@@ -24,6 +24,64 @@ def _validate_points(points: np.ndarray, name: str) -> np.ndarray:
     return points.copy()
 
 
+def _normalize_vector(
+    value: np.ndarray,
+    name: str,
+) -> np.ndarray:
+    vector = np.asarray(value, dtype=float).reshape(3)
+
+    norm = float(np.linalg.norm(vector))
+
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise ValueError(
+            f"{name} must be finite and non-zero"
+        )
+
+    return vector / norm
+
+
+@dataclass(frozen=True)
+class PlaneFrame:
+    """Right-handed target-plane frame in robot-base coordinates."""
+
+    u: np.ndarray
+    v: np.ndarray
+    n: np.ndarray
+    offset_mm: float
+
+    def __post_init__(self) -> None:
+        u = _normalize_vector(self.u, "plane u")
+        v = _normalize_vector(self.v, "plane v")
+        n = _normalize_vector(self.n, "plane normal")
+
+        if not np.allclose(
+            np.cross(u, v),
+            n,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "plane frame must be right-handed and orthonormal"
+            )
+
+        if not np.isfinite(self.offset_mm):
+            raise ValueError(
+                "plane offset must be finite"
+            )
+
+        object.__setattr__(self, "u", u)
+        object.__setattr__(self, "v", v)
+        object.__setattr__(self, "n", n)
+        object.__setattr__(
+            self,
+            "offset_mm",
+            float(self.offset_mm),
+        )
+
+    @property
+    def l(self) -> float:
+        return self.offset_mm
+
+
 # 1개 프로파일 데이터와 해당하는 TCP transform을 담는 dataclass
 @dataclass
 class LaserScan:

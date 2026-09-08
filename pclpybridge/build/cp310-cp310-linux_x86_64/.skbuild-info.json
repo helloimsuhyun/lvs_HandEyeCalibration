@@ -1,0 +1,8 @@
+{
+  "source_dir": "/home/choisuhyun/lvs_HandEyeCalibration/pclpybridge_pcl112_fix",
+  "build_dir": "/home/choisuhyun/lvs_HandEyeCalibration/pclpybridge_pcl112_fix/build/cp310-cp310-linux_x86_64",
+  "cmake_path": "/usr/bin/cmake",
+  "skbuild_path": "/tmp/pip-build-env-rfa8azw4/overlay/lib/python3.10/site-packages/scikit_build_core",
+  "skbuild_version": "1.0.3",
+  "python_executable": "/home/choisuhyun/miniconda3/envs/laser_handeye/bin/python"
+}

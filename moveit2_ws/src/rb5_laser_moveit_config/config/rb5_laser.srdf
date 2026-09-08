@@ -1,0 +1,100 @@
+<?xml version="1.0"?>
+<robot name="rb5_850e">
+
+  <!-- Fixed base reference -->
+  <virtual_joint
+      name="world_joint"
+      type="fixed"
+      parent_frame="world"
+      child_link="link0"/>
+
+  <!--
+    Planning chain:
+      link0
+        -> ...
+        -> link6
+        -> tcp
+        -> sensor_measurement_frame
+        -> sensor_physical_origin
+
+    The pose goal used by MoveIt is sensor_physical_origin.
+  -->
+  <group name="rb5_arm">
+    <chain
+        base_link="link0"
+        tip_link="sensor_physical_origin"/>
+  </group>
+
+  <!-- Default/home configuration -->
+  <group_state name="home" group="rb5_arm">
+    <joint name="base" value="0"/>
+    <joint name="shoulder" value="-1.570796327"/>
+    <joint name="elbow" value="1.570796327"/>
+    <joint name="wrist1" value="0"/>
+    <joint name="wrist2" value="1.570796327"/>
+    <joint name="wrist3" value="0"/>
+  </group_state>
+
+  <!-- Robot adjacent links -->
+  <disable_collisions
+      link1="link0"
+      link2="link1"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="link1"
+      link2="link2"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="link2"
+      link2="link3"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="link3"
+      link2="link4"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="link4"
+      link2="link5"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="link5"
+      link2="link6"
+      reason="Adjacent"/>
+
+  <!-- Fixed tool/sensor chain -->
+  <disable_collisions
+      link1="link6"
+      link2="tcp"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="tcp"
+      link2="sensor_measurement_frame"
+      reason="Adjacent"/>
+
+  <disable_collisions
+      link1="sensor_measurement_frame"
+      link2="sensor_physical_origin"
+      reason="Adjacent"/>
+
+  <!--
+    The physical sensor housing is rigidly mounted to link6.
+
+    Its collision geometry may overlap/touch the wrist-side geometry because
+    they are part of the same rigidly mounted tool assembly. This pair is
+    therefore excluded from self-collision checking.
+
+    Do NOT disable collisions between the sensor and link5/link4/etc.;
+    those links move relative to the sensor and must still be checked.
+  -->
+  <disable_collisions
+      link1="link6"
+      link2="sensor_measurement_frame"
+      reason="Adjacent"/>
+
+</robot>

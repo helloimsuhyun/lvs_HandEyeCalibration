@@ -97,6 +97,7 @@ for _import_root in (_WORKSPACE_ROOT, _ROBUST_ROOT):
 # Match the simulation stack used by the repository's exact sliced-LHS generator.
 from main import generate_independent_random_plane_comparison as base
 from main import generate_plane_uniform_comparison as uniform
+from laser_handeye.pose_design import audit_latin_hypercube, latin_hypercube_strata
 from laser_handeye.simulation import sample_random_handeye
 
 # Reuse the exact D_s information and exchange-search implementation from
@@ -208,34 +209,6 @@ def circular_resultant_length_deg(values_deg: Iterable[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def lhs_strata(
-    rng: np.random.Generator,
-    n: int,
-    dimensions: int,
-) -> np.ndarray:
-    """Return integer stratum IDs with one use of every 0..n-1 per dimension."""
-    strata = np.empty((n, dimensions), dtype=np.int64)
-    for dim in range(dimensions):
-        strata[:, dim] = rng.permutation(n)
-    return strata
-
-
-def audit_exact_lhs(normalized: np.ndarray) -> None:
-    normalized = np.asarray(normalized, dtype=float)
-    n, dimensions = normalized.shape
-    if np.any(normalized < 0.0) or np.any(normalized >= 1.0):
-        raise RuntimeError("normalized LHS points escaped [0,1)")
-
-    ids = np.floor(normalized * n).astype(int)
-    expected = np.arange(n, dtype=int)
-    for dim in range(dimensions):
-        if not np.array_equal(np.sort(ids[:, dim]), expected):
-            raise RuntimeError(
-                f"exact LHS audit failed in dimension {dim}: "
-                "a stratum is missing or duplicated"
-            )
-
-
 def generate_exact_lhs_candidate_bank(
     *,
     rng: np.random.Generator,
@@ -268,7 +241,7 @@ def generate_exact_lhs_candidate_bank(
     failed_designs = 0
 
     for design_attempt in range(1, max_design_attempts + 1):
-        strata = lhs_strata(rng, count, len(PARAMETER_NAMES))
+        strata = latin_hypercube_strata(rng, count, len(PARAMETER_NAMES))
 
         poses = []
         scans = []
@@ -340,7 +313,7 @@ def generate_exact_lhs_candidate_bank(
             continue
 
         normalized = np.asarray(normalized_rows, dtype=float)
-        audit_exact_lhs(normalized)
+        audit_latin_hypercube(normalized)
 
         return poses, scans, normalized, {
             "exact_lhs": True,

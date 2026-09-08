@@ -1,0 +1,220 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="rb5_850e">
+  <link name="link0">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link0.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link0.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="link1">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link1.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link1.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000057 -0.005795 -0.034516" />
+      <mass value="4.147" />
+      <inertia ixx="0.008787118" ixy="-8.564e-06" ixz="-8.047e-06" iyy="0.008888636" iyz="0.000893025" izz="0.007845924" />
+    </inertial>
+  </link>
+  <link name="link2">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link2.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link2.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000037 -0.121603 0.212933" />
+      <mass value="9.633" />
+      <inertia ixx="0.392214367" ixy="-1.4684e-05" ixz="-5.721e-05" iyy="0.388914548" iyz="0.000255706" izz="0.021949397" />
+    </inertial>
+  </link>
+  <link name="link3">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link3.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link3.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000021 -0.015845 0.202568" />
+      <mass value="3.915" />
+      <inertia ixx="0.112039835" ixy="-1.006e-06" ixz="1.4848e-05" iyy="0.111790094" iyz="0.002092668" izz="0.007569107" />
+    </inertial>
+  </link>
+  <link name="link4">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link4.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link4.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.000057 -0.106332 0.025881" />
+      <mass value="1.452" />
+      <inertia ixx="0.001629031" ixy="3.99e-07" ixz="2.37e-07" iyy="0.001558024" iyz="0.000127282" izz="0.001224887" />
+    </inertial>
+  </link>
+  <link name="link5">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link5.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link5.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000028 -0.025911 -0.004363" />
+      <mass value="1.454" />
+      <inertia ixx="0.001631445" ixy="1.764e-06" ixz="2.2e-07" iyy="0.001226962" iyz="0.000127473" izz="0.001560416" />
+    </inertial>
+  </link>
+  <link name="link6">
+    <visual>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/visual/link6.dae" />
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://rbpodo_description/meshes/rb5_850e/collision/link6.stl" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="-0.000002 -0.079964 -0.000494" />
+      <mass value="0.243" />
+      <inertia ixx="0.000147823" ixy="2.46e-07" ixz="6.43e-07" iyy="0.000243703" iyz="-5.54e-07" izz="0.000142339" />
+    </inertial>
+  </link>
+  <link name="tcp" />
+  <joint name="base" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.1692" />
+    <parent link="link0" />
+    <child link="link1" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="shoulder" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="link1" />
+    <child link="link2" />
+    <axis xyz="0 1 0" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="elbow" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.425" />
+    <parent link="link2" />
+    <child link="link3" />
+    <axis xyz="0 1 0" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="wrist1" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0.392" />
+    <parent link="link3" />
+    <child link="link4" />
+    <axis xyz="0 1 0" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="wrist2" type="revolute">
+    <origin rpy="0 0 0" xyz="0 -0.1107 0.1107" />
+    <parent link="link4" />
+    <child link="link5" />
+    <axis xyz="0 0 1" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="wrist3" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="link5" />
+    <child link="link6" />
+    <axis xyz="0 1 0" />
+    <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14" />
+  </joint>
+  <joint name="tcp_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 -0.0967 0" />
+    <parent link="link6" />
+    <child link="tcp" />
+  </joint>
+  <link name="sensor_measurement_frame">
+    <collision name="lj_v7080_head_collision">
+      <origin xyz="0.003 0.036 0.1155" rpy="0 0 0" />
+      <geometry>
+        <box size="0.062 0.116 0.091" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_connector_large">
+      <origin xyz="0.008 0.0925 0.131" rpy="-1.57079632679 -1.57079632679 0" />
+      <geometry>
+        <cylinder radius="0.02" length="0.017" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_connector_small">
+      <origin xyz="0.008 0.112 0.131" rpy="-1.57079632679 -1.57079632679 0" />
+      <geometry>
+        <cylinder radius="0.0185" length="0.022" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_cable_straight_1">
+      <origin xyz="0.008 0.14 0.131" rpy="-1.57079632679 -1.57079632679 0" />
+      <geometry>
+        <cylinder radius="0.0142" length="0.034" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_cable_bend_1">
+      <origin xyz="0.008 0.1605 0.1295" rpy="1.97568811308 0 3.14159265359" />
+      <geometry>
+        <cylinder radius="0.0142" length="0.00761577310586" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_cable_bend_2">
+      <origin xyz="0.008 0.1665 0.125" rpy="2.44685437739 0 3.14159265359" />
+      <geometry>
+        <cylinder radius="0.0142" length="0.00781024967591" />
+      </geometry>
+    </collision>
+    <collision name="lj_v7080_cable_straight_2">
+      <origin xyz="0.008 0.169 0.114" rpy="3.14159265359 0 3.14159265359" />
+      <geometry>
+        <cylinder radius="0.0142" length="0.016" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="sensor_physical_origin" />
+  <joint name="tcp_to_sensor_measurement" type="fixed">
+    <origin xyz="0 -0.151 0" rpy="1.57079632679 0 3.14159265359" />
+    <parent link="tcp" />
+    <child link="sensor_measurement_frame" />
+  </joint>
+  <joint name="sensor_measurement_to_physical" type="fixed">
+    <origin xyz="0 0 0.08" rpy="0 0 0" />
+    <parent link="sensor_measurement_frame" />
+    <child link="sensor_physical_origin" />
+  </joint>
+</robot>

@@ -1,0 +1,3 @@
+# STEP/IGES import is optional. STL/OBJ input does not need this dependency.
+cadquery>=2.4,<3
+

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur5e_mujoco_preview">
+  <!-- Robot-only UR5e xacro. Sensor is attached later by handeye_mujoco.builder. -->
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+  <!-- MuJoCo reserves the body name "world" for its implicit world body. -->
+  <link name="ur_world"/>
+  <xacro:ur_robot
+      name="ur5e"
+      tf_prefix=""
+      parent="ur_world"
+      joint_limits_parameters_file="$(find ur_description)/config/ur5e/joint_limits.yaml"
+      kinematics_parameters_file="$(find ur_description)/config/ur5e/default_kinematics.yaml"
+      physical_parameters_file="$(find ur_description)/config/ur5e/physical_parameters.yaml"
+      visual_parameters_file="$(find ur_description)/config/ur5e/visual_parameters.yaml"
+      ur_type="ur5e"
+      generate_ros2_control_tag="false">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:ur_robot>
+</robot>

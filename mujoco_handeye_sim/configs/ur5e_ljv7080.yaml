@@ -1,0 +1,95 @@
+# UR5e counterpart of rb5_ljv7080.yaml.
+# It uses the same Keyence measurement frame, collision proxy and physical origin.
+robot:
+  # Flattened from the installed official ur_description xacro by
+  # scripts/prepare_ur5e.py.
+  urdf: ../build/ur5e_ljv7080/ur5e_robot.urdf
+
+  # Application convention: tcp == UR tool0.
+  tcp_link: tool0
+  package_roots:
+    ur_description: ros2://ur_description
+  use_collision_meshes: true
+  # Keep official high-resolution DAE meshes for display. Collision STL files
+  # remain active for collision checking but are hidden in normal previews.
+  render_visual_meshes: true
+  visual_rgba: "0.72 0.76 0.82 1"
+
+  # Joint order [rad]: shoulder_pan, shoulder_lift, elbow,
+  #                    wrist_1, wrist_2, wrist_3
+  home_qpos: [0.0, -1.570796327, 1.570796327, -1.570796327, -1.570796327, 0.0]
+  position_kp: 100.0
+  position_kv: 20.0
+
+sensor:
+  name: lj_v7080
+  cad: ../assets/lj_v7080/LJ-V7080_3.stl
+  cad_units: mm
+  tessellation:
+    linear_deflection: 0.25
+    angular_deflection: 0.15
+
+  # Same CAD -> Keyence measurement-frame registration as RB5.
+  frame:
+    origin_in_cad: [-52.6428785, -97.6682626, 12.7832449]
+    x_axis_in_cad: [0.0, 0.0, 1.0]
+    y_axis_in_cad: [1.0, 0.0, 0.0]
+    z_axis_in_cad: [0.0, 1.0, 0.0]
+
+  # Same padded physical sensor/connector/cable collision proxy as RB5.
+  collision:
+    type: primitives
+    # Conservative static allowance for sensor mounting/model uncertainty.
+    # Dynamic robot stopping distance must be handled by the controller's
+    # safety configuration, not by this geometry padding.
+    padding_m: 0.010
+    boxes:
+      - name: lj_v7080_head_collision
+        center_mm: [3.0, 36.0, 115.5]
+        half_size_mm: [21.0, 48.0, 35.5]
+    capsules:
+      - name: lj_v7080_connector_large
+        from_mm: [8.0, 84.0, 131.0]
+        to_mm: [8.0, 101.0, 131.0]
+        radius_mm: 10.0
+      - name: lj_v7080_connector_small
+        from_mm: [8.0, 101.0, 131.0]
+        to_mm: [8.0, 123.0, 131.0]
+        radius_mm: 8.5
+      - name: lj_v7080_cable_straight_1
+        from_mm: [8.0, 123.0, 131.0]
+        to_mm: [8.0, 157.0, 131.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_1
+        from_mm: [8.0, 157.0, 131.0]
+        to_mm: [8.0, 164.0, 128.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_2
+        from_mm: [8.0, 164.0, 128.0]
+        to_mm: [8.0, 169.0, 122.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_straight_2
+        from_mm: [8.0, 169.0, 122.0]
+        to_mm: [8.0, 169.0, 106.0]
+        radius_mm: 4.2
+
+handeye:
+  path: ur5e_tool0_sensor.json
+  # ^tool0 T_sensor
+  key: T_tcp_sensor
+  # ^sensor T_physical
+  physical_key: T_sensor_physical
+  translation_units: mm
+
+scene:
+  timestep: 0.002
+  safety_margin_m: 0.005
+  # Fixed UR frames are collapsed by MuJoCo's URDF importer, so render them as
+  # diagnostic triads on the nearest movable ancestor.
+  preview_frames: [flange, tool0]
+  frame_axis_length_m: 0.075
+  floor:
+    enabled: true
+
+output:
+  directory: ../build/ur5e_ljv7080

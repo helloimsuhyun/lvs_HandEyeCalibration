@@ -1,0 +1,148 @@
+paths:
+  handeye: ../initial_T_tcp_sensor.json
+  mujoco_model: ../../mujoco_handeye_sim/build/rb5_ljv7080/model.xml
+  session_root: ../../runs/real/rb5/handeye_workflow
+  initial_dataset: ../../runs/real/rb5/handeye_workflow/initial_plane/dataset
+  estimate_dir: ../../runs/real/rb5/handeye_workflow/initial_plane/estimate
+  scan_dataset: ../../runs/real/rb5/handeye_workflow/calibration_scans
+  planning_model: ../../runs/real/rb5/handeye_workflow/planning/model.xml
+  scan_plan: ../../runs/real/rb5/handeye_workflow/planning/scan_plan.json
+  calibrated_transform: ../../runs/real/rb5/handeye_workflow/T_tcp_sensor_calibrated.csv
+
+equipment:
+  base_frame: link0
+  joint_names: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+  robot_adapter: real_laser_handeye.robot_adapter_rb5_ros:RobotAdapter
+  laser_adapter: real_laser_handeye.laser_adapter:LaserAdapter
+  robot_host: ""
+  robot_port: null
+  laser_ip: ""
+  laser_control_port: 24691
+  laser_high_speed_port: 24692
+  batch_profiles: 5
+  aggregate: median
+  connection_profile_timeout_s: 5.0
+
+  driver:
+    auto_launch: true
+    ros_setup: /opt/ros/humble/setup.bash
+    robot_workspace_setup: ~/rbpodo_ros2_ws/install/setup.bash
+    project_workspace_setup: ../../moveit2_ws/install/setup.bash
+    launch_package: rb5_laser_moveit_config
+    launch_file: real_driver.launch.py
+    launch_arguments:
+      model_id: rb5_850e
+    startup_timeout_s: 35.0
+    process_alive_check_s: 1.0
+
+sensor_frames:
+  body_name: lj_v7080
+  physical_site_name: sensor_physical_origin
+  measurement_site_name: sensor_origin
+
+planning:
+  # Single supported route:
+  # START/previous APPROACH -> RRTConnect -> APPROACH
+  # -> Cartesian -> SCAN -> Cartesian -> APPROACH
+  # circular_greedy preserves the existing behavior. global_alpha_dp jointly
+  # selects the full scan order and alpha/alpha+180 branch.
+  route_mode: circular_greedy
+  global_alpha_max_joint_delta_deg: 90.0
+  greedy_joint_weights: [1.5, 1.0, 1.0, 1.2, 1.5, 2.5]
+
+  collision_distance_fallback_step_mm: 5.0
+  collision_tilt_fallback_step_deg: 5.0
+
+  radius_mm: null
+  hull_edge_margin_mm: 10.0
+  radius_fill_ratio: 0.90
+
+  plane_keepout_clearance_mm: 10.0
+  plane_collision_scale: 2.0
+
+  sensor_forward_axis: "-z"
+  tilt_min_deg: 5.0
+  tilt_max_deg: 35.0
+  distance_near_mm: 65.0
+  distance_far_mm: 90.0
+
+  moveit:
+    ros_setup: /opt/ros/humble/setup.bash
+    workspace_setup: ../../moveit2_ws/install/setup.bash
+
+    auto_launch: true
+    launch_package: rb5_laser_moveit_config
+    launch_file: move_group.launch.py
+
+    planning_frame: link0
+    group_name: rb5_arm
+    tip_link: sensor_physical_origin
+
+    ik_timeout_s: 0.50
+
+    pipeline_id: ompl
+    planner_id: RRTConnectkConfigDefault
+    planning_attempts: 1
+    planning_time_s: 5.0
+    joint_goal_tolerance_rad: 0.0005
+
+    # RRTConnect / joint-space nominal speed.
+    velocity_scaling: 0.15
+    acceleration_scaling: 0.15
+
+    # Previous Pilz 0.10 settings migrated to the native Cartesian service.
+    cartesian_velocity_scaling: 0.10
+    cartesian_acceleration_scaling: 0.10
+
+    plane_thickness_m: 0.01
+
+    floor_size_xyz_m: [4.0, 4.0, 0.10]
+    floor_surface_z_m: 0.0
+
+    workspace_min_m: [-1.5, -1.5, -0.2]
+    workspace_max_m: [1.5, 1.5, 1.5]
+
+    startup_timeout_s: 25.0
+
+motion:
+  approach_distance_mm: 80.0
+
+  joint_tolerance_deg: 0.1
+  path_tolerance_deg: 1.0
+
+  linear_position_tolerance_mm: 0.5
+  linear_rotation_tolerance_deg: 0.2
+
+  start_tolerance_deg: 0.25
+  timeout_s: 60.0
+  settle_time_s: 1.0
+
+visualization:
+  sensor_frame_axis_length_mm: 70.0
+
+capture:
+  timeout_s: 3.0
+  min_points: 50
+  max_abs_sensor_y_mm: 0.1
+  min_sensor_x_mm: null
+  max_sensor_x_mm: null
+  min_sensor_z_mm: null
+  max_sensor_z_mm: null
+  max_stationarity_translation_mm: 0.1
+  max_stationarity_rotation_deg: 0.1
+
+calibration:
+  min_scans: 6
+  max_iter: 3000
+  tol: 1.0e-09
+  max_condition: 1.0e6
+  max_final_plane_rms_mm: 0.5
+  disable_profile_ransac: false
+  ransac_reject_policy: skip
+  ransac_threshold_mm: 0.15
+  ransac_max_iterations: 1000
+  ransac_min_inliers: 20
+  ransac_min_inlier_ratio: 0.65
+  max_ransac_skip_ratio: 0.3
+  ransac_seed: 1701
+  ransac_refine_iterations: 3

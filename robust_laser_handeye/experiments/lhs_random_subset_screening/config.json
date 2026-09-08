@@ -1,0 +1,58 @@
+{
+  "seed": 1701,
+  "output_dir": "results/phase1_lhs_screening_normal_azimuth_v2",
+  "lhs": {
+    "candidate_count": 1000,
+    "ranges": {
+      "u_mm": [-40.0, 40.0],
+      "v_mm": [-40.0, 40.0],
+      "d_mm": [60.0, 150.0],
+      "tilt_deg": [10.0, 55.0],
+      "azimuth_deg": [-180.0, 180.0],
+      "normal_azimuth_sensor_deg": [-180.0, 180.0]
+    }
+  },
+  "screening": {
+    "scan_counts": [5, 7, 9, 11, 13, 15],
+    "subsets_per_n": 1000,
+    "top_fraction": 0.15
+  },
+  "plane": {
+    "center_base_mm": [0.0, 0.0, 500.0],
+    "u_base": [1.0, 0.0, 0.0],
+    "v_base": [0.0, 1.0, 0.0],
+    "normal_base": [0.0, 0.0, 1.0]
+  },
+  "ground_truth_handeye": {
+    "rotation_euler_xyz_deg": [10.0, -8.0, 20.0],
+    "translation_mm": [35.0, -25.0, 80.0]
+  },
+  "initial_error": {
+    "translation_mm": [80.0, -40.0, 44.72135955],
+    "rotation_axis": [0.26726124, 0.53452248, 0.80178373],
+    "rotation_deg": 15.0
+  },
+  "noise": {
+    "axis": "xz",
+    "std_mm": 0.25,
+    "repeats": 5
+  },
+  "solver": {
+    "iterative": {
+      "plane_offset_mode": "joint",
+      "max_iter": 100,
+      "tol": 1e-6
+    },
+    "nonlinear": {
+      "plane_mode": "joint",
+      "loss": "linear",
+      "max_nfev": 300,
+      "tol": 1e-10
+    }
+  },
+  "classification": {
+    "translation_mm": 1.0,
+    "rotation_deg": 0.1,
+    "minimum_pass_rate_for_promotion": 0.8
+  }
+}

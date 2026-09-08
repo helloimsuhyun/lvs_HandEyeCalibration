@@ -45,7 +45,7 @@ PYTHONPATH=. python3 main/generate_single_uniform_vs_fisher.py \
   --candidate-target-v-range-mm -70 70 \
   --candidate-view-tilt-range-deg 5 80 \
   --candidate-view-azimuth-range-deg -180 180 \
-  --candidate-sensor-roll-range-deg -180 180 \
+  --candidate-normal-azimuth-sensor-range-deg -180 180 \
   --fisher-objective e_optimal \
   --measurement-noise-std-mm 0.20
 
@@ -75,11 +75,17 @@ from laser_handeye.calibration_dataset import (
     save_calibration_dataset,
 )
 from laser_handeye.data import LaserScan
+from laser_handeye.pose_design import (
+    PlaneFrame as DesignPlaneFrame,
+    PlaneRelativePose as DesignPlaneRelativePose,
+    latin_hypercube,
+    sensor_pose_from_plane_relative,
+)
 from laser_handeye.simulation import sample_random_handeye
 
 
 SCHEMA = "laser_handeye.single_plane_uniform_vs_active_fisher"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -90,7 +96,7 @@ class PlaneRelativeCandidate:
     center_depth_mm: float
     view_tilt_deg: float
     view_azimuth_deg: float
-    sensor_roll_deg: float
+    normal_azimuth_sensor_deg: float
     noise_seed: int
     simulation_seed: int
 
@@ -102,7 +108,7 @@ class CandidateConfig:
     depth_range_mm: tuple[float, float]
     tilt_range_deg: tuple[float, float]
     azimuth_range_deg: tuple[float, float]
-    roll_range_deg: tuple[float, float]
+    normal_azimuth_sensor_range_deg: tuple[float, float]
     max_batches: int
     batch_multiplier: int
 
@@ -186,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=(-180.0, 180.0),
     )
     parser.add_argument(
-        "--candidate-sensor-roll-range-deg", type=float, nargs=2,
+        "--candidate-normal-azimuth-sensor-range-deg", type=float, nargs=2,
         default=(-180.0, 180.0),
     )
     parser.add_argument(
@@ -300,8 +306,8 @@ def _validate_args(
         raise SystemExit(
             "candidate center depth range must lie inside the profile depth ROI"
         )
-    if tilt[0] < 0.0 or tilt[1] >= 89.0:
-        raise SystemExit("candidate tilt range must lie within [0, 89)")
+    if tilt[0] <= 0.0 or tilt[1] >= 89.0:
+        raise SystemExit("candidate tilt range must lie within (0, 89)")
 
     # Conservative guarantee for every azimuth/roll combination:
     # |Delta z|max <= profile_half_width * tan(max_tilt).
@@ -362,7 +368,8 @@ def _validate_args(
             args.candidate_view_azimuth_range_deg, "candidate azimuth range"
         ),
         sensor_roll_range_deg=_finite_pair(
-            args.candidate_sensor_roll_range_deg, "candidate roll range"
+            args.candidate_normal_azimuth_sensor_range_deg,
+            "candidate sensor-frame plane-normal azimuth range",
         ),
         plane_angle_range_deg=_finite_pair(
             args.plane_angle_range_deg, "plane angle range"
@@ -391,7 +398,7 @@ def _validate_args(
         depth_range_mm=center_depth,
         tilt_range_deg=tilt,
         azimuth_range_deg=fair.view_azimuth_range_deg,
-        roll_range_deg=fair.sensor_roll_range_deg,
+        normal_azimuth_sensor_range_deg=fair.sensor_roll_range_deg,
         max_batches=int(args.candidate_max_batches),
         batch_multiplier=int(args.candidate_batch_multiplier),
     )
@@ -420,16 +427,6 @@ def _validate_args(
     return fair, candidates, selection
 
 
-def _latin_hypercube(
-    rng: np.random.Generator, n: int, dimensions: int
-) -> np.ndarray:
-    values = np.empty((n, dimensions), dtype=float)
-    for dimension in range(dimensions):
-        permutation = rng.permutation(n)
-        values[:, dimension] = (permutation + rng.random(n)) / n
-    return values
-
-
 def _scale(value: float, bounds: tuple[float, float]) -> float:
     lower, upper = bounds
     return float(lower + value * (upper - lower))
@@ -450,7 +447,9 @@ def _candidate_from_row(
         center_depth_mm=_scale(row[2], config.depth_range_mm),
         view_tilt_deg=_scale(row[3], config.tilt_range_deg),
         view_azimuth_deg=_scale(row[4], config.azimuth_range_deg),
-        sensor_roll_deg=_scale(row[5], config.roll_range_deg),
+        normal_azimuth_sensor_deg=_scale(
+            row[5], config.normal_azimuth_sensor_range_deg
+        ),
         noise_seed=base._derived_seed(
             master_seed, trial_index, 0x53494E47, candidate_id, 0x4E4F4953
         ),
@@ -465,42 +464,19 @@ def _make_sensor_pose_relative_to_plane(
     common_center: np.ndarray,
     pose: PlaneRelativeCandidate,
 ) -> np.ndarray:
-    roll = np.deg2rad(pose.sensor_roll_deg)
-
-    z_axis = pose_geometry._sensor_z_axis_from_view_angles(
-        frame,
-        pose.view_tilt_deg,
-        pose.view_azimuth_deg,
-        name="plane-relative canonical sensor +Z view direction",
+    return sensor_pose_from_plane_relative(
+        DesignPlaneFrame(frame.u, frame.v, frame.n, frame.l),
+        common_center,
+        DesignPlaneRelativePose(
+            sample_id=pose.candidate_id,
+            target_u_mm=pose.target_u_mm,
+            target_v_mm=pose.target_v_mm,
+            distance_mm=pose.center_depth_mm,
+            tilt_deg=pose.view_tilt_deg,
+            azimuth_deg=pose.view_azimuth_deg,
+            normal_azimuth_sensor_deg=pose.normal_azimuth_sensor_deg,
+        ),
     )
-
-    x_reference = frame.u - float(frame.u @ z_axis) * z_axis
-    if np.linalg.norm(x_reference) <= 1e-10:
-        x_reference = frame.v - float(frame.v @ z_axis) * z_axis
-    x_zero = base._normalize(x_reference, "plane-relative zero-roll x")
-    y_zero = base._normalize(
-        np.cross(z_axis, x_zero), "plane-relative zero-roll y"
-    )
-    x_axis = base._normalize(
-        np.cos(roll) * x_zero + np.sin(roll) * y_zero,
-        "plane-relative rolled x",
-    )
-    y_axis = base._normalize(
-        -np.sin(roll) * x_zero + np.cos(roll) * y_zero,
-        "plane-relative rolled y",
-    )
-
-    target = (
-        np.asarray(common_center, dtype=float).reshape(3)
-        + pose.target_u_mm * frame.u
-        + pose.target_v_mm * frame.v
-    )
-    sensor_origin = target - pose.center_depth_mm * z_axis
-
-    transform = np.eye(4, dtype=float)
-    transform[:3, :3] = np.column_stack([x_axis, y_axis, z_axis])
-    transform[:3, 3] = sensor_origin
-    return transform
 
 
 def _as_base_sample(pose: PlaneRelativeCandidate) -> base.SharedGlobalPoseSample:
@@ -510,7 +486,8 @@ def _as_base_sample(pose: PlaneRelativeCandidate) -> base.SharedGlobalPoseSample
         center_depth_mm=pose.center_depth_mm,
         global_view_tilt_deg=pose.view_tilt_deg,
         global_view_azimuth_deg=pose.view_azimuth_deg,
-        sensor_roll_deg=pose.sensor_roll_deg,
+        # Adapter field only; T_base_s uses the new canonical convention.
+        sensor_roll_deg=pose.normal_azimuth_sensor_deg,
         noise_seed=pose.noise_seed,
         simulation_seed=pose.simulation_seed,
     )
@@ -536,12 +513,15 @@ def _simulate_candidate_scan(
         x_values=x_values,
     )
     metadata = dict(scan.meta)
+    metadata.pop("sensor_roll_deg", None)
     metadata.update(
         {
             "comparison_schema": SCHEMA,
             "comparison_schema_version": SCHEMA_VERSION,
             "pose_sampling_frame": "plane_0_relative",
-            "candidate_parameterization": "u_v_depth_tilt_azimuth_roll",
+            "candidate_parameterization": (
+                "u_v_depth_tilt_view_azimuth_normal_azimuth_sensor"
+            ),
             "target_u_mm": pose.target_u_mm,
             "target_v_mm": pose.target_v_mm,
             "view_pose_convention": dict(pose_geometry.VIEW_POSE_CONVENTION),
@@ -551,11 +531,11 @@ def _simulate_candidate_scan(
                 "center_depth_mm": pose.center_depth_mm,
                 "view_tilt_deg": pose.view_tilt_deg,
                 "view_azimuth_deg": pose.view_azimuth_deg,
-                "sensor_roll_deg": pose.sensor_roll_deg,
+                "normal_azimuth_sensor_deg": pose.normal_azimuth_sensor_deg,
                 "view_u_mm": pose.target_u_mm,
                 "view_v_mm": pose.target_v_mm,
                 "view_distance_mm": pose.center_depth_mm,
-                "view_roll_deg": pose.sensor_roll_deg,
+                "view_normal_azimuth_sensor_deg": pose.normal_azimuth_sensor_deg,
             },
         }
     )
@@ -598,7 +578,7 @@ def _generate_candidate_bank(
             break
         remaining = count - len(poses)
         batch_size = max(remaining, candidate_config.batch_multiplier * remaining)
-        rows = _latin_hypercube(rng, batch_size, 6)
+        rows = latin_hypercube(rng, batch_size, 6)
         for row in rows:
             if len(poses) >= count:
                 break

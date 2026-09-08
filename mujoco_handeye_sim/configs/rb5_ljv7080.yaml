@@ -1,0 +1,90 @@
+# Only the three marked INPUT fields are equipment-specific.
+robot:
+  # INPUT 1: manipulator URDF
+  urdf: ../assets/rb5_850e/rbpodo_description/robots/rb5_850e.urdf
+  tcp_link: tcp
+  package_roots:
+    rbpodo_description: ../assets/rb5_850e/rbpodo_description
+  use_collision_meshes: true
+  # RB5 joint order: base, shoulder, elbow, wrist1, wrist2, wrist3 [rad]
+  home_qpos: [0.0, -1.570796327, 1.570796327, 0.0, 1.570796327, 0.0]
+  position_kp: 100.0
+  position_kv: 20.0
+
+sensor:
+  name: lj_v7080
+  # INPUT 2: sensor STEP/STL/OBJ CAD
+  cad: ../../real_laser_handeye/LJ-V7080_3.stp
+  cad_units: mm
+  # Shipped cache makes the example buildable without a CAD kernel.
+  # Remove/change this line when replacing the sensor CAD.
+  preconverted_mesh: ../assets/lj_v7080/LJ-V7080_3.stl
+  preconverted_source_sha256: 638426ba6afc89099bfaadd7bb36bf373094d710778eed0b1d93d67a03784a8b
+  tessellation:
+    linear_deflection: 0.25
+    angular_deflection: 0.15
+  # Keyence drawing/STEP frame registration.
+  # This is the centre of the trapezoidal measurement range (X=+-16, Z=+-23 mm).
+  # Axes make profile points [x, 0, z] agree with real_laser_handeye:
+  #   sensor +X = CAD +Z, sensor +Y = CAD +X, sensor +Z = CAD +Y.
+  frame:
+    origin_in_cad: [-52.6428785, -97.6682626, 12.7832449]
+    x_axis_in_cad: [0.0, 0.0, 1.0]
+    y_axis_in_cad: [1.0, 0.0, 0.0]
+    z_axis_in_cad: [0.0, 1.0, 0.0]
+  collision:
+    # The STEP also contains the trapezoidal measurement-range drawing and a
+    # nominal cable, so its whole bounding box must not be used for collision.
+    # This is the physical 42 x 96 x 71 mm sensor head in measurement coordinates.
+    type: primitives
+    # Conservative static allowance for sensor mounting/model uncertainty.
+    # Dynamic robot stopping distance must be handled by the controller's
+    # safety configuration, not by this geometry padding.
+    padding_m: 0.010
+    boxes:
+      - name: lj_v7080_head_collision
+        center_mm: [3.0, 36.0, 115.5]
+        half_size_mm: [21.0, 48.0, 35.5]
+    # Connector and fixed CAD cable centreline, extracted in measurement frame.
+    # Capsule radii are the CAD radii; padding_m is added by the builder.
+    capsules:
+      - name: lj_v7080_connector_large
+        from_mm: [8.0, 84.0, 131.0]
+        to_mm: [8.0, 101.0, 131.0]
+        radius_mm: 10.0
+      - name: lj_v7080_connector_small
+        from_mm: [8.0, 101.0, 131.0]
+        to_mm: [8.0, 123.0, 131.0]
+        radius_mm: 8.5
+      - name: lj_v7080_cable_straight_1
+        from_mm: [8.0, 123.0, 131.0]
+        to_mm: [8.0, 157.0, 131.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_1
+        from_mm: [8.0, 157.0, 131.0]
+        to_mm: [8.0, 164.0, 128.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_2
+        from_mm: [8.0, 164.0, 128.0]
+        to_mm: [8.0, 169.0, 122.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_straight_2
+        from_mm: [8.0, 169.0, 122.0]
+        to_mm: [8.0, 169.0, 106.0]
+        radius_mm: 4.2
+
+handeye:
+  # INPUT 3: T_tcp_sensor. Existing project values are millimetres.
+  path: ../../real_laser_handeye/initial_T_tcp_sensor.json
+  key: T_tcp_sensor
+  translation_units: mm
+
+scene:
+  timestep: 0.002
+  # Contacts begin this far before robot mesh penetration and are considered unsafe.
+  safety_margin_m: 0.005
+  floor:
+    enabled: true
+
+output:
+  directory: ../build/rb5_ljv7080

@@ -1,6 +1,6 @@
 # Synthetic Laser Hand–Eye Calibration Dataset Generator
 
-`generate_synthetic_calibration_dataset.py`는 레이저 프로파일 센서 hand–eye calibration 실험에 사용할 **noise-free synthetic dataset collection**을 생성합니다.
+`generate_calibration_dataset.py`는 레이저 프로파일 센서 hand–eye calibration 실험에 사용할 **noise-free synthetic dataset collection**을 생성합니다.
 
 ## 반복 선형해 기반 비선형 refinement ablation
 
@@ -247,7 +247,6 @@ initialization, solver 설정과 shared-global schema를 검증합니다. 현재
 
 | Mode | 설명 |
 |---|---|
-| `translation-composite` | Tan 2025 closed-form 방식용 pure-translation + composite motion dataset |
 | `single-plane-circular` | 원형 9-line single-plane acquisition dataset |
 | `three-plane` | 서로 직교하는 3개 평면을 사용하는 random 6-DoF dataset |
 
@@ -260,7 +259,7 @@ initialization, solver 설정과 shared-global schema를 검증합니다. 현재
 ```text
 robust_laser_handeye/
 ├── examples/
-│   └── generate_synthetic_calibration_dataset.py
+│   └── generate_calibration_dataset.py
 └── laser_handeye/
 ```
 
@@ -274,100 +273,31 @@ conda activate laser_handeye
 스크립트 도움말:
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py --help
+PYTHONPATH=. python examples/generate_calibration_dataset.py --help
 ```
 
 각 mode별 세부 도움말:
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
-  translation-composite --help
-```
-
-```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular --help
 ```
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   three-plane --help
 ```
 
 ---
 
-# 3. Translation–Composite Dataset
-
-Tan 2025 closed-form estimator에 필요한 두 개의 motion group을 생성합니다.
-
-- pure-translation poses
-- composite 6-DoF poses
-
-## 기본 예제
-
-```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
-  translation-composite \
-  --trials 100 \
-  --seed 7 \
-  --output-dir results/datasets/translation_composite_100
-```
-
-기본 설정:
-
-```text
-translation poses: 36
-composite poses: 30
-profile points: 640
-scan angle: 21.4 deg
-sensor Z range: 190–290 mm
-nominal sensor distance: 240 mm
-plane mode: fixed
-hand–eye preset: tan2025
-```
-
-## Random hand–eye와 random plane 사용
-
-```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
-  translation-composite \
-  --trials 100 \
-  --seed 7 \
-  --output-dir results/datasets/translation_composite_random \
-  --handeye-preset random \
-  --plane-mode random \
-  --translation-poses 36 \
-  --composite-poses 30 \
-  --profile-points 640 \
-  --plane-angle-range-deg -30 30 \
-  --plane-min-axis-angle-deg 1 \
-  --plane-distance-range-mm 350 600 \
-  --plane-tangent-range-mm -100 100
-```
-
-## 주요 옵션
-
-| 옵션 | 의미 | 기본값 |
-|---|---|---:|
-| `--translation-poses` | pure-translation pose 수 | 36 |
-| `--composite-poses` | composite pose 수 | 30 |
-| `--profile-points` | profile당 point 수 | 640 |
-| `--scan-angle-deg` | 센서 scan angle | 21.4 |
-| `--sensor-z-min-mm` | sensor Z 최소값 | 190 |
-| `--sensor-z-max-mm` | sensor Z 최대값 | 290 |
-| `--plane-mode` | `fixed` 또는 `random` | fixed |
-| `--handeye-preset` | `random` 또는 `tan2025` | tan2025 |
-
----
-
-# 4. Single-Plane Circular Dataset
+# 3. Single-Plane Circular Dataset
 
 하나의 평면 위에 40도 간격의 9개 radial target line을 구성하고, 각 line에 대해 `(d, theta, beta)` 조합을 생성합니다.
 
 ## 기본 예제
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
@@ -406,7 +336,7 @@ beta = 60, 90, 120 deg
 `--reference-line-ids` 뒤에 값을 쓰지 않으면 reference ring이 비활성화됩니다.
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
@@ -427,7 +357,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 모든 target line에서 theta 30도와 60도를 모두 사용합니다.
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
@@ -450,7 +380,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 ## 기본 81 scans + 선택 line에 theta 60도 추가
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
@@ -483,14 +413,14 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 
 ---
 
-# 5. Three-Plane Dataset
+# 4. Three-Plane Dataset
 
 서로 직교하는 3개 평면에 대해 random 6-DoF sensor pose와 laser profile을 생성합니다.
 
 ## 기본 예제
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   three-plane \
   --trials 100 \
   --seed 7 \
@@ -508,7 +438,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 평면당 27 pose를 사용합니다.
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   three-plane \
   --trials 100 \
   --seed 7 \
@@ -538,7 +468,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 
 ---
 
-# 6. 공통 옵션
+# 5. 공통 옵션
 
 모든 mode에서 다음 옵션을 지원합니다.
 
@@ -547,23 +477,20 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 | `--trials N` | 독립적으로 생성할 dataset trial 수 |
 | `--seed N` | 전체 collection의 master random seed |
 | `--output-dir PATH` | dataset collection 저장 위치 |
-| `--handeye-preset random` | trial마다 random GT hand–eye 생성 |
-| `--handeye-preset tan2025` | Tan 2025 preset GT hand–eye 사용 |
 
 예시:
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   three-plane \
   --trials 100 \
   --seed 42 \
-  --handeye-preset random \
   --output-dir results/datasets/three_plane_seed42
 ```
 
 ---
 
-# 7. 출력 구조
+# 6. 출력 구조
 
 생성 결과는 collection 단위로 저장됩니다.
 
@@ -604,7 +531,7 @@ results/datasets/single_plane_circular_100/
 
 ---
 
-# 8. 재현성
+# 7. 재현성
 
 같은 명령에서 다음 두 값이 같으면 동일한 ideal dataset이 생성됩니다.
 
@@ -625,7 +552,7 @@ trial index
 
 ---
 
-# 9. Output Directory 주의사항
+# 8. Output Directory 주의사항
 
 스크립트는 기존 결과를 덮어쓰지 않습니다.
 
@@ -652,32 +579,16 @@ rm -rf results/datasets/single_plane_circular_100
 
 ---
 
-# 10. 권장 생성 명령
-
-## Tan closed-form / iterative 비교용
-
-```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
-  translation-composite \
-  --trials 100 \
-  --seed 7 \
-  --output-dir results/datasets/tan_shared_100 \
-  --handeye-preset random \
-  --plane-mode random \
-  --translation-poses 36 \
-  --composite-poses 30 \
-  --profile-points 640
-```
+# 9. 권장 생성 명령
 
 ## Single-plane 81-scan baseline
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
   --output-dir results/datasets/single_plane_81 \
-  --handeye-preset random \
   --profile-points 100 \
   --heights-mm 60 90 120 \
   --theta-deg 30 \
@@ -689,12 +600,11 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 ## Single-plane multi-theta
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   single-plane-circular \
   --trials 100 \
   --seed 7 \
   --output-dir results/datasets/single_plane_multi_theta \
-  --handeye-preset random \
   --profile-points 100 \
   --heights-mm 60 90 120 \
   --theta-deg 30 60 \
@@ -706,12 +616,11 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 ## Three-plane 81-scan comparison
 
 ```bash
-PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
+PYTHONPATH=. python examples/generate_calibration_dataset.py \
   three-plane \
   --trials 100 \
   --seed 7 \
   --output-dir results/datasets/three_plane_81 \
-  --handeye-preset random \
   --poses-per-plane 27 \
   --profile-points 100 \
   --plane-distance-range-mm 650 1000 \
@@ -720,7 +629,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 
 ---
 
-# 11. Dataset 생성과 Calibration 분리
+# 10. Dataset 생성과 Calibration 분리
 
 권장 실험 절차:
 
@@ -728,7 +637,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 1. ideal/raw synthetic dataset collection 생성
 2. collection의 logical SHA-256 기록
 3. calibration 실행 단계에서 동일한 noise seed 적용
-4. iterative / closed / closed_to_iterative 비교
+4. iterative / nonlinear-refinement 비교
 5. trial별 GT error와 convergence 저장
 ```
 
@@ -744,7 +653,7 @@ PYTHONPATH=. python examples/generate_synthetic_calibration_dataset.py \
 
 ---
 
-# 12. Alternating 결과를 초기값으로 사용한 Joint Nonlinear Refinement
+# 11. Alternating 결과를 초기값으로 사용한 Joint Nonlinear Refinement
 
 다음 스크립트는 같은 noisy trial에서 기존 반복 교대 최적화를 한 번
 수행한 뒤, 그 결과를 초기값으로 비선형 refinement를 수행합니다.
@@ -783,3 +692,45 @@ bash main/run_alternating_joint_nonlinear_comparison.sh
 따라서 서로 다른 실행을 사후 pairing하지 않아도 동일한 noise와
 동일한 초기값에 대한 before/after 비교가 가능합니다. 생성되는 plot은
 pose 오차, signed improvement, 평면 normal/offset 오차를 각각 보여줍니다.
+
+---
+
+# 12. 공통 pose 생성과 unrestricted D-optimal subset 탐색
+
+`laser_handeye.pose_design`이 random, LHS, circular pose 생성과 좌표계 변환을
+한 곳에서 제공합니다. 실험 스크립트는 자체 LHS 구현을 만들지 않고 이
+공통 API를 사용합니다. `unrestricted_doptimal_pose_design.py`는 circular나
+고정 tilt를 강제하지 않는 plane-relative 6DoF 범위에서 random 또는 LHS
+candidate bank를 만든 뒤, unknown-plane nuisance를 Schur complement로
+제거한 hand-eye 정보의 `logdet(H_eff)`를 multi-start 1-exchange로
+최대화합니다.
+
+```bash
+python3 main/unrestricted_doptimal_pose_design.py \
+  --candidate-design lhs \
+  --output-dir result_unrestricted_doptimal
+```
+
+빠른 smoke test:
+
+```bash
+python3 main/unrestricted_doptimal_pose_design.py \
+  --output-dir /tmp/unrestricted_doptimal_smoke \
+  --candidate-design random \
+  --candidate-count 80 \
+  --subset-sizes 3 4 5 \
+  --random-starts 3 \
+  --random-baseline-subsets 20 \
+  --mc-trials 0
+```
+
+현재 ideal straight-profile 모델에서는 scan 하나의 Jacobian row space가
+최대 2차원이므로, single-plane nuisance 3DoF를 제거한 hand-eye rank의
+상한은 `2N-3`입니다. 따라서 N=3,4는 pose와 무관하게 rank 6을 만족할 수
+없으며 결과에 `structurally_unobservable`로 기록됩니다. N>=5에는 후보별
+실제 profile geometry와 기존 analytic Jacobian을 사용해 정상적으로
+D-optimal subset을 탐색합니다.
+
+주요 산출물은 `candidate_bank.csv`, `candidate_information.npz`,
+`summary.csv`, `best_subset_N*.csv/json`, start/random-baseline 기록,
+geometry plot, `sanity_checks.json`, 그리고 paired Monte Carlo 결과입니다.

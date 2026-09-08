@@ -20,16 +20,13 @@ from laser_handeye.calibration_dataset.generators import (
     GenerationSeeds,
     SinglePlaneCircularGenerationConfig,
     ThreePlaneGenerationConfig,
-    TranslationCompositeGenerationConfig,
     generate_single_plane_circular_dataset,
     generate_three_plane_dataset,
-    generate_translation_composite_dataset,
 )
 from laser_handeye.calibration_dataset import (
     logical_dataset_sha256,
     save_calibration_dataset,
 )
-from laser_handeye.tan2025.simulation import PaperSimulationConfig
 
 
 COLLECTION_SCHEMA = "laser_handeye.calibration_dataset_collection"
@@ -52,8 +49,6 @@ def _nonnegative_int(text: str) -> int:
 
 def _add_common_options(
     parser: argparse.ArgumentParser,
-    *,
-    default_handeye_preset: str,
 ) -> None:
     parser.add_argument(
         "--trials",
@@ -73,89 +68,10 @@ def _add_common_options(
         required=True,
         help="new or empty collection directory (existing files are never overwritten)",
     )
-    parser.add_argument(
-        "--handeye-preset",
-        choices=("random", "tan2025"),
-        default=default_handeye_preset,
-        help="ground-truth hand-eye transform source",
-    )
-
-
-def _add_translation_composite_options(parser: argparse.ArgumentParser) -> None:
-    _add_common_options(parser, default_handeye_preset="tan2025")
-    parser.add_argument("--translation-poses", type=_positive_int, default=36)
-    parser.add_argument("--composite-poses", type=_positive_int, default=30)
-    parser.add_argument("--profile-points", type=_positive_int, default=640)
-    parser.add_argument("--scan-angle-deg", type=float, default=21.4)
-    parser.add_argument("--sensor-z-min-mm", type=float, default=190.0)
-    parser.add_argument("--sensor-z-max-mm", type=float, default=290.0)
-    parser.add_argument("--nominal-sensor-distance-mm", type=float, default=240.0)
-    parser.add_argument(
-        "--plane-mode",
-        choices=("fixed", "random"),
-        default="fixed",
-        help=(
-            "fixed uses --plane-center-base-mm/--plane-normal-base; random "
-            "resamples one plane per trial and shares it across both groups"
-        ),
-    )
-    parser.add_argument(
-        "--plane-center-base-mm",
-        type=float,
-        nargs=3,
-        metavar=("X", "Y", "Z"),
-        default=(500.0, 0.0, 300.0),
-        help="base-frame point on the plane used by --plane-mode fixed",
-    )
-    parser.add_argument(
-        "--plane-normal-base",
-        type=float,
-        nargs=3,
-        metavar=("NX", "NY", "NZ"),
-        default=(0.337918, 0.1050427, -0.935296),
-        help="plane normal used by --plane-mode fixed",
-    )
-    parser.add_argument(
-        "--plane-angle-range-deg",
-        type=float,
-        nargs=2,
-        metavar=("MIN", "MAX"),
-        default=(-30.0, 30.0),
-        help="Euler XYZ sampling interval used by --plane-mode random",
-    )
-    parser.add_argument(
-        "--plane-min-axis-angle-deg",
-        type=float,
-        default=1.0,
-        help="minimum acute angle from every signed base axis in random mode",
-    )
-    parser.add_argument(
-        "--plane-distance-range-mm",
-        type=float,
-        nargs=2,
-        metavar=("MIN", "MAX"),
-        default=(350.0, 600.0),
-        help="positive plane offset interval along the sampled normal",
-    )
-    parser.add_argument(
-        "--plane-tangent-range-mm",
-        type=float,
-        nargs=2,
-        metavar=("MIN", "MAX"),
-        default=(-100.0, 100.0),
-        help="two plane-tangent center-coordinate interval used in random mode",
-    )
-    parser.add_argument("--translation-tangent-span-mm", type=float, default=55.0)
-    parser.add_argument("--translation-normal-span-mm", type=float, default=22.0)
-    parser.add_argument("--composite-target-span-mm", type=float, default=55.0)
-    parser.add_argument("--composite-tilt-span-deg", type=float, default=30.0)
-    parser.add_argument("--composite-roll-span-deg", type=float, default=170.0)
-    parser.add_argument("--composite-distance-span-mm", type=float, default=12.0)
-    parser.add_argument("--minimum-valid-fraction", type=float, default=0.8)
 
 
 def _add_single_plane_circular_options(parser: argparse.ArgumentParser) -> None:
-    _add_common_options(parser, default_handeye_preset="random")
+    _add_common_options(parser)
     parser.add_argument("--profile-points", type=_positive_int, default=100)
     parser.add_argument("--profile-half-width-mm", type=float, default=25.0)
     parser.add_argument("--radius-mm", type=float, default=100.0)
@@ -233,7 +149,7 @@ def _add_single_plane_circular_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_three_plane_options(parser: argparse.ArgumentParser) -> None:
-    _add_common_options(parser, default_handeye_preset="random")
+    _add_common_options(parser)
     parser.add_argument("--poses-per-plane", type=_positive_int, default=35)
     parser.add_argument("--profile-points", type=_positive_int, default=100)
     parser.add_argument("--profile-half-width-mm", type=float, default=25.0)
@@ -270,12 +186,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    translation = subparsers.add_parser(
-        "translation-composite",
-        help="separate pure-translation and composite motion groups",
-    )
-    _add_translation_composite_options(translation)
-
     circular = subparsers.add_parser(
         "single-plane-circular",
         help="single-plane nine-line circular optimal-pattern acquisition",
@@ -294,43 +204,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
-def _translation_composite_config(
-    args: argparse.Namespace,
-) -> TranslationCompositeGenerationConfig:
-    simulation = PaperSimulationConfig(
-        num_translation_poses=args.translation_poses,
-        num_composite_poses=args.composite_poses,
-        num_profile_points=args.profile_points,
-        scan_angle_deg=args.scan_angle_deg,
-        sensor_z_min_mm=args.sensor_z_min_mm,
-        sensor_z_max_mm=args.sensor_z_max_mm,
-        nominal_sensor_distance_mm=args.nominal_sensor_distance_mm,
-        plane_center_base_mm=tuple(args.plane_center_base_mm),
-        plane_normal_base=np.asarray(args.plane_normal_base, dtype=float),
-        translation_tangent_span_mm=args.translation_tangent_span_mm,
-        translation_normal_span_mm=args.translation_normal_span_mm,
-        composite_target_span_mm=args.composite_target_span_mm,
-        composite_tilt_span_deg=args.composite_tilt_span_deg,
-        composite_roll_span_deg=args.composite_roll_span_deg,
-        composite_distance_span_mm=args.composite_distance_span_mm,
-        minimum_valid_fraction=args.minimum_valid_fraction,
-    )
-    return TranslationCompositeGenerationConfig(
-        simulation=simulation,
-        handeye_preset=args.handeye_preset,
-        plane_mode=args.plane_mode,
-        plane_angle_range_deg=tuple(args.plane_angle_range_deg),
-        plane_min_axis_angle_deg=args.plane_min_axis_angle_deg,
-        plane_distance_range_mm=tuple(args.plane_distance_range_mm),
-        plane_tangent_range_mm=tuple(args.plane_tangent_range_mm),
-    )
-
-
 def _single_plane_circular_config(
     args: argparse.Namespace,
 ) -> SinglePlaneCircularGenerationConfig:
     return SinglePlaneCircularGenerationConfig(
-        handeye_preset=args.handeye_preset,
         profile_points=args.profile_points,
         profile_half_width_mm=args.profile_half_width_mm,
         radius_mm=args.radius_mm,
@@ -353,7 +230,6 @@ def _single_plane_circular_config(
 
 def _three_plane_config(args: argparse.Namespace) -> ThreePlaneGenerationConfig:
     return ThreePlaneGenerationConfig(
-        handeye_preset=args.handeye_preset,
         poses_per_plane=args.poses_per_plane,
         profile_points=args.profile_points,
         profile_half_width_mm=args.profile_half_width_mm,
@@ -369,8 +245,6 @@ def _three_plane_config(args: argparse.Namespace) -> ThreePlaneGenerationConfig:
 def _mode_components(
     args: argparse.Namespace,
 ) -> tuple[Any, Callable[[Any, GenerationSeeds], Any]]:
-    if args.mode == "translation-composite":
-        return _translation_composite_config(args), generate_translation_composite_dataset
     if args.mode == "single-plane-circular":
         return _single_plane_circular_config(args), generate_single_plane_circular_dataset
     if args.mode == "three-plane":
@@ -394,20 +268,6 @@ def _jsonable(value: Any) -> Any:
 
 def _collection_config(config: Any) -> dict[str, Any]:
     payload = _jsonable(asdict(config))
-    if isinstance(config, TranslationCompositeGenerationConfig):
-        # The generator replaces this dataclass default independently in each
-        # trial from handeye_preset, so persisting it as effective GT would be
-        # misleading.  Every trial manifest stores its actual truth transform.
-        simulation = payload.get("simulation", {})
-        if isinstance(simulation, dict):
-            simulation.pop("T_ef_s_true", None)
-            simulation["T_ef_s_true_source"] = "handeye_preset_per_trial"
-            if config.plane_mode == "random":
-                simulation.pop("plane_center_base_mm", None)
-                simulation.pop("plane_normal_base", None)
-                simulation["plane_source"] = "random_plane_config_per_trial"
-            else:
-                simulation["plane_source"] = "fixed_simulation_config"
     return payload
 
 
@@ -446,7 +306,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = _prepare_output_directory(args.output_dir)
 
     acquisition_modes = {
-        "translation-composite": "translation_composite",
         "single-plane-circular": "single_plane_circular",
         "three-plane": "three_plane_random",
     }

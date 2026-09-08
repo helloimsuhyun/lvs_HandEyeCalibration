@@ -26,54 +26,11 @@ import numpy as np
 from main import generate_single_uniform_vs_fisher as legacy
 from main import generate_independent_random_plane_comparison as base
 from laser_handeye.calibration_dataset import CalibrationDataset
+from laser_handeye.pose_design import (
+    latin_hypercube,
+    nested_sliced_latin_hypercube,
+)
 from laser_handeye.simulation import sample_random_handeye
-
-
-def _nested_sliced_lhs(
-    rng: np.random.Generator,
-    *,
-    initial_count: int,
-    total_count: int,
-    dimensions: int,
-) -> np.ndarray:
-    """Return an ordered nested LHS.
-
-    The first ``initial_count`` rows form an LHS over coarse strata.
-    All ``total_count`` rows form an LHS over refined strata.
-    """
-    if total_count % initial_count != 0:
-        raise ValueError(
-            "exact nested sliced-LHS requires total_scans % initial_scans == 0"
-        )
-    refinement = total_count // initial_count
-    values = np.empty((total_count, dimensions), dtype=float)
-
-    for dim in range(dimensions):
-        coarse_order = rng.permutation(initial_count)
-        sub_orders = np.vstack(
-            [rng.permutation(refinement) for _ in range(initial_count)]
-        )
-
-        # Bootstrap: one refined sub-stratum from every coarse stratum.
-        for row in range(initial_count):
-            fine_index = coarse_order[row] * refinement + sub_orders[row, 0]
-            values[row, dim] = (fine_index + rng.random()) / total_count
-
-        # Continuation: fill the unused refined strata.
-        output_row = initial_count
-        for layer in range(1, refinement):
-            row_order = rng.permutation(initial_count)
-            for source_row in row_order:
-                fine_index = (
-                    coarse_order[source_row] * refinement
-                    + sub_orders[source_row, layer]
-                )
-                values[output_row, dim] = (
-                    fine_index + rng.random()
-                ) / total_count
-                output_row += 1
-
-    return values
 
 
 def _simulate_design_bank(
@@ -156,7 +113,7 @@ def _simulate_design_bank(
 
     # Extra action bank used only by Fisher after the common bootstrap.
     while len(poses) < total_count + extra_count:
-        batch = legacy._latin_hypercube(
+        batch = latin_hypercube(
             rng,
             max(64, total_count + extra_count - len(poses)),
             rows.shape[1],
@@ -270,7 +227,7 @@ def _generate_trial(
         fair_config.profile_points,
     )
 
-    design_rows = _nested_sliced_lhs(
+    design_rows = nested_sliced_latin_hypercube(
         np.random.default_rng(design_seq),
         initial_count=selection_config.initial_random_scans,
         total_count=fair_config.total_scans,

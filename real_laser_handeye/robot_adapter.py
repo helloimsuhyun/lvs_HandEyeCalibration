@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 import numpy as np
@@ -46,6 +47,7 @@ class RobotAdapter:
 
         # 로봇 명령 응답 및 오류 확인용
         self.response_collector: rb.ResponseCollector | None = None
+        self._state_lock = threading.Lock()
 
     def connect(
         self,
@@ -163,7 +165,8 @@ class RobotAdapter:
                 "RobotAdapter가 연결되지 않았습니다. connect()를 먼저 호출하세요."
             )
 
-        state = self.data_client.request_data()
+        with self._state_lock:
+            state = self.data_client.request_data()
 
         if state is None:
             raise RuntimeError("로봇으로부터 현재 상태 데이터를 받지 못했습니다.")
@@ -240,6 +243,99 @@ class RobotAdapter:
 
         transform[:3, 3] = xyz_mm
         return transform
+
+    @staticmethod
+    def _extract_joint_positions(state, *, prefer_reference: bool = False) -> np.ndarray:
+        """Extract controller joint order [base..wrist3] in degrees."""
+        fields = ("jnt_ref", "jnt_ang") if prefer_reference else ("jnt_ang", "jnt_ref")
+        for field in fields:
+            if hasattr(state.sdata, field):
+                values = np.asarray(
+                    getattr(state.sdata, field), dtype=np.float64
+                ).reshape(-1)
+                if values.size >= 6 and np.all(np.isfinite(values[:6])):
+                    return values[:6].copy()
+        raise RuntimeError(
+            "joint position field를 찾지 못했습니다. 확인한 필드: jnt_ang, jnt_ref"
+        )
+
+    def read_joint_positions_deg(self, *, prefer_reference: bool = False) -> np.ndarray:
+        """Return measured (or requested reference) joint positions in degrees."""
+        return self._extract_joint_positions(
+            self._read_state(), prefer_reference=prefer_reference
+        )
+
+    def wait_until_joint_reached(
+        self,
+        target_joint_deg: np.ndarray,
+        *,
+        tolerance_deg: float = 0.5,
+        timeout_s: float = 30.0,
+        stable_count: int = 5,
+        poll_interval_s: float = 0.05,
+        prefer_reference: bool = False,
+    ) -> np.ndarray:
+        target = self._validate_pose_vec(target_joint_deg, "target_joint_deg")
+        if tolerance_deg <= 0 or timeout_s <= 0 or stable_count < 1 or poll_interval_s <= 0:
+            raise ValueError("joint wait tolerances, timeout, and sample counts must be positive")
+        started_at = time.monotonic()
+        consecutive = 0
+        last = None
+        last_error = math.inf
+        while time.monotonic() - started_at <= timeout_s:
+            current = self.read_joint_positions_deg(
+                prefer_reference=prefer_reference
+            )
+            last = current
+            error = np.abs(self._angle_difference_deg(current, target))
+            last_error = float(np.max(error))
+            consecutive = consecutive + 1 if last_error <= tolerance_deg else 0
+            if consecutive >= stable_count:
+                return current.copy()
+            time.sleep(poll_interval_s)
+        raise TimeoutError(
+            "목표 joint pose에 도달하지 못했습니다. "
+            f"target={target.tolist()}, current={None if last is None else last.tolist()}, "
+            f"max_error={last_error:.3f} deg"
+        )
+
+    def move_j(
+        self,
+        target_joint_deg: np.ndarray,
+        *,
+        speed_deg_s: float = 10.0,
+        accel_deg_s2: float = 20.0,
+        tolerance_deg: float = 0.5,
+        timeout_s: float = 45.0,
+        stable_count: int = 5,
+        poll_interval_s: float = 0.05,
+        prefer_reference: bool = False,
+    ) -> np.ndarray:
+        """Execute a joint-space move and wait for stable arrival."""
+        self._require_connected()
+        target = self._validate_pose_vec(target_joint_deg, "target_joint_deg")
+        if speed_deg_s <= 0 or accel_deg_s2 <= 0:
+            raise ValueError("joint speed and acceleration must be positive")
+        assert self.client is not None
+        assert self.response_collector is not None
+        self._throw_if_robot_error()
+        self.client.move_j(
+            self.response_collector,
+            target,
+            float(speed_deg_s),
+            float(accel_deg_s2),
+        )
+        self._throw_if_robot_error()
+        arrived = self.wait_until_joint_reached(
+            target,
+            tolerance_deg=tolerance_deg,
+            timeout_s=timeout_s,
+            stable_count=stable_count,
+            poll_interval_s=poll_interval_s,
+            prefer_reference=prefer_reference,
+        )
+        self._throw_if_robot_error()
+        return arrived
 
     def wait_until_tcp_reached(
         self,

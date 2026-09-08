@@ -1,0 +1,42 @@
+{
+  "seed": 6901,
+  "output_dir": "results/fixed_translation_rotation_geometry",
+  "phase1_dir": "results/phase1_lhs_screening",
+  "phase2a_dir": "results/phase2a_initialization_robustness",
+  "N": 9,
+  "profile": {
+    "points": 100,
+    "half_width_mm": 25.0
+  },
+  "baseline": {
+    "low_tilt_deg": 10.0,
+    "low_psi_b_deg": [0.0, 90.0, 180.0, 270.0],
+    "high_tilt_deg": 55.0,
+    "high_psi_b_deg": [36.0, 108.0, 180.0, 252.0, 324.0],
+    "distance_mm": 105.0
+  },
+  "r0_gamma": {
+    "clustered_deg": [-20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0],
+    "random_seed": 6902
+  },
+  "r1_uv_radii_mm": [0.0, 10.0, 20.0, 30.0, 40.0],
+  "r2_mean_distances_mm": [60.0, 75.0, 90.0, 105.0, 120.0, 135.0, 150.0],
+  "r2_diversity_levels": {
+    "D0": [105.0, 105.0, 105.0, 105.0, 105.0, 105.0, 105.0, 105.0, 105.0],
+    "D1": [90.0, 90.0, 90.0, 90.0, 105.0, 120.0, 120.0, 120.0, 120.0],
+    "D2": [75.0, 75.0, 75.0, 75.0, 105.0, 135.0, 135.0, 135.0, 135.0],
+    "D3": [60.0, 60.0, 60.0, 60.0, 105.0, 150.0, 150.0, 150.0, 150.0]
+  },
+  "r3": {
+    "small_uv_radius_mm": 0.0,
+    "large_uv_radius_mm": 40.0,
+    "constant_distance_mm": 105.0,
+    "diverse_distances_mm": [60.0, 60.0, 60.0, 60.0, 105.0, 150.0, 150.0, 150.0, 150.0]
+  },
+  "numerics": {
+    "identity_tolerance": 1e-10,
+    "rank_relative_tolerance": 1e-10,
+    "pinv_rcond": 1e-12
+  },
+  "bootstrap_repeats": 5000
+}

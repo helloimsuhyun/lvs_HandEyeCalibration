@@ -1,0 +1,25 @@
+{
+  "seed": 4701,
+  "existing_stage2_dir": "results/translation_trace_isotropy_controlled",
+  "phase1_dir": "results/phase1_lhs_screening",
+  "output_dir": "results/translation_geometry_followup",
+  "bootstrap_repeats": 5000,
+  "replication": {
+    "N": 11,
+    "candidate_seed": 4701,
+    "subset_seed": 4702,
+    "initialization_seed": 4703,
+    "noise_seed": 4704,
+    "fresh_subsets": 50000,
+    "extreme_fraction": 0.30,
+    "pairs_per_comparison": 30,
+    "minimum_pairs_per_comparison": 20,
+    "controlled_axis_max_std": 0.20,
+    "controlled_axis_target_median_std": 0.10,
+    "primary_confounder_max_std": 0.20,
+    "primary_confounder_target_median_std": 0.10,
+    "secondary_confounder_rms_max_std": 0.50,
+    "minimum_treatment_gap_std": 0.75,
+    "condition_eigenvalue_floor": 1e-10
+  }
+}

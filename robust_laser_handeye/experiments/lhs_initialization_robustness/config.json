@@ -1,0 +1,22 @@
+{
+  "seed": 2701,
+  "phase1_dir": "results/phase1_lhs_screening",
+  "output_dir": "results/phase2a_initialization_robustness",
+  "input": {
+    "top_fraction_per_n": 0.10
+  },
+  "initial_error": {
+    "translation_norm_mm": [50.0, 150.0],
+    "rotation_deg": [5.0, 25.0],
+    "environments": 30
+  },
+  "noise": {
+    "axis": "xz",
+    "std_mm": 0.25,
+    "repeats_per_environment": 3
+  },
+  "classification": {
+    "translation_mm": 1.0,
+    "rotation_deg": 0.1
+  }
+}

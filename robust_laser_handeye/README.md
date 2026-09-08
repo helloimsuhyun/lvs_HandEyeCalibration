@@ -1,12 +1,7 @@
 # Robust 2D Laser Sensor Hand-Eye Calibration
 
-> The new Tan et al. (IEEE TIM 2025) three-step closed-form reproduction is
-> isolated in `laser_handeye/tan2025/`; setup, limitations, and commands are in
-> [`../paper/README.md`](../paper/README.md). The material below documents the
-> existing Sharifzadeh-style alternating single-plane implementation.
-
-Reusable noise-free acquisitions for translation/composite, single-plane
-circular, and three-plane experiments are generated with
+Reusable noise-free acquisitions for single-plane circular and three-plane
+experiments are generated with
 `examples/generate_calibration_dataset.py`. The portable manifest/NPZ contract
 and real-robot handoff are documented in
 [`laser_handeye/calibration_dataset/README.md`](laser_handeye/calibration_dataset/README.md).

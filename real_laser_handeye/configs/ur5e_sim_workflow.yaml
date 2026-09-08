@@ -1,0 +1,34 @@
+extends: ur5e_ljv7080_workflow.yaml
+
+paths:
+  session_root: ../../runs/sim/ur5e/handeye_workflow
+  initial_dataset: ../../runs/sim/ur5e/handeye_workflow/latest/initial_plane/dataset
+  estimate_dir: ../../runs/sim/ur5e/handeye_workflow/latest/initial_plane/estimate
+  scan_dataset: ../../runs/sim/ur5e/handeye_workflow/latest/calibration_scans
+  planning_model: ../../runs/sim/ur5e/handeye_workflow/latest/planning/model.xml
+  scan_plan: ../../runs/sim/ur5e/handeye_workflow/latest/planning/scan_plan.json
+  calibrated_transform: ../../runs/sim/ur5e/handeye_workflow/latest/T_tcp_sensor_calibrated.csv
+
+simulation:
+  new_session_per_launch: true
+  auto_safe_pose: true
+
+  safe_pose:
+    distance_mm: null
+    distance_offsets_mm: [0.0, 50.0, -50.0, 100.0, -100.0]
+    roll_candidates_deg: [0.0, 90.0, -90.0, 180.0]
+    ik_timeout_s: 1.0
+
+  board_center_base_mm: [600.0, 0.0, 30.0]
+  board_normal_base: [-0.09, 0.09, 0.991867]
+  minimum_plane_axis_tilt_deg: 5.0
+
+  board_half_width_mm: 120.0
+  board_half_height_mm: 90.0
+
+  initial_sensor_distance_mm: 220.0
+  scan_profile_half_width_mm: 25.0
+  profile_points: 401
+
+motion:
+  simulated_delay_s: 0.15

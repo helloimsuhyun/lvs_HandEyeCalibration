@@ -5,7 +5,7 @@ import numpy as np
 from .scene_generation import normalize_vector, plane_basis
 from .se3 import inv_T, make_T
 
-
+# SO(3)에서 랜덤 회전 생성
 def sample_random_rotation(rng: np.random.Generator) -> np.ndarray:
     """Sample a uniform random rotation matrix in SO(3)."""
     quaternion = rng.normal(size=4)
@@ -81,7 +81,7 @@ def sample_sensor_pose_for_plane(
     sensor_origin = target - depth_mm * R_base_s[:, 2]
     return make_T(R_base_s, sensor_origin)
 
-
+# 센서 포즈 > 로봇 TCP 포즈 
 def sensor_pose_to_robot_pose(
     T_base_s: np.ndarray,
     T_ef_s: np.ndarray,

@@ -1,0 +1,4 @@
+mujoco>=3.2,<4
+numpy>=1.21
+PyYAML>=6
+

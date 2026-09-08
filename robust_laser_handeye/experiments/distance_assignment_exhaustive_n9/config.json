@@ -1,0 +1,12 @@
+{
+  "seed": 7319,
+  "source_config": "experiments/fixed_translation_rotation_geometry/config.json",
+  "source_results": "results/fixed_translation_rotation_geometry",
+  "output_dir": "results/distance_assignment_exhaustive_N9",
+  "distance_multiset_mm": [60.0, 60.0, 60.0, 60.0, 105.0, 150.0, 150.0, 150.0, 150.0],
+  "uv_radius_mm": 40.0,
+  "calibration_workers": 4,
+  "selected_quantile_bins": 10,
+  "selected_per_bin": 6,
+  "bootstrap_repeats": 5000
+}

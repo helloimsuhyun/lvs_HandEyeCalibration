@@ -10,10 +10,14 @@ import time
 import uuid
 
 import numpy as np
-import pyqtgraph as pg
-from pyqtgraph.Qt import QtWidgets
+try:
+    import pyqtgraph as pg
+    from pyqtgraph.Qt import QtWidgets
+except ImportError:  # Calibration-only and Tk workflow do not require PyQtGraph.
+    pg = None
+    QtWidgets = None
 
-from robust_laser_handeye.laser_handeye.calibration import calibrate_single_plane
+from robust_laser_handeye.laser_handeye.calibration import calibrate_single_plane_with_nonlinear
 
 try:
     from .calibrate_only.with_ransac_calibrate_only import (
@@ -33,10 +37,16 @@ except ImportError:  # Direct execution: python real_laser_handeye/main.py
 
 try:
     from .laser_adapter import LaserAdapter
-    from .robot_adapter import RobotAdapter
 except ImportError:  # Direct execution: python real_laser_handeye/main.py
     from laser_adapter import LaserAdapter
-    from real_laser_handeye.robot_adapter import RobotAdapter
+
+try:
+    from .robot_adapter import RobotAdapter
+except (ImportError, ModuleNotFoundError):
+    try:
+        from real_laser_handeye.robot_adapter import RobotAdapter
+    except (ImportError, ModuleNotFoundError):
+        RobotAdapter = None
 
 
 
@@ -44,6 +54,11 @@ class LiveMonitor:
     """Fast PyQtGraph visualization of the laser profile and TCP pose."""
 
     def __init__(self, history_length: int = 200) -> None:
+        if pg is None or QtWidgets is None:
+            raise RuntimeError(
+                "PyQtGraph is required for the legacy live monitor; "
+                "use workflow_gui or install pyqtgraph"
+            )
         self.history_length = max(2, int(history_length))
         self.times: list[float] = []
         self.xyz_history: list[np.ndarray] = []
@@ -354,6 +369,42 @@ def atomic_matrix(path: Path, value: np.ndarray) -> None:
             temporary.unlink()
 
 
+def atomic_accumulated_scans(path: Path, scans) -> None:
+    """Save accepted variable-length profiles in one pickle-free NPZ file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    profiles = [np.asarray(scan.points_s, dtype=float).reshape(-1, 3) for scan in scans]
+    offsets = np.zeros(len(profiles) + 1, dtype=np.int64)
+    if profiles:
+        offsets[1:] = np.cumsum([len(points) for points in profiles], dtype=np.int64)
+        points_s = np.vstack(profiles)
+        transforms = np.stack(
+            [np.asarray(scan.T_base_ef, dtype=float).reshape(4, 4) for scan in scans]
+        )
+    else:
+        points_s = np.empty((0, 3), dtype=float)
+        transforms = np.empty((0, 4, 4), dtype=float)
+    scan_ids = np.asarray(
+        [(-1 if scan.scan_id is None else int(scan.scan_id)) for scan in scans],
+        dtype=np.int64,
+    )
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            np.savez_compressed(
+                stream,
+                T_base_tcp=transforms,
+                points_s=points_s,
+                profile_offsets=offsets,
+                scan_ids=scan_ids,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def load_transform(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".json":
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -436,8 +487,10 @@ def capture_once(robot: RobotAdapter, laser: LaserAdapter, args) -> Path:
     print(f"saved {output} ({len(points)} points)")
     return output
 
-
 def calibrate(args, monitor: LiveMonitor | None = None) -> np.ndarray:
+    # ------------------------------------------------------------------
+    # Validate RANSAC settings
+    # ------------------------------------------------------------------
     if args.ransac_threshold_mm <= 0:
         raise ValueError("--ransac-threshold-mm must be positive")
     if args.ransac_max_iterations < 1:
@@ -449,6 +502,9 @@ def calibrate(args, monitor: LiveMonitor | None = None) -> np.ndarray:
     if not (0.0 <= args.max_ransac_skip_ratio <= 1.0):
         raise ValueError("--max-ransac-skip-ratio must be in [0, 1]")
 
+    # ------------------------------------------------------------------
+    # Load scans + profile RANSAC
+    # ------------------------------------------------------------------
     scans, ransac_rows = load_scans_with_ransac(
         args.dataset_dir,
         use_profile_ransac=not args.disable_profile_ransac,
@@ -460,14 +516,23 @@ def calibrate(args, monitor: LiveMonitor | None = None) -> np.ndarray:
         ransac_refine_iterations=args.ransac_refine_iterations,
         ransac_reject_policy=args.ransac_reject_policy,
     )
+
     total_scan_count = len(ransac_rows)
     rejected_rows = [
-        row for row in ransac_rows if row.get("status") == "rejected"
+        row for row in ransac_rows
+        if row.get("status") == "rejected"
     ]
     rejected_count = len(rejected_rows)
-    skip_ratio = rejected_count / total_scan_count if total_scan_count else 0.0
+
+    skip_ratio = (
+        rejected_count / total_scan_count
+        if total_scan_count
+        else 0.0
+    )
+
     ransac_path = args.output.with_suffix(".profile_ransac.csv")
     save_profile_ransac_diagnostics(ransac_path, ransac_rows)
+
     print(
         "RANSAC summary: "
         f"{len(scans)}/{total_scan_count} scans accepted, "
@@ -475,77 +540,317 @@ def calibrate(args, monitor: LiveMonitor | None = None) -> np.ndarray:
     )
     print(f"saved {ransac_path}")
 
+    # ------------------------------------------------------------------
+    # Dataset quality gates
+    # ------------------------------------------------------------------
     if len(scans) < args.min_scans:
         raise RuntimeError(
-            f"need at least {args.min_scans} accepted captures; found {len(scans)}"
+            f"need at least {args.min_scans} accepted captures; "
+            f"found {len(scans)}"
         )
-    if not args.disable_profile_ransac and skip_ratio > args.max_ransac_skip_ratio:
+
+    if (
+        not args.disable_profile_ransac
+        and skip_ratio > args.max_ransac_skip_ratio
+    ):
         raise RuntimeError(
             "too many scans rejected by RANSAC: "
-            f"{rejected_count}/{total_scan_count} ({skip_ratio:.1%}) > "
+            f"{rejected_count}/{total_scan_count} "
+            f"({skip_ratio:.1%}) > "
             f"{args.max_ransac_skip_ratio:.1%}"
         )
+
+    accumulated_path = args.output.with_suffix(".accumulated_scans.npz")
+    atomic_accumulated_scans(accumulated_path, scans)
+    print(f"saved {accumulated_path}")
+
+    # ------------------------------------------------------------------
+    # Initial hand-eye
+    # ------------------------------------------------------------------
     initial = load_transform(args.initial_transform)
-    result = calibrate_single_plane(
-        scans,
-        T_init=initial,
-        max_iter=args.max_iter,
-        tol=args.tol,
-        plane_offset_mode="joint",
-        max_translation_offset_condition=args.max_condition,
+
+    # ------------------------------------------------------------------
+    # Calibration
+    #
+    # 1. iterative linear / joint-offset calibration
+    # 2. full 6-DoF nonlinear refinement
+    #
+    # Unknown plane => nonlinear plane_mode="refit"
+    # ------------------------------------------------------------------
+    linear_result, nonlinear_result = (
+        calibrate_single_plane_with_nonlinear(
+            scans,
+            T_init=initial,
+
+            # ----------------------------------------------------------
+            # Iterative linear initialization
+            # ----------------------------------------------------------
+            max_iter=args.max_iter,
+            tol=args.tol,
+            plane_offset_mode="joint",
+            max_translation_offset_condition=args.max_condition,
+
+            # ----------------------------------------------------------
+            # Nonlinear 6-DoF refinement
+            # ----------------------------------------------------------
+            plane_mode="refit",
+            nonlinear_loss="linear",
+            nonlinear_f_scale_mm=1.0,
+            nonlinear_max_nfev=200,
+            nonlinear_ftol=1e-10,
+            nonlinear_xtol=1e-10,
+            nonlinear_gtol=1e-10,
+        )
     )
-    final_rms = float(result.plane_rms_history[-1])
-    accepted = bool(
-        result.converged
-        and np.isfinite(final_rms)
-        and final_rms <= args.max_final_plane_rms_mm
-    )
-    plane_rms_history = [
-        float(value) for value in result.plane_rms_history
+
+    # ------------------------------------------------------------------
+    # Keep the two solver results separate.
+    #
+    # linear_result:
+    #   iterations / rank / condition / iterative RMS history
+    #
+    # nonlinear_result:
+    #   final T / nonlinear success / final RMS / nonlinear update
+    # ------------------------------------------------------------------
+    T_final = np.asarray(
+        nonlinear_result.T_ef_s,
+        dtype=float,
+    ).reshape(4, 4)
+
+    linear_plane_rms_history = [
+        float(value)
+        for value in linear_result.plane_rms_history
     ]
+
+    linear_final_rms = float(
+        linear_plane_rms_history[-1]
+    )
+
+    nonlinear_initial_rms = float(
+        nonlinear_result.initial_rms_mm
+    )
+    nonlinear_final_rms = float(
+        nonlinear_result.final_rms_mm
+    )
+
+    # Plot history:
+    # iterative linear states + final nonlinear state.
+    plane_rms_history = list(linear_plane_rms_history)
+
+    if (
+        not plane_rms_history
+        or not np.isclose(
+            plane_rms_history[-1],
+            nonlinear_initial_rms,
+            rtol=1e-9,
+            atol=1e-12,
+        )
+    ):
+        plane_rms_history.append(nonlinear_initial_rms)
+
+    plane_rms_history.append(nonlinear_final_rms)
+
+    # ------------------------------------------------------------------
+    # Final acceptance
+    #
+    # Both stages must terminate successfully and the FINAL NONLINEAR
+    # residual must satisfy the real-run quality gate.
+    # ------------------------------------------------------------------
+    accepted = bool(
+        linear_result.converged
+        and nonlinear_result.success
+        and np.all(np.isfinite(T_final))
+        and np.isfinite(nonlinear_final_rms)
+        and nonlinear_final_rms <= args.max_final_plane_rms_mm
+    )
+
+    # ------------------------------------------------------------------
+    # RMS plot / live monitor
+    # ------------------------------------------------------------------
     plot_path = args.output.with_suffix(".plane_rms.png")
-    save_plane_rms_plot(plane_rms_history, plot_path)
+    save_plane_rms_plot(
+        plane_rms_history,
+        plot_path,
+    )
+
     if monitor is not None:
         monitor.show_rms(plane_rms_history)
 
-    diagnostics_path = args.output.with_suffix(".diagnostics.json")
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    diagnostics_path = args.output.with_suffix(
+        ".diagnostics.json"
+    )
+
     atomic_json(
         diagnostics_path,
         {
+            # ----------------------------------------------------------
+            # Dataset / RANSAC
+            # ----------------------------------------------------------
+            "dataset_dir": str(args.dataset_dir),
+            "initial_transform": str(args.initial_transform),
+            "output_transform": str(args.output),
             "scan_count": len(scans),
             "total_capture_count": total_scan_count,
             "ransac_rejected_count": rejected_count,
             "ransac_skip_ratio": skip_ratio,
             "profile_ransac_diagnostics": str(ransac_path),
-            "point_count": int(sum(scan.num_points for scan in scans)),
-            "converged": bool(result.converged),
+            "accumulated_scans": str(accumulated_path),
+            "point_count": int(
+                sum(scan.num_points for scan in scans)
+            ),
+
+            # ----------------------------------------------------------
+            # Overall acceptance
+            # ----------------------------------------------------------
             "accepted": accepted,
-            "iterations": int(result.iterations),
-            "initial_plane_rms_mm": plane_rms_history[0],
-            "final_plane_rms_mm": final_rms,
+
+            # ----------------------------------------------------------
+            # Iterative linear stage
+            # ----------------------------------------------------------
+            "linear_converged": bool(
+                linear_result.converged
+            ),
+            "linear_iterations": int(
+                linear_result.iterations
+            ),
+            "linear_initial_plane_rms_mm": float(
+                linear_plane_rms_history[0]
+            ),
+            "linear_final_plane_rms_mm": linear_final_rms,
+
+            "linear_plane_rms_history_mm": (
+                linear_plane_rms_history
+            ),
+
+            "linear_rank_history": [
+                int(value)
+                for value in linear_result.rank_history
+            ],
+
+            "linear_condition_history": [
+                (
+                    float(value)
+                    if np.isfinite(value)
+                    else None
+                )
+                for value in linear_result.cond_history
+            ],
+
+            # ----------------------------------------------------------
+            # Nonlinear refinement stage
+            # ----------------------------------------------------------
+            "nonlinear_success": bool(
+                nonlinear_result.success
+            ),
+            "nonlinear_nfev": int(
+                nonlinear_result.nfev
+            ),
+            "nonlinear_initial_rms_mm": (
+                nonlinear_initial_rms
+            ),
+            "nonlinear_final_rms_mm": (
+                nonlinear_final_rms
+            ),
+            "nonlinear_delta_translation_mm": float(
+                nonlinear_result.delta_translation_mm
+            ),
+            "nonlinear_delta_rotation_deg": float(
+                nonlinear_result.delta_rotation_deg
+            ),
+
+            # Combined history only for visualization.
             "plane_rms_history_mm": plane_rms_history,
             "plane_rms_plot": str(plot_path),
-            "rank_history": [int(value) for value in result.rank_history],
-            "condition_history": [
-                float(value) if np.isfinite(value) else None
-                for value in result.cond_history
-            ],
-            "T_tcp_sensor": result.T_ef_s.tolist(),
+
+            # ----------------------------------------------------------
+            # Final result
+            # ----------------------------------------------------------
+            "max_final_plane_rms_mm": float(
+                args.max_final_plane_rms_mm
+            ),
+            "T_tcp_sensor_linear": (
+                linear_result.T_ef_s.tolist()
+            ),
+            "T_tcp_sensor": T_final.tolist(),
         },
     )
+
     print(f"saved {plot_path}")
+    print(f"saved {diagnostics_path}")
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 72)
+    print("CALIBRATION SUMMARY")
+    print("=" * 72)
+
+    print(
+        "Linear iterative: "
+        f"converged={linear_result.converged}, "
+        f"iterations={linear_result.iterations}, "
+        f"RMS={linear_final_rms:.6f} mm"
+    )
+
+    print(
+        "Nonlinear refine: "
+        f"success={nonlinear_result.success}, "
+        f"nfev={nonlinear_result.nfev}, "
+        f"RMS={nonlinear_initial_rms:.6f} "
+        f"-> {nonlinear_final_rms:.6f} mm"
+    )
+
+    print(
+        "Nonlinear update: "
+        f"translation="
+        f"{nonlinear_result.delta_translation_mm:.6f} mm, "
+        f"rotation="
+        f"{nonlinear_result.delta_rotation_deg:.6f} deg"
+    )
+
+    # ------------------------------------------------------------------
+    # Reject bad calibration BEFORE overwriting output transform.
+    # ------------------------------------------------------------------
     if not accepted:
         raise RuntimeError(
-            f"calibration rejected: converged={result.converged}, "
-            f"final RMS={final_rms:.6f} mm; see {diagnostics_path}"
+            "calibration rejected: "
+            f"linear_converged={linear_result.converged}, "
+            f"nonlinear_success={nonlinear_result.success}, "
+            f"nonlinear_final_RMS="
+            f"{nonlinear_final_rms:.6f} mm "
+            f"(limit "
+            f"{args.max_final_plane_rms_mm:.6f} mm); "
+            f"see {diagnostics_path}"
         )
-    atomic_matrix(args.output, result.T_ef_s)
-    print(f"saved {args.output}")
-    print(np.array2string(result.T_ef_s, precision=8, suppress_small=True))
-    return result.T_ef_s
 
+    # ------------------------------------------------------------------
+    # Save FINAL NONLINEAR transform
+    # ------------------------------------------------------------------
+    atomic_matrix(
+        args.output,
+        T_final,
+    )
+
+    print(f"saved {args.output}")
+    print()
+    print("Final nonlinear T_tcp_sensor:")
+    print(
+        np.array2string(
+            T_final,
+            precision=8,
+            suppress_small=True,
+        )
+    )
+
+    return T_final
 
 def connect_hardware(args) -> tuple[RobotAdapter, LaserAdapter]:
+    if RobotAdapter is None:
+        raise RuntimeError("rbpodo is required for real robot connection")
     robot = RobotAdapter(args.robot_host, args.robot_port)
     laser = LaserAdapter(
         ip=args.laser_ip,

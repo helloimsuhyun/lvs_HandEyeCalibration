@@ -1,0 +1,111 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur5e_ljv7080_preview">
+  <!--
+    Visualization-only model.
+
+    Coordinate convention used here:
+      ^tool0 T_sensor =
+        [-1  0  0    0 mm ]
+        [ 0  1  0    0 mm ]
+        [ 0  0 -1  151 mm ]
+        [ 0  0  0    1    ]
+
+      ^sensor T_physical = Trans(0, 0, +80 mm)
+
+    The official UR ROS model has
+      +Z_tool0 = +X_flange,
+      +X_tool0 = +Y_flange,
+      +Y_tool0 = +Z_flange.
+
+    Therefore the same sensor mounting is
+      ^flange p_sensor = [151, 0, 0] mm
+      ^flange R_sensor = RPY(+90 deg, 0, -90 deg).
+  -->
+
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+
+  <xacro:property name="axis_length" value="0.075"/>
+  <xacro:property name="axis_radius" value="0.0032"/>
+
+  <link name="world"/>
+
+  <xacro:ur_robot
+      name="ur5e"
+      tf_prefix=""
+      parent="world"
+      joint_limits_parameters_file="$(find ur_description)/config/ur5e/joint_limits.yaml"
+      kinematics_parameters_file="$(find ur_description)/config/ur5e/default_kinematics.yaml"
+      physical_parameters_file="$(find ur_description)/config/ur5e/physical_parameters.yaml"
+      visual_parameters_file="$(find ur_description)/config/ur5e/visual_parameters.yaml"
+      ur_type="ur5e"
+      generate_ros2_control_tag="false">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:ur_robot>
+
+  <!-- A small RGB triad rigidly attached to a parent frame. -->
+  <xacro:macro name="frame_triad" params="name parent origin_rgba">
+    <link name="${name}">
+      <visual name="origin">
+        <geometry><sphere radius="0.008"/></geometry>
+        <material name="${name}_origin"><color rgba="${origin_rgba}"/></material>
+      </visual>
+      <visual name="x_axis">
+        <origin xyz="${axis_length/2} 0 0" rpy="0 ${pi/2} 0"/>
+        <geometry><cylinder radius="${axis_radius}" length="${axis_length}"/></geometry>
+        <material name="${name}_red"><color rgba="1 0.05 0.05 1"/></material>
+      </visual>
+      <visual name="y_axis">
+        <origin xyz="0 ${axis_length/2} 0" rpy="${-pi/2} 0 0"/>
+        <geometry><cylinder radius="${axis_radius}" length="${axis_length}"/></geometry>
+        <material name="${name}_green"><color rgba="0.05 1 0.05 1"/></material>
+      </visual>
+      <visual name="z_axis">
+        <origin xyz="0 0 ${axis_length/2}" rpy="0 0 0"/>
+        <geometry><cylinder radius="${axis_radius}" length="${axis_length}"/></geometry>
+        <material name="${name}_blue"><color rgba="0.08 0.30 1 1"/></material>
+      </visual>
+    </link>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- Official physical attachment frame and controller/tool frame. -->
+  <xacro:frame_triad name="flange_axes_preview" parent="flange" origin_rgba="1.0 0.45 0.05 1"/>
+  <xacro:frame_triad name="tool0_axes_preview" parent="tool0" origin_rgba="0.05 0.9 1.0 1"/>
+
+  <!-- Sensor measurement frame S, mounted from the physical flange. -->
+  <link name="sensor_measurement_frame">
+    <visual name="lj_v7080_visual">
+      <!-- T_sensor_cad from the existing RB5/MuJoCo sensor registration. -->
+      <origin xyz="-0.0127832449 0.0526428785 0.0976682626"
+              rpy="1.57079632679 0 1.57079632679"/>
+      <geometry>
+        <mesh filename="package://ur5e_laser_visualization/meshes/LJ-V7080_3.stl"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_dark"><color rgba="0.16 0.20 0.24 0.95"/></material>
+    </visual>
+  </link>
+
+  <joint name="flange_to_sensor_measurement" type="fixed">
+    <parent link="flange"/>
+    <child link="sensor_measurement_frame"/>
+    <!-- ^flange T_sensor: +151 mm along +X_flange. -->
+    <origin xyz="0.151 0 0" rpy="1.57079632679 0 -1.57079632679"/>
+  </joint>
+
+  <xacro:frame_triad name="sensor_axes_preview" parent="sensor_measurement_frame" origin_rgba="1.0 0.05 0.85 1"/>
+
+  <!-- Physical origin P: +80 mm along sensor +Z. -->
+  <link name="sensor_physical_origin"/>
+  <joint name="sensor_measurement_to_physical" type="fixed">
+    <parent link="sensor_measurement_frame"/>
+    <child link="sensor_physical_origin"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+  </joint>
+  <xacro:frame_triad name="physical_axes_preview" parent="sensor_physical_origin" origin_rgba="1.0 0.9 0.05 1"/>
+
+</robot>

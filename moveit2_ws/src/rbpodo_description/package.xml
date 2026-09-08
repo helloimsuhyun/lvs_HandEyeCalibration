@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>rbpodo_description</name>
+  <version>0.1.0</version>
+  <description>RB5-850E mesh resources used by the hand-eye MoveIt model.</description>
+  <maintainer email="user@example.com">lvs handeye</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

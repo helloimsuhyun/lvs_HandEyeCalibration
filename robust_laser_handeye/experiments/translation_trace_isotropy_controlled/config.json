@@ -1,0 +1,25 @@
+{
+  "seed": 3701,
+  "phase1_dir": "results/phase1_lhs_screening",
+  "phase2a_dir": "results/phase2a_initialization_robustness",
+  "output_dir": "results/translation_trace_isotropy_controlled",
+  "geometry": {
+    "scan_counts": [9],
+    "fresh_subsets_per_n": 20000,
+    "extreme_fraction": 0.30,
+    "condition_eigenvalue_floor": 1e-10
+  },
+  "matching": {
+    "pairs_per_comparison": 30,
+    "minimum_pairs_per_comparison": 20,
+    "controlled_axis_tolerance_std": 0.10,
+    "minimum_treatment_gap_std": 0.75,
+    "maximum_confounder_rms_std": 0.50
+  },
+  "stage2": {
+    "comparisons": ["A_vs_B", "A_vs_C"],
+    "scenario_source": "phase2a_saved_bank",
+    "noise_pairing": "same_by_environment_repeat_scan_slot",
+    "translation_success_mm": 1.0
+  }
+}

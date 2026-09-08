@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""
-PYTHONPATH=. python3 main/calibrate.py \
-  --collection /home/choisuhyun/lvs_HandEyeCalibration/robust_laser_handeye/results/datasets/tan2025 \
+"""Calibrate every trial in a portable calibration-dataset collection.
+
+Example::
+
+  PYTHONPATH=. python3 main/calibrate.py \
+  --collection results/datasets/single_plane \
   --output-dir results/calibration/iterative \
   --mode iterative \
   --noise-axis xz \
@@ -11,24 +14,6 @@ PYTHONPATH=. python3 main/calibrate.py \
   --init-angle-range-deg 15 \
   --init-translation-perturbation direction_norm \
   --init-rotation-perturbation axis_angle \
-  --max-iter 3000 \
-  --tol 1e-5 \
-  --verbose
-
-PYTHONPATH=. python3 main/calibrate.py \
-  --collection /home/choisuhyun/lvs_HandEyeCalibration/robust_laser_handeye/results/datasets/tan2025 \
-  --output-dir results/calibration/closed \
-  --mode closed \
-  --noise-axis xz \
-  --noise-std-mm 0.35 \
-  --verbose
-
-PYTHONPATH=. python3 main/calibrate.py \
-  --collection /home/choisuhyun/lvs_HandEyeCalibration/robust_laser_handeye/results/datasets/tan2025 \
-  --output-dir results/calibration/closed_to_iterative \
-  --mode closed_to_iterative \
-  --noise-axis xz \
-  --noise-std-mm 0.15 \
   --max-iter 3000 \
   --tol 1e-5 \
   --verbose
@@ -68,91 +53,11 @@ from laser_handeye.se3 import (
     rotation_vector_error_deg,
     transform_points,
 )
-from laser_handeye.tan2025 import Tan2025ClosedFormEstimator
-from laser_handeye.tan2025.models import Tan2025Dataset
 
 
 COLLECTION_SCHEMA = "laser_handeye.calibration_dataset_collection"
 ITERATIVE_PLANE_OFFSET_MODE = "joint"
 ITERATIVE_SOLVER_UPDATE_MODE = "simultaneous"
-
-MOTION_TAG_SCHEMA = "laser_handeye.motion_group"
-MOTION_TAG_SCHEMA_VERSION = 1
-
-
-def _split_translation_composite_scans(
-    scans: Sequence[Any],
-) -> tuple[list[Any], list[Any]]:
-    """Split scans only from explicit metadata written during acquisition."""
-    translation: list[tuple[int, int, Any]] = []
-    composite: list[tuple[int, int, Any]] = []
-    missing: list[int] = []
-
-    for fallback_index, scan in enumerate(scans):
-        meta = dict(getattr(scan, "meta", None) or {})
-        group = str(meta.get("motion_group", "")).strip().lower()
-
-        if group not in {"translation", "composite"}:
-            missing.append(fallback_index)
-            continue
-
-        if meta.get("motion_tag_schema") != MOTION_TAG_SCHEMA:
-            raise ValueError(
-                f"scan {fallback_index} has an invalid motion_tag_schema"
-            )
-        if int(meta.get("motion_tag_schema_version", -1)) != (
-            MOTION_TAG_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                f"scan {fallback_index} has an unsupported motion tag version"
-            )
-
-        try:
-            group_index = int(meta["group_scan_index"])
-            acquisition_index = int(meta["acquisition_index"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"scan {fallback_index} has incomplete motion metadata: {meta}"
-            ) from exc
-
-        entry = (group_index, acquisition_index, scan)
-        if group == "translation":
-            translation.append(entry)
-        else:
-            composite.append(entry)
-
-    if missing:
-        raise ValueError(
-            f"{len(missing)} scans have no explicit translation/composite tag. "
-            "Regenerate the dataset with the tagged synthetic generator."
-        )
-
-    if not translation or not composite:
-        raise ValueError(
-            "both translation and composite scan groups are required"
-        )
-
-    translation.sort(key=lambda item: (item[0], item[1]))
-    composite.sort(key=lambda item: (item[0], item[1]))
-
-    translation_indices = [item[0] for item in translation]
-    composite_indices = [item[0] for item in composite]
-    if translation_indices != list(range(len(translation))):
-        raise ValueError(
-            f"translation group_scan_index is not contiguous: "
-            f"{translation_indices}"
-        )
-    if composite_indices != list(range(len(composite))):
-        raise ValueError(
-            f"composite group_scan_index is not contiguous: "
-            f"{composite_indices}"
-        )
-
-    return (
-        [item[2] for item in translation],
-        [item[2] for item in composite],
-    )
-
 
 MODE_ALIASES = {
     "iterative": "iterative",
@@ -161,10 +66,6 @@ MODE_ALIASES = {
     "iterative_to_joint_nonlinear": "iterative_joint_nonlinear",
     "iterative_refit_nonlinear": "iterative_refit_nonlinear",
     "iterative_to_refit_nonlinear": "iterative_refit_nonlinear",
-    "closed": "closed",
-    "closed_to_iterative": "closed_to_iterative",
-    "closed_to_tieraive": "closed_to_iterative",
-    "closed_to_iteraive": "closed_to_iterative",
 }
 
 
@@ -183,8 +84,6 @@ class TrialResult:
     n_scans: int
     n_points: int
 
-    closed_translation_error_mm: float
-    closed_rotation_error_deg: float
     init_translation_error_mm: float
     init_rotation_error_deg: float
 
@@ -258,7 +157,7 @@ class IterationResult:
 
     ``iteration == 0`` is the explicit initial estimate for iterative modes.
     Subsequent rows correspond to ``calibrate_planes().T_history``.  The
-    closed-form-only mode contains a single final row.
+    Non-iterative modes contain a single final row.
     """
 
     trial_index: int
@@ -310,8 +209,6 @@ def _calibration_mode(text: str) -> str:
                 "iterative",
                 "iterative_joint_nonlinear",
                 "iterative_refit_nonlinear",
-                "closed",
-                "closed_to_iterative",
             )
         )
         raise argparse.ArgumentTypeError(f"invalid mode {text!r}; choose one of: {valid}")
@@ -330,12 +227,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="iterative",
         metavar=(
             "{iterative,iterative_joint_nonlinear,"
-            "iterative_refit_nonlinear,closed,"
-            "closed_to_iterative}"
+            "iterative_refit_nonlinear}"
         ),
         help=(
-            "iterative: existing alternating solver; closed: Tan 2025 closed-form; "
-            "closed_to_iterative: closed-form result used as iterative initialization; "
+            "iterative: existing alternating solver; "
             "iterative_joint_nonlinear: alternating result initializes a joint "
             "nonlinear refinement of SE(3), plane normals, and plane offsets; "
             "iterative_refit_nonlinear: alternating result initializes a "
@@ -666,13 +561,6 @@ def _extract_scans_by_plane(dataset: Any) -> dict[int, list[Any]]:
     return grouped
 
 
-def _extract_translation_composite_groups(
-    dataset: Any,
-) -> tuple[list[Any], list[Any]]:
-    """Split Tan motion groups strictly from explicit scan metadata tags."""
-    return _split_translation_composite_scans(_extract_all_scans(dataset))
-
-
 def _normalize(vector: Any) -> np.ndarray:
     value = np.asarray(vector, dtype=float).reshape(3)
     norm = float(np.linalg.norm(value))
@@ -895,60 +783,6 @@ def _generic_initial_guess(
     )
 
 
-def _extract_estimated_transform(result: Any) -> np.ndarray:
-    direct_names = (
-        "T_ef_s",
-        "T_ef_s_est",
-        "T_es",
-        "T_handeye",
-        "handeye",
-        "transform",
-        "T",
-    )
-    direct = _get_member(result, direct_names)
-    if direct is not None:
-        return _as_transform(direct, "closed-form estimate")
-
-    if isinstance(result, np.ndarray):
-        return _as_transform(result, "closed-form estimate")
-
-    if isinstance(result, (tuple, list)):
-        for item in result:
-            try:
-                return _extract_estimated_transform(item)
-            except (AttributeError, ValueError, TypeError):
-                continue
-
-    nested = _get_member(result, ("estimate", "result", "solution"))
-    if nested is not None and nested is not result:
-        return _extract_estimated_transform(nested)
-
-    raise AttributeError(
-        "Tan2025ClosedFormEstimator returned an object without a recognizable "
-        "4x4 hand-eye transform"
-    )
-
-
-def _invoke_closed_estimator(dataset: Any) -> np.ndarray:
-    """Build the estimator's real Tan2025Dataset from explicit motion tags."""
-    translation_scans, composite_scans = (
-        _extract_translation_composite_groups(dataset)
-    )
-
-    tan_dataset = Tan2025Dataset(
-        translation_scans=translation_scans,
-        composite_scans=composite_scans,
-        metadata={
-            "source": "calibration_dataset_collection",
-            "motion_group_source": "explicit_scan_tags",
-        },
-    )
-
-    estimator = Tan2025ClosedFormEstimator()
-    result = estimator.estimate(tan_dataset)
-    return _extract_estimated_transform(result)
-
-
 def _run_iterative(
     scans_by_plane: dict[int, list[Any]],
     T_init: np.ndarray,
@@ -1144,9 +978,6 @@ def _run_trial(
     )
 
     nan = float("nan")
-    T_closed: np.ndarray | None = None
-    closed_t_error = nan
-    closed_r_error = nan
     rank_last = -1
     condition_last = nan
     solver_result: Any | None = None
@@ -1180,59 +1011,7 @@ def _run_trial(
     nonlinear_plane_normals_json = ""
     nonlinear_plane_offsets_json = ""
 
-    if args.mode in {"closed", "closed_to_iterative"}:
-        if acquisition_mode != "translation_composite":
-            raise ValueError(
-                f"--mode {args.mode} requires acquisition_mode='translation_composite', "
-                f"got {acquisition_mode!r}"
-            )
-        T_closed = _invoke_closed_estimator(dataset)
-        closed_t_error, closed_r_error = _transform_errors(T_closed, T_true)
-
-    if args.mode == "closed":
-        assert T_closed is not None
-        T_init = T_closed.copy()
-        T_est = T_closed
-        init_t_error = closed_t_error
-        init_r_error = closed_r_error
-        converged = True
-        iterations = 0
-
-    elif args.mode == "closed_to_iterative":
-        assert T_closed is not None
-        T_init = T_closed.copy()
-        init_t_error = closed_t_error
-        init_r_error = closed_r_error
-        solver_result = _run_iterative(scans_by_plane, T_init, args)
-        T_est = np.asarray(solver_result.T_ef_s, dtype=float).reshape(4, 4)
-        rank_history = list(getattr(solver_result, "rank_history", []))
-        cond_history = list(getattr(solver_result, "cond_history", []))
-        converged = bool(getattr(solver_result, "converged", False))
-        iterations = int(
-            getattr(
-                solver_result,
-                "iterations",
-                len(getattr(solver_result, "T_history", [])),
-            )
-        )
-        rank_last = int(rank_history[-1]) if rank_history else -1
-        condition_last = (
-            float(cond_history[-1]) if cond_history else float("nan")
-        )
-        alternating_converged = converged
-        alternating_iterations = iterations
-        alternating_t_error, alternating_r_error = _transform_errors(
-            T_est,
-            T_true,
-        )
-        alternating_self_fit_rms = _self_fit_rms(scans_by_plane, T_est)
-        alternating_true_plane_rms = _true_plane_rms(
-            scans_by_plane,
-            T_est,
-            true_planes,
-        )
-
-    elif args.mode in {
+    if args.mode in {
         "iterative",
         "iterative_refit_nonlinear",
         "iterative_joint_nonlinear",
@@ -1432,8 +1211,6 @@ def _run_trial(
         n_planes=len(scans_by_plane),
         n_scans=n_scans,
         n_points=n_points,
-        closed_translation_error_mm=closed_t_error,
-        closed_rotation_error_deg=closed_r_error,
         init_translation_error_mm=init_t_error,
         init_rotation_error_deg=init_r_error,
         translation_error_mm=t_error,
@@ -1546,8 +1323,6 @@ def _failure_result(
         n_planes=0,
         n_scans=0,
         n_points=0,
-        closed_translation_error_mm=nan,
-        closed_rotation_error_deg=nan,
         init_translation_error_mm=nan,
         init_rotation_error_deg=nan,
         translation_error_mm=nan,
@@ -1726,13 +1501,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not acquisition_mode:
         raise SystemExit("collection.json does not contain acquisition_mode")
 
-    if args.mode in {"closed", "closed_to_iterative"}:
-        if acquisition_mode != "translation_composite":
-            raise SystemExit(
-                f"--mode {args.mode} requires a translation-composite dataset; "
-                f"collection acquisition_mode is {acquisition_mode!r}"
-            )
-
     entries = list(collection.get("trials", []))
     if args.only_trial is not None:
         entries = [
@@ -1758,7 +1526,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "iterative",
         "iterative_refit_nonlinear",
         "iterative_joint_nonlinear",
-        "closed_to_iterative",
     }:
         print(
             "[dataset-calibration] iterative solver fixed to "
@@ -1803,15 +1570,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.verbose or ordinal == len(entries) or ordinal % 5 == 0:
             status = "FAIL" if row.error_type else ("OK" if row.success else "MISS")
-            closed_text = (
-                f" closed_t={row.closed_translation_error_mm:.6g} mm"
-                if np.isfinite(row.closed_translation_error_mm)
-                else ""
-            )
             print(
                 f"[{ordinal:04d}/{len(entries):04d}] trial={trial_index:06d} "
                 f"{status} conv={row.converged} iter={row.iterations}"
-                f"{closed_text} final_t={row.translation_error_mm:.6g} mm "
+                f" final_t={row.translation_error_mm:.6g} mm "
                 f"final_r={row.rotation_error_deg:.6g} deg"
             )
             if row.nonlinear_refined:

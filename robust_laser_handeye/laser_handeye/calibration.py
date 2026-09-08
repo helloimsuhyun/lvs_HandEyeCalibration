@@ -8,7 +8,7 @@ import numpy as np
 from .data import LaserScan
 from .geometry import fit_plane_pca, scaled_normal_from_plane
 from .se3 import make_T, project_to_so3, transform_points
-
+from .nonlinear_refinement import refine_handeye_nonlinear
 
 PlaneOffsetMode = Literal["fitted", "joint", "difference"]
 
@@ -943,6 +943,49 @@ def calibrate_single_plane(
         max_translation_offset_condition=max_translation_offset_condition,
     )
 
+# iterative > nonlinear refine
+
+def calibrate_single_plane_with_nonlinear(
+    scans: list[LaserScan],
+    T_init: np.ndarray,
+    *,
+    max_iter: int = 100,
+    tol: float = 1e-9,
+    min_rank: int = 9,
+    plane_offset_mode: PlaneOffsetMode = "joint",
+    max_translation_offset_condition: float = 1e6,
+    plane_mode: str = "refit",
+    nonlinear_loss: str = "linear",
+    nonlinear_f_scale_mm: float = 1.0,
+    nonlinear_max_nfev: int = 200,
+    nonlinear_ftol: float = 1e-10,
+    nonlinear_xtol: float = 1e-10,
+    nonlinear_gtol: float = 1e-10,
+):
+
+    linear_result = calibrate_single_plane(
+        scans,
+        T_init=T_init,
+        max_iter=max_iter,
+        tol=tol,
+        min_rank=min_rank,
+        plane_offset_mode=plane_offset_mode,
+        max_translation_offset_condition=max_translation_offset_condition,
+    )
+
+    nonlinear_result = refine_handeye_nonlinear(
+        {0: scans},
+        T_init=linear_result.T_ef_s,
+        plane_mode=plane_mode,
+        loss=nonlinear_loss,
+        f_scale_mm=nonlinear_f_scale_mm,
+        max_nfev=nonlinear_max_nfev,
+        ftol=nonlinear_ftol,
+        xtol=nonlinear_xtol,
+        gtol=nonlinear_gtol,
+    )
+
+    return linear_result, nonlinear_result
 
 
 

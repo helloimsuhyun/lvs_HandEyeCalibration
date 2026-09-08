@@ -1,0 +1,83 @@
+# Legacy visualization config; uses the same corrected UR5e transform as the full model.
+# First run scripts/prepare_ur5e_visual.py to flatten the official UR xacro.
+robot:
+  urdf: ../build/ur5e_ljv7080_visual/ur5e_robot.urdf
+  # Existing project hand-eye convention is preserved: TCP means UR tool0 here.
+  tcp_link: tool0
+  package_roots:
+    # Resolved with: ros2 pkg prefix ur_description
+    ur_description: ros2://ur_description
+  use_collision_meshes: true
+  render_visual_meshes: true
+  visual_rgba: "0.72 0.76 0.82 1"
+  # UR5e joint order: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
+  home_qpos: [0.0, -1.570796327, 1.570796327, -1.570796327, -1.570796327, 0.0]
+  position_kp: 100.0
+  position_kv: 20.0
+
+sensor:
+  name: lj_v7080
+  # Use the shipped STL directly so this preview does not depend on the STEP file.
+  cad: ../assets/lj_v7080/LJ-V7080_3.stl
+  cad_units: mm
+  tessellation:
+    linear_deflection: 0.25
+    angular_deflection: 0.15
+  # Same Keyence CAD -> measurement-frame registration as the RB5 model.
+  frame:
+    origin_in_cad: [-52.6428785, -97.6682626, 12.7832449]
+    x_axis_in_cad: [0.0, 0.0, 1.0]
+    y_axis_in_cad: [1.0, 0.0, 0.0]
+    z_axis_in_cad: [0.0, 1.0, 0.0]
+  collision:
+    type: primitives
+    # Keep the visual preview's collision proxy identical to the planning model.
+    padding_m: 0.010
+    boxes:
+      - name: lj_v7080_head_collision
+        center_mm: [3.0, 36.0, 115.5]
+        half_size_mm: [21.0, 48.0, 35.5]
+    capsules:
+      - name: lj_v7080_connector_large
+        from_mm: [8.0, 84.0, 131.0]
+        to_mm: [8.0, 101.0, 131.0]
+        radius_mm: 10.0
+      - name: lj_v7080_connector_small
+        from_mm: [8.0, 101.0, 131.0]
+        to_mm: [8.0, 123.0, 131.0]
+        radius_mm: 8.5
+      - name: lj_v7080_cable_straight_1
+        from_mm: [8.0, 123.0, 131.0]
+        to_mm: [8.0, 157.0, 131.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_1
+        from_mm: [8.0, 157.0, 131.0]
+        to_mm: [8.0, 164.0, 128.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_bend_2
+        from_mm: [8.0, 164.0, 128.0]
+        to_mm: [8.0, 169.0, 122.0]
+        radius_mm: 4.2
+      - name: lj_v7080_cable_straight_2
+        from_mm: [8.0, 169.0, 122.0]
+        to_mm: [8.0, 169.0, 106.0]
+        radius_mm: 4.2
+
+handeye:
+  path: ur5e_tool0_sensor.json
+  # T_tcp_sensor means ^tool0 T_sensor for UR5e.
+  key: T_tcp_sensor
+  physical_key: T_sensor_physical
+  translation_units: mm
+
+scene:
+  timestep: 0.002
+  safety_margin_m: 0.005
+  # Render fixed frames that MuJoCo's URDF importer would otherwise collapse.
+  preview_frames: [flange, tool0]
+  frame_axis_length_m: 0.075
+  floor:
+    enabled: true
+
+output:
+  directory: ../build/ur5e_ljv7080_visual

@@ -62,15 +62,15 @@ def _dataset(*, channel_id_semantics: str = "stable_sensor_channel"):
     ]
     groups = [
         AcquisitionGroup(
-            group_id="translation",
+            group_id="primary_ring",
             acquisition_role="calibration",
-            motion_kind="pure_translation",
+            motion_kind="circular",
             plane_id=0,
         ),
         AcquisitionGroup(
-            group_id="composite",
-            acquisition_role="calibration",
-            motion_kind="composite",
+            group_id="reference_ring",
+            acquisition_role="reference",
+            motion_kind="circular_reference",
             plane_id=0,
         ),
         AcquisitionGroup(
@@ -96,10 +96,10 @@ def _dataset(*, channel_id_semantics: str = "stable_sensor_channel"):
     )
     return CalibrationDataset(
         scans=scans,
-        scan_group_ids=["translation", "composite", "bootstrap"],
+        scan_group_ids=["primary_ring", "reference_ring", "bootstrap"],
         sequence_indices=[0, 0, 0],
         groups=groups,
-        acquisition_mode="translation_composite",
+        acquisition_mode="single_plane_circular",
         source="simulation",
         profile_state="ideal",
         truth=truth,
@@ -141,12 +141,6 @@ def test_round_trip_preserves_ragged_profiles_channels_truth_and_adapters(tmp_pa
         include_excluded=True,
     )
     assert [scan.scan_id for scan in bootstrap[0]] == [30]
-
-    tan = loaded.to_tan2025_dataset()
-    assert [scan.scan_id for scan in tan.translation_scans] == [10]
-    assert [scan.scan_id for scan in tan.composite_scans] == [20]
-    assert tan.translation_scans[0].meta["motion_kind"] == "translation"
-
 
 def test_file_hash_detects_payload_corruption(tmp_path):
     manifest = save_calibration_dataset(_dataset(), tmp_path / "trial")
@@ -218,19 +212,13 @@ def test_missing_channel_ids_are_rejected():
         )
 
 
-def test_tan_adapter_rejects_per_scan_ordinal_channels():
-    dataset = _dataset(channel_id_semantics="per_scan_ordinal")
-    with pytest.raises(ValueError, match="stable_sensor_channel"):
-        dataset.to_tan2025_dataset()
-
-
 def test_adapters_follow_group_declaration_and_sequence_order_after_round_trip(
     tmp_path,
 ):
     source = _dataset()
     dataset = CalibrationDataset(
         scans=[source.scans[0], source.scans[1], source.scans[2]],
-        scan_group_ids=["translation", "composite", "translation"],
+        scan_group_ids=["primary_ring", "reference_ring", "primary_ring"],
         sequence_indices=[1, 0, 0],
         groups=source.groups,
         acquisition_mode=source.acquisition_mode,
@@ -241,37 +229,8 @@ def test_adapters_follow_group_declaration_and_sequence_order_after_round_trip(
     loaded_path = save_calibration_dataset(dataset, tmp_path / "ordered")
     loaded = load_calibration_dataset(loaded_path.parent)
     assert [group.group_id for group in loaded.groups] == [
-        "translation",
-        "composite",
+        "primary_ring",
+        "reference_ring",
         "bootstrap",
     ]
     assert [scan.scan_id for scan in loaded.to_scans_by_plane()[0]] == [30, 10, 20]
-
-
-def test_tan_auto_inference_ignores_groups_excluded_from_calibration():
-    source = _dataset()
-    groups = [
-        AcquisitionGroup(
-            group_id=group.group_id,
-            acquisition_role=group.acquisition_role,
-            motion_kind=group.motion_kind,
-            plane_id=group.plane_id,
-            include_in_calibration=(
-                False if group.group_id == "translation" else group.include_in_calibration
-            ),
-        )
-        for group in source.groups
-    ]
-    dataset = CalibrationDataset(
-        scans=source.scans,
-        scan_group_ids=source.scan_group_ids,
-        sequence_indices=source.sequence_indices,
-        groups=groups,
-        acquisition_mode=source.acquisition_mode,
-        source=source.source,
-        profile_state=source.profile_state,
-    )
-    with pytest.raises(ValueError, match="exactly one translation group"):
-        dataset.to_tan2025_dataset()
-    explicit = dataset.to_tan2025_dataset(translation_group="translation")
-    assert len(explicit.translation_scans) == 1

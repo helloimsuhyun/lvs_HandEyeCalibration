@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass
 from numbers import Integral
 from typing import Literal, Sequence
 
@@ -10,7 +10,7 @@ from ..data import LaserScan
 from ..patterns import scan_parameter_grid
 from ..pose_generation import sample_robot_pose_for_plane
 from ..scene_generation import make_three_planes, plane_basis
-from ..se3 import euler_xyz_deg, make_T
+from ..se3 import make_T
 from ..simulation import (
     PoseGeometry,
     generate_circular_pattern_scans,
@@ -18,22 +18,12 @@ from ..simulation import (
     sample_random_plane_pose,
     simulate_profile_on_plane,
 )
-from ..tan2025.simulation import (
-    AnalyticTan2025Simulator,
-    PaperSimulationConfig,
-    SensorNoiseConfig,
-    paper_handeye_transform,
-)
 from .models import (
     AcquisitionGroup,
     CalibrationDataset,
     CalibrationTruth,
     PlaneTruth,
 )
-
-
-HandEyePreset = Literal["random", "tan2025"]
-PlaneMode = Literal["fixed", "random"]
 
 
 @dataclass(frozen=True)
@@ -88,58 +78,9 @@ class GenerationSeeds:
 
 
 @dataclass(frozen=True)
-class TranslationCompositeGenerationConfig:
-    """Single-plane acquisition with pure-translation and composite groups."""
-
-    simulation: PaperSimulationConfig = field(default_factory=PaperSimulationConfig)
-    handeye_preset: HandEyePreset = "tan2025"
-    plane_mode: PlaneMode = "fixed"
-    plane_angle_range_deg: tuple[float, float] = (-30.0, 30.0)
-    plane_min_axis_angle_deg: float = 1.0
-    plane_distance_range_mm: tuple[float, float] = (350.0, 600.0)
-    plane_tangent_range_mm: tuple[float, float] = (-100.0, 100.0)
-
-    def __post_init__(self) -> None:
-        _validate_handeye_preset(self.handeye_preset)
-        if self.plane_mode not in ("fixed", "random"):
-            raise ValueError("plane_mode must be fixed or random")
-        _validate_closed_interval(
-            self.plane_angle_range_deg,
-            "plane_angle_range_deg",
-        )
-        _validate_closed_interval(
-            self.plane_distance_range_mm,
-            "plane_distance_range_mm",
-        )
-        _validate_closed_interval(
-            self.plane_tangent_range_mm,
-            "plane_tangent_range_mm",
-        )
-        if self.plane_distance_range_mm[0] <= 0.0:
-            raise ValueError("plane distances must be positive")
-        if (
-            not np.isfinite(self.plane_min_axis_angle_deg)
-            or not 0.0 <= self.plane_min_axis_angle_deg < 54.7356
-        ):
-            raise ValueError(
-                "plane_min_axis_angle_deg must lie in [0, 54.7356)"
-            )
-        noise = self.simulation.sensor_noise
-        if noise.mode != "none" or noise.magnitude_mm != 0.0:
-            raise ValueError("raw dataset generation requires sensor noise mode none")
-        if noise.dropout_probability != 0.0:
-            raise ValueError("raw dataset generation requires zero dropout")
-        if self.simulation.pose_translation_noise_std_mm != 0.0:
-            raise ValueError("raw dataset generation requires zero pose noise")
-        if self.simulation.pose_rotation_noise_std_deg != 0.0:
-            raise ValueError("raw dataset generation requires zero pose noise")
-
-
-@dataclass(frozen=True)
 class SinglePlaneCircularGenerationConfig:
     """Current optimal-benchmark circular pattern, stored without noise."""
 
-    handeye_preset: HandEyePreset = "random"
     profile_points: int = 100
     profile_half_width_mm: float = 25.0
     radius_mm: float = 100.0
@@ -159,7 +100,6 @@ class SinglePlaneCircularGenerationConfig:
     check_reachability: bool = False
 
     def __post_init__(self) -> None:
-        _validate_handeye_preset(self.handeye_preset)
         _validate_positive_integer(self.profile_points, "profile_points", minimum=3)
         _validate_positive(self.profile_half_width_mm, "profile_half_width_mm")
         _validate_positive(self.radius_mm, "radius_mm")
@@ -206,7 +146,6 @@ class SinglePlaneCircularGenerationConfig:
 class ThreePlaneGenerationConfig:
     """Existing three-orthogonal-plane random acquisition, stored without noise."""
 
-    handeye_preset: HandEyePreset = "random"
     poses_per_plane: int = 35
     profile_points: int = 100
     profile_half_width_mm: float = 25.0
@@ -218,7 +157,6 @@ class ThreePlaneGenerationConfig:
     max_trials_per_plane: int = 50_000
 
     def __post_init__(self) -> None:
-        _validate_handeye_preset(self.handeye_preset)
         _validate_positive_integer(self.poses_per_plane, "poses_per_plane")
         _validate_positive_integer(self.profile_points, "profile_points", minimum=3)
         _validate_positive(self.profile_half_width_mm, "profile_half_width_mm")
@@ -245,11 +183,6 @@ class ThreePlaneGenerationConfig:
         )
 
 
-def _validate_handeye_preset(value: str) -> None:
-    if value not in ("random", "tan2025"):
-        raise ValueError("handeye_preset must be random or tan2025")
-
-
 def _validate_positive_integer(value: int, name: str, minimum: int = 1) -> None:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer")
@@ -270,14 +203,6 @@ def _validate_range(value: Sequence[float], name: str) -> None:
         raise ValueError(f"{name} must be increasing")
 
 
-def _validate_closed_interval(value: Sequence[float], name: str) -> None:
-    values = np.asarray(value, dtype=float)
-    if values.shape != (2,) or not np.all(np.isfinite(values)):
-        raise ValueError(f"{name} must contain two finite values")
-    if values[1] < values[0]:
-        raise ValueError(f"{name} must be non-decreasing")
-
-
 def _validate_nonempty_finite(
     value: Sequence[float],
     name: str,
@@ -291,69 +216,9 @@ def _validate_nonempty_finite(
         raise ValueError(f"{name} values must be positive")
 
 
-def _sample_handeye(preset: HandEyePreset, seed: int) -> np.ndarray:
-    if preset == "tan2025":
-        return paper_handeye_transform()
+def _sample_handeye(seed: int) -> np.ndarray:
     transform, _, _ = sample_random_handeye(np.random.default_rng(seed))
     return transform
-
-
-def _angle_to_nearest_base_axis_deg(normal: np.ndarray) -> float:
-    normal = np.asarray(normal, dtype=float).reshape(3)
-    normal /= np.linalg.norm(normal)
-    nearest_cosine = float(np.clip(np.max(np.abs(normal)), 0.0, 1.0))
-    return float(np.degrees(np.arccos(nearest_cosine)))
-
-
-def _translation_plane_for_trial(
-    config: TranslationCompositeGenerationConfig,
-    environment_seed: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
-    """Resolve one plane shared by both motion groups in a trial."""
-    if config.plane_mode == "fixed":
-        return (
-            np.asarray(config.simulation.plane_normal_base, dtype=float).copy(),
-            np.asarray(config.simulation.plane_center_base_mm, dtype=float).copy(),
-            {"plane_mode": "fixed"},
-        )
-
-    rng = np.random.default_rng(environment_seed)
-    angle_min, angle_max = config.plane_angle_range_deg
-    for attempt in range(1, 10_001):
-        angles_deg = rng.uniform(angle_min, angle_max, size=3)
-        rotation = euler_xyz_deg(*angles_deg)
-        normal = np.asarray(rotation[:, 2], dtype=float)
-        normal /= np.linalg.norm(normal)
-        axis_angle_deg = _angle_to_nearest_base_axis_deg(normal)
-        if axis_angle_deg < config.plane_min_axis_angle_deg:
-            continue
-
-        distance_mm = float(rng.uniform(*config.plane_distance_range_mm))
-        tangent_coordinates = rng.uniform(
-            *config.plane_tangent_range_mm,
-            size=2,
-        )
-        u_axis, v_axis = plane_basis(normal)
-        center = (
-            distance_mm * normal
-            + float(tangent_coordinates[0]) * u_axis
-            + float(tangent_coordinates[1]) * v_axis
-        )
-        return normal, center, {
-            "plane_mode": "random",
-            "sampling_attempts": attempt,
-            "normal_sampling_euler_xyz_deg": angles_deg.tolist(),
-            "nearest_base_axis_angle_deg": axis_angle_deg,
-            "distance_mm": distance_mm,
-            "tangent_coordinates_mm": tangent_coordinates.tolist(),
-        }
-
-    raise RuntimeError(
-        "failed to sample a translation-composite plane satisfying the "
-        "angle range and base-axis constraint after 10000 attempts; "
-        f"angle_range_deg={config.plane_angle_range_deg}, "
-        f"min_axis_angle_deg={config.plane_min_axis_angle_deg}"
-    )
 
 
 def _jsonable(value: object) -> object:
@@ -372,7 +237,6 @@ def _config_metadata_without_truth(config: object) -> dict[str, object]:
     payload = _jsonable(asdict(config))
     if not isinstance(payload, dict):
         raise RuntimeError("generation config must serialize to a dictionary")
-    payload.pop("handeye_preset", None)
     simulation = payload.get("simulation")
     if isinstance(simulation, dict):
         simulation.pop("T_ef_s_true", None)
@@ -467,134 +331,11 @@ def _dataset(
     )
 
 
-def generate_translation_composite_dataset(
-    config: TranslationCompositeGenerationConfig,
-    seeds: GenerationSeeds,
-) -> CalibrationDataset:
-    true_handeye = _sample_handeye(config.handeye_preset, seeds.handeye_seed)
-    plane_normal, plane_center, plane_truth_metadata = (
-        _translation_plane_for_trial(config, seeds.environment_seed)
-    )
-    simulation_config = replace(
-        config.simulation,
-        T_ef_s_true=true_handeye,
-        plane_normal_base=plane_normal,
-        plane_center_base_mm=tuple(plane_center.tolist()),
-        sensor_noise=SensorNoiseConfig(),
-        pose_translation_noise_std_mm=0.0,
-        pose_rotation_noise_std_deg=0.0,
-    )
-    simulated = AnalyticTan2025Simulator(simulation_config).generate(
-        seed=None,
-        rng=np.random.default_rng(seeds.motion_seed),
-    )
-    groups = (
-        AcquisitionGroup(
-            group_id="translation",
-            acquisition_role="calibration",
-            motion_kind="pure_translation",
-            plane_id=0,
-            include_in_calibration=True,
-        ),
-        AcquisitionGroup(
-            group_id="composite",
-            acquisition_role="calibration",
-            motion_kind="composite",
-            plane_id=0,
-            include_in_calibration=True,
-        ),
-    )
-    truth = CalibrationTruth(
-        T_ef_s_true=true_handeye,
-        planes=(
-            PlaneTruth(
-                plane_id=0,
-                normal_base=simulated.truth.plane_normal_base,
-                offset_mm=simulated.truth.plane_offset_mm,
-                T_base_plane=_canonical_plane_transform_at_point(
-                    simulated.truth.plane_normal_base,
-                    plane_center,
-                ),
-            ),
-        ),
-        metadata={
-            "handeye_preset": config.handeye_preset,
-            "plane": plane_truth_metadata,
-        },
-    )
-    half_angle = np.radians(simulation_config.scan_angle_deg * 0.5)
-    ray_angles = np.linspace(
-        -half_angle,
-        half_angle,
-        simulation_config.num_profile_points,
-    )
-    environment_metadata = _jsonable(simulated.dataset.metadata)
-    if not isinstance(environment_metadata, dict):
-        raise RuntimeError("simulator metadata must be a dictionary")
-    paper_defaults = PaperSimulationConfig()
-    environment_metadata["disclosed_by_paper"] = {
-        "num_profile_points": paper_defaults.num_profile_points,
-        "scan_angle_deg": paper_defaults.scan_angle_deg,
-        "sensor_z_range_mm": [
-            paper_defaults.sensor_z_min_mm,
-            paper_defaults.sensor_z_max_mm,
-        ],
-        "paper_reports_a_handeye_transform": True,
-        "paper_reports_a_plane_normal": True,
-    }
-    environment_metadata["effective_simulation_parameters"] = {
-        "plane_mode": config.plane_mode,
-        "num_profile_points": simulation_config.num_profile_points,
-        "scan_angle_deg": simulation_config.scan_angle_deg,
-        "sensor_z_range_mm": [
-            simulation_config.sensor_z_min_mm,
-            simulation_config.sensor_z_max_mm,
-        ],
-    }
-    environment_metadata["plane_sampling"] = {
-        "mode": config.plane_mode,
-        "shared_by_motion_groups": ["translation", "composite"],
-        "random_distribution": (
-            "Euler XYZ box; induced normal is not uniform on the sphere"
-            if config.plane_mode == "random"
-            else None
-        ),
-    }
-    implementation_choices = environment_metadata.get(
-        "implementation_choices_not_disclosed_by_paper"
-    )
-    if isinstance(implementation_choices, dict):
-        implementation_choices.pop("plane_center_base_mm", None)
-    return _dataset(
-        grouped_scans=(
-            ("translation", simulated.dataset.translation_scans),
-            ("composite", simulated.dataset.composite_scans),
-        ),
-        groups=groups,
-        acquisition_mode="translation_composite",
-        truth=truth,
-        seeds=seeds,
-        metadata={
-            "generator": "analytic_plane_ray_translation_composite",
-            "generator_config": _config_metadata_without_truth(config),
-            "environment": environment_metadata,
-            "profile_model": {
-                "parameterization": "unit rays [sin(theta), 0, cos(theta)]",
-                "ray_angles_rad": ray_angles.tolist(),
-                "sensor_z_range_mm": [
-                    simulation_config.sensor_z_min_mm,
-                    simulation_config.sensor_z_max_mm,
-                ],
-            },
-        },
-    )
-
-
 def generate_single_plane_circular_dataset(
     config: SinglePlaneCircularGenerationConfig,
     seeds: GenerationSeeds,
 ) -> CalibrationDataset:
-    true_handeye = _sample_handeye(config.handeye_preset, seeds.handeye_seed)
+    true_handeye = _sample_handeye(seeds.handeye_seed)
     environment_rng = np.random.default_rng(seeds.environment_seed)
     motion_rng = np.random.default_rng(seeds.motion_seed)
     plane_R, plane_t, plane_n, plane_l, _plane_angles = sample_random_plane_pose(
@@ -709,7 +450,7 @@ def generate_single_plane_circular_dataset(
                 ),
             ),
         ),
-        metadata={"handeye_preset": config.handeye_preset},
+        metadata={"handeye_source": "random"},
     )
     return _dataset(
         grouped_scans=grouped_scans,
@@ -769,7 +510,7 @@ def generate_three_plane_dataset(
     config: ThreePlaneGenerationConfig,
     seeds: GenerationSeeds,
 ) -> CalibrationDataset:
-    true_handeye = _sample_handeye(config.handeye_preset, seeds.handeye_seed)
+    true_handeye = _sample_handeye(seeds.handeye_seed)
     environment_rng = np.random.default_rng(seeds.environment_seed)
     motion_rng = np.random.default_rng(seeds.motion_seed)
     planes = make_three_planes(
@@ -855,7 +596,7 @@ def generate_three_plane_dataset(
             )
             for plane_id, (normal, offset) in enumerate(planes)
         ),
-        metadata={"handeye_preset": config.handeye_preset},
+        metadata={"handeye_source": "random"},
     )
     return _dataset(
         grouped_scans=grouped_scans,
@@ -877,12 +618,8 @@ def generate_three_plane_dataset(
 
 __all__ = [
     "GenerationSeeds",
-    "HandEyePreset",
-    "PlaneMode",
     "SinglePlaneCircularGenerationConfig",
     "ThreePlaneGenerationConfig",
-    "TranslationCompositeGenerationConfig",
     "generate_single_plane_circular_dataset",
     "generate_three_plane_dataset",
-    "generate_translation_composite_dataset",
 ]

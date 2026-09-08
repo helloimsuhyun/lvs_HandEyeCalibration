@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur5e_laser">
+  <!--
+    UR5e + Keyence LJ-V7080 model used by MoveIt.
+
+    Hand-eye convention used by the application:
+      ^tool0 T_sensor =
+        [-1  0  0    0 mm ]
+        [ 0  1  0    0 mm ]
+        [ 0  0 -1  151 mm ]
+        [ 0  0  0    1    ]
+
+      ^sensor T_physical = Trans(0, 0, +80 mm)
+
+    The official UR model has the fixed axis relationship
+      +Z_tool0 = +X_flange
+      +X_tool0 = +Y_flange
+      +Y_tool0 = +Z_flange
+
+    Therefore the same physical mounting is encoded here directly as
+      ^flange p_sensor = [151, 0, 0] mm
+      ^flange R_sensor = RPY(+90 deg, 0, -90 deg)
+
+    This keeps the physical attachment expressed from `flange`, while the
+    application may continue to store T_tcp_sensor with `tcp == tool0`.
+  -->
+
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+
+  <xacro:arg name="kinematics_parameters_file"
+             default="$(find ur_description)/config/ur5e/default_kinematics.yaml"/>
+
+  <link name="world"/>
+
+  <xacro:ur_robot
+      name="ur5e"
+      tf_prefix=""
+      parent="world"
+      joint_limits_parameters_file="$(find ur_description)/config/ur5e/joint_limits.yaml"
+      kinematics_parameters_file="$(arg kinematics_parameters_file)"
+      physical_parameters_file="$(find ur_description)/config/ur5e/physical_parameters.yaml"
+      visual_parameters_file="$(find ur_description)/config/ur5e/visual_parameters.yaml"
+      ur_type="ur5e"
+      generate_ros2_control_tag="false">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:ur_robot>
+
+  <!-- Sensor measurement frame S. The CAD visual is registered to S using
+       the same transform already validated on the RB5/MuJoCo model. -->
+  <link name="sensor_measurement_frame">
+    <visual name="lj_v7080_visual">
+      <origin xyz="-0.0127832449 0.0526428785 0.0976682626"
+              rpy="1.57079632679 0 1.57079632679"/>
+      <geometry>
+        <mesh filename="package://ur5e_laser_moveit_config/meshes/LJ-V7080_3.stl"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="sensor_dark">
+        <color rgba="0.16 0.20 0.24 0.95"/>
+      </material>
+    </visual>
+
+    <!-- Collision proxies use the same 10 mm static mounting/model allowance
+         as the MuJoCo sensor configuration. Keep physical dimensions and the
+         padding explicit so the safety allowance remains auditable. -->
+    <xacro:property name="sensor_collision_padding" value="0.010"/>
+    <collision name="lj_v7080_head_collision">
+      <origin xyz="0.003 0.036 0.1155" rpy="0 0 0"/>
+      <geometry><box size="${0.042 + 2.0 * sensor_collision_padding} ${0.096 + 2.0 * sensor_collision_padding} ${0.071 + 2.0 * sensor_collision_padding}"/></geometry>
+    </collision>
+    <collision name="lj_v7080_connector_large">
+      <origin xyz="0.008 0.0925 0.131" rpy="-1.57079632679 -1.57079632679 0"/>
+      <geometry><cylinder radius="${0.010 + sensor_collision_padding}" length="0.017"/></geometry>
+    </collision>
+    <collision name="lj_v7080_connector_small">
+      <origin xyz="0.008 0.112 0.131" rpy="-1.57079632679 -1.57079632679 0"/>
+      <geometry><cylinder radius="${0.0085 + sensor_collision_padding}" length="0.022"/></geometry>
+    </collision>
+    <collision name="lj_v7080_cable_straight_1">
+      <origin xyz="0.008 0.14 0.131" rpy="-1.57079632679 -1.57079632679 0"/>
+      <geometry><cylinder radius="${0.0042 + sensor_collision_padding}" length="0.034"/></geometry>
+    </collision>
+    <collision name="lj_v7080_cable_bend_1">
+      <origin xyz="0.008 0.1605 0.1295" rpy="1.97568811308 0 3.14159265359"/>
+      <geometry><cylinder radius="${0.0042 + sensor_collision_padding}" length="0.00761577310586"/></geometry>
+    </collision>
+    <collision name="lj_v7080_cable_bend_2">
+      <origin xyz="0.008 0.1665 0.125" rpy="2.44685437739 0 3.14159265359"/>
+      <geometry><cylinder radius="${0.0042 + sensor_collision_padding}" length="0.00781024967591"/></geometry>
+    </collision>
+    <collision name="lj_v7080_cable_straight_2">
+      <origin xyz="0.008 0.169 0.114" rpy="3.14159265359 0 3.14159265359"/>
+      <geometry><cylinder radius="${0.0042 + sensor_collision_padding}" length="0.016"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="flange_to_sensor_measurement" type="fixed">
+    <parent link="flange"/>
+    <child link="sensor_measurement_frame"/>
+    <origin xyz="0.151 0 0" rpy="1.57079632679 0 -1.57079632679"/>
+  </joint>
+
+  <!-- P is the physical reference point used by pose generation/planning. -->
+  <link name="sensor_physical_origin"/>
+  <joint name="sensor_measurement_to_physical" type="fixed">
+    <parent link="sensor_measurement_frame"/>
+    <child link="sensor_physical_origin"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+  </joint>
+</robot>

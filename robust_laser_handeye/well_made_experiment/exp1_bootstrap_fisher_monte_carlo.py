@@ -1,0 +1,1678 @@
+#!/usr/bin/env python3
+"""
+Monte-Carlo comparison of four single-plane active calibration strategies.
+
+The experiment isolates two factors:
+
+    BOOTSTRAP
+        OPT12   : the Jacobian-derived 12-pose pattern from exp1_optimal.py
+        RAND12  : 12 random feasible poses from the same pose domain
+
+    CONTINUATION
+        FISHER  : online D-optimal Fisher selection
+        RANDOM  : a fixed random continuation order
+
+Four branches are therefore compared within every trial:
+
+    OPT12+FISHER
+    OPT12+RANDOM
+    RAND12+FISHER
+    RAND12+RANDOM
+
+Fairness within a trial
+-----------------------
+All four branches share:
+    - the same GT hand-eye transform
+    - the same initial hand-eye estimate
+    - the same physical plane
+    - the same continuation candidate bank
+    - the same noisy measurement for a given continuation candidate
+    - the same random continuation order for the two RANDOM branches
+
+The two OPT12 branches share exactly the same optimized bootstrap scans.
+The two RAND12 branches share exactly the same random bootstrap scans.
+The bootstrap noise seeds are paired scan-by-scan between OPT12 and RAND12.
+
+The Fisher policy is causal: candidate information is predicted only from the
+currently estimated hand-eye/plane state and the candidate robot pose.  The
+future noisy profile is acquired only after the candidate has been selected.
+
+D-optimal objective
+-------------------
+Selection maximizes
+
+    0.5 * log det(H_handeye_marginal)
+
+where plane parameters are Schur-marginalized from the joint observed Fisher
+information.  This is the d_optimal objective implemented by active_fisher.py.
+
+Pose domain for RAND12 and the continuation candidate bank
+-----------------------------------------------------------
+To keep the comparison aligned with the 12-pose design:
+    - UV center lies on the same radius-100-mm circle
+    - circle angle psi is uniform on [0, 360) deg
+    - tilt is uniform on [5, 40] deg
+    - distance is uniform on [60, 120] mm
+    - beta (view azimuth) is uniform on [0, 360) deg
+    - physical laser scan line is radial at the chosen UV center
+
+Outputs
+-------
+    trajectories.csv
+        One row per trial / method / scan count.
+
+    summary_by_scan.csv
+        Monte-Carlo median/IQR D-optimal score, translation/rotation error,
+        estimator/accuracy success rate for every scan count.
+
+    final_comparison.csv
+        Final-scan comparison and paired D-optimal advantage over RAND12+RANDOM.
+
+    d_optimal_vs_scan_count.png
+    d_optimal_advantage_vs_random_random.png
+    translation_error_vs_scan_count.png
+    rotation_error_vs_scan_count.png
+    accuracy_success_vs_scan_count.png
+
+Example
+-------
+PYTHONPATH=. python \
+  robust_laser_handeye/well_made_experiment/exp1_bootstrap_fisher_monte_carlo.py \
+  --trials 100 \
+  --total-scans 30 \
+  --candidate-pool-size 120
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+from typing import Iterable
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from robust_laser_handeye.laser_handeye.active_fisher import (
+    JointCalibrationEstimate,
+    estimate_joint_calibration,
+    fisher_objective_value,
+    predicted_candidate_information,
+)
+from robust_laser_handeye.laser_handeye.data import LaserScan
+from robust_laser_handeye.laser_handeye.simulation import sample_random_handeye
+from robust_laser_handeye.well_made_experiment import exp1_optimal as exp1
+
+
+# =============================================================================
+# Experiment labels
+# =============================================================================
+
+METHODS = (
+    "OPT12+FISHER",
+    "OPT12+RANDOM",
+    "RAND12+FISHER",
+    "RAND12+RANDOM",
+)
+
+BASELINE_METHOD = "RAND12+RANDOM"
+BOOTSTRAP_SCAN_COUNT = 12
+FISHER_OBJECTIVE = "d_optimal"
+
+
+# =============================================================================
+# Default geometry / estimation settings
+# =============================================================================
+
+DEFAULT_TRIALS = 100
+DEFAULT_TOTAL_SCANS = 30
+DEFAULT_CANDIDATE_POOL_SIZE = 120
+DEFAULT_SEED = 20260901
+
+DEFAULT_MEASUREMENT_NOISE_STD_MM = 0.25
+DEFAULT_NOISE_AXIS = "xz"
+
+DEFAULT_INIT_TRANSLATION_MM = 100.0
+DEFAULT_INIT_ROTATION_DEG = 15.0
+
+# Fixed coordinate scales used only to nondimensionalize the Fisher state.
+# They are NOT an information prior.
+DEFAULT_FISHER_ROTATION_SCALE_DEG = 2.0
+DEFAULT_FISHER_TRANSLATION_SCALE_MM = 10.0
+DEFAULT_FISHER_PLANE_NORMAL_SCALE_DEG = 20.0
+DEFAULT_FISHER_PLANE_OFFSET_SCALE_MM = 100.0
+
+DEFAULT_ESTIMATOR_MAX_ITERATIONS = 60
+DEFAULT_ESTIMATOR_TOLERANCE = 1e-7
+
+# Random pose domain.  These match the span of the optimized design.
+DEFAULT_TILT_RANGE_DEG = (5.0, 40.0)
+DEFAULT_DISTANCE_RANGE_MM = (60.0, 120.0)
+DEFAULT_BETA_RANGE_DEG = (0.0, 360.0)
+
+# Feasibility range for the ideal profile generated by a random action.
+# The 5/40 deg and 60/120 mm design can reach roughly 40 mm at one edge,
+# so this is intentionally wider than the center-distance range.
+DEFAULT_PROFILE_DEPTH_RANGE_MM = (30.0, 150.0)
+
+GT_TRANSLATION_COMPONENT_RANGE_MM = (-100.0, 200.0)
+GT_EULER_COMPONENT_RANGE_DEG = (-180.0, 180.0)
+
+ACCURACY_TRANSLATION_THRESHOLD_MM = 1.0
+ACCURACY_ROTATION_THRESHOLD_DEG = 0.25
+
+
+# =============================================================================
+# Data classes
+# =============================================================================
+
+@dataclass(frozen=True)
+class CandidatePose:
+    candidate_id: int
+
+    target_u_mm: float
+    target_v_mm: float
+    psi_deg: float
+
+    tilt_deg: float
+    distance_mm: float
+    beta_deg: float
+    alpha_deg: float
+
+    T_base_s: np.ndarray
+    T_base_ef: np.ndarray
+
+
+@dataclass(frozen=True)
+class TrajectoryRow:
+    trial: int
+    method: str
+
+    bootstrap: str
+    continuation: str
+
+    scan_count: int
+    stage: str
+
+    selected_candidate_id: int
+    selected_psi_deg: float
+    selected_tilt_deg: float
+    selected_distance_mm: float
+    selected_beta_deg: float
+
+    estimator_success: bool
+    estimator_converged: bool
+    data_rank: int
+
+    d_optimal_half_logdet: float
+    marginal_logdet: float
+
+    translation_error_mm: float
+    rotation_error_deg: float
+    accuracy_success: bool
+
+    error_message: str
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def finite_range(values: Iterable[float], name: str) -> tuple[float, float]:
+    lower, upper = map(float, values)
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+        raise ValueError(f"invalid {name}: {(lower, upper)}")
+    return lower, upper
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Monte-Carlo OPT12/RAND12 bootstrap x D-optimal/random "
+            "continuation comparison."
+        )
+    )
+
+    parser.add_argument("--trials", type=positive_int, default=DEFAULT_TRIALS)
+    parser.add_argument("--total-scans", type=positive_int, default=DEFAULT_TOTAL_SCANS)
+    parser.add_argument(
+        "--candidate-pool-size",
+        type=positive_int,
+        default=DEFAULT_CANDIDATE_POOL_SIZE,
+    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs/exp1_bootstrap_fisher_monte_carlo"),
+    )
+
+    parser.add_argument(
+        "--measurement-noise-std-mm",
+        type=float,
+        default=DEFAULT_MEASUREMENT_NOISE_STD_MM,
+    )
+    parser.add_argument(
+        "--noise-axis",
+        choices=("z", "xz"),
+        default=DEFAULT_NOISE_AXIS,
+    )
+
+    parser.add_argument(
+        "--init-translation-mm",
+        type=float,
+        default=DEFAULT_INIT_TRANSLATION_MM,
+    )
+    parser.add_argument(
+        "--init-rotation-deg",
+        type=float,
+        default=DEFAULT_INIT_ROTATION_DEG,
+    )
+
+    parser.add_argument(
+        "--fisher-rotation-scale-deg",
+        type=float,
+        default=DEFAULT_FISHER_ROTATION_SCALE_DEG,
+    )
+    parser.add_argument(
+        "--fisher-translation-scale-mm",
+        type=float,
+        default=DEFAULT_FISHER_TRANSLATION_SCALE_MM,
+    )
+    parser.add_argument(
+        "--fisher-plane-normal-scale-deg",
+        type=float,
+        default=DEFAULT_FISHER_PLANE_NORMAL_SCALE_DEG,
+    )
+    parser.add_argument(
+        "--fisher-plane-offset-scale-mm",
+        type=float,
+        default=DEFAULT_FISHER_PLANE_OFFSET_SCALE_MM,
+    )
+
+    parser.add_argument(
+        "--estimator-max-iterations",
+        type=positive_int,
+        default=DEFAULT_ESTIMATOR_MAX_ITERATIONS,
+    )
+    parser.add_argument(
+        "--estimator-tolerance",
+        type=float,
+        default=DEFAULT_ESTIMATOR_TOLERANCE,
+    )
+
+    parser.add_argument(
+        "--tilt-range-deg",
+        type=float,
+        nargs=2,
+        default=DEFAULT_TILT_RANGE_DEG,
+    )
+    parser.add_argument(
+        "--distance-range-mm",
+        type=float,
+        nargs=2,
+        default=DEFAULT_DISTANCE_RANGE_MM,
+    )
+    parser.add_argument(
+        "--beta-range-deg",
+        type=float,
+        nargs=2,
+        default=DEFAULT_BETA_RANGE_DEG,
+    )
+    parser.add_argument(
+        "--profile-depth-range-mm",
+        type=float,
+        nargs=2,
+        default=DEFAULT_PROFILE_DEPTH_RANGE_MM,
+    )
+
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Also show plots interactively.",
+    )
+
+    args = parser.parse_args()
+
+    if args.total_scans < BOOTSTRAP_SCAN_COUNT:
+        parser.error(
+            f"--total-scans must be >= {BOOTSTRAP_SCAN_COUNT}"
+        )
+
+    continuation_count = args.total_scans - BOOTSTRAP_SCAN_COUNT
+    if args.candidate_pool_size < continuation_count:
+        parser.error(
+            "--candidate-pool-size must be at least total-scans - 12"
+        )
+
+    positive_floats = {
+        "--measurement-noise-std-mm": args.measurement_noise_std_mm,
+        "--init-translation-mm": args.init_translation_mm,
+        "--init-rotation-deg": args.init_rotation_deg,
+        "--fisher-rotation-scale-deg": args.fisher_rotation_scale_deg,
+        "--fisher-translation-scale-mm": args.fisher_translation_scale_mm,
+        "--fisher-plane-normal-scale-deg": args.fisher_plane_normal_scale_deg,
+        "--fisher-plane-offset-scale-mm": args.fisher_plane_offset_scale_mm,
+        "--estimator-tolerance": args.estimator_tolerance,
+    }
+    for name, value in positive_floats.items():
+        if not np.isfinite(value) or value <= 0.0:
+            parser.error(f"{name} must be positive and finite")
+
+    try:
+        args.tilt_range_deg = finite_range(args.tilt_range_deg, "tilt range")
+        args.distance_range_mm = finite_range(
+            args.distance_range_mm, "distance range"
+        )
+        args.beta_range_deg = finite_range(args.beta_range_deg, "beta range")
+        args.profile_depth_range_mm = finite_range(
+            args.profile_depth_range_mm, "profile depth range"
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    return args
+
+
+# =============================================================================
+# Plane / profile geometry
+# =============================================================================
+
+def make_frame():
+    return exp1.make_plane_frame(
+        normal=exp1.PLANE_NORMAL,
+        board_center=exp1.BOARD_CENTER,
+    )
+
+
+def robot_pose_from_sensor_pose(
+    T_base_s: np.ndarray,
+    T_ef_s_true: np.ndarray,
+) -> np.ndarray:
+    return (
+        np.asarray(T_base_s, dtype=float).reshape(4, 4)
+        @ np.linalg.inv(np.asarray(T_ef_s_true, dtype=float).reshape(4, 4))
+    )
+
+
+def ideal_profile_points(
+    frame,
+    T_base_s: np.ndarray,
+) -> np.ndarray:
+    """Exact X-Z laser profile of the true plane in sensor coordinates."""
+    transform = np.asarray(T_base_s, dtype=float).reshape(4, 4)
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+
+    normal = np.asarray(frame.n, dtype=float).reshape(3)
+    offset = float(frame.offset_mm)
+
+    normal_sensor = rotation.T @ normal
+    denominator = float(normal_sensor[2])
+    if abs(denominator) <= 1e-10:
+        raise ValueError("profile ray is nearly parallel to the plane")
+
+    x_values = np.asarray(exp1.X_VALUES, dtype=float).reshape(-1)
+    rhs = float(offset - normal @ translation)
+    z_values = (rhs - normal_sensor[0] * x_values) / denominator
+
+    if np.any(~np.isfinite(z_values)):
+        raise ValueError("non-finite ideal profile")
+
+    return np.column_stack(
+        [
+            x_values,
+            np.zeros_like(x_values),
+            z_values,
+        ]
+    )
+
+
+def profile_is_feasible(
+    frame,
+    T_base_s: np.ndarray,
+    depth_range_mm: tuple[float, float],
+) -> bool:
+    try:
+        points = ideal_profile_points(frame, T_base_s)
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+        return False
+
+    depth_min, depth_max = depth_range_mm
+    z_values = points[:, 2]
+    return bool(
+        float(np.min(z_values)) >= depth_min
+        and float(np.max(z_values)) <= depth_max
+    )
+
+
+def noisy_scan_from_pose(
+    pose: CandidatePose,
+    frame,
+    *,
+    noise_std_mm: float,
+    noise_axis: str,
+    noise_seed: int,
+    scan_id: int,
+    source: str,
+) -> LaserScan:
+    points = ideal_profile_points(frame, pose.T_base_s).copy()
+    rng = np.random.default_rng(int(noise_seed))
+
+    if noise_axis == "z":
+        points[:, 2] += rng.normal(
+            loc=0.0,
+            scale=noise_std_mm,
+            size=len(points),
+        )
+    elif noise_axis == "xz":
+        noise = rng.normal(
+            loc=0.0,
+            scale=noise_std_mm,
+            size=(len(points), 2),
+        )
+        points[:, 0] += noise[:, 0]
+        points[:, 2] += noise[:, 1]
+    else:
+        raise ValueError("noise_axis must be 'z' or 'xz'")
+
+    return LaserScan(
+        T_base_ef=np.asarray(pose.T_base_ef, dtype=float).reshape(4, 4).copy(),
+        points_s=points,
+        plane_id=0,
+        scan_id=int(scan_id),
+        meta={
+            "source": source,
+            "candidate_id": int(pose.candidate_id),
+            "target_u_mm": float(pose.target_u_mm),
+            "target_v_mm": float(pose.target_v_mm),
+            "psi_deg": float(pose.psi_deg),
+            "tilt_deg": float(pose.tilt_deg),
+            "distance_mm": float(pose.distance_mm),
+            "beta_deg": float(pose.beta_deg),
+            "alpha_deg": float(pose.alpha_deg),
+            "noise_seed": int(noise_seed),
+        },
+    )
+
+
+# =============================================================================
+# OPT12 bootstrap
+# =============================================================================
+
+def build_optimal_bootstrap_poses(
+    frame,
+    T_ef_s_true: np.ndarray,
+) -> list[CandidatePose]:
+    uv = exp1.circular_uv_points(
+        radius_mm=exp1.RADIUS_MM,
+        N=exp1.N,
+    )
+
+    target_points = exp1.plane_uv_to_base_points(
+        uv=uv,
+        target_center_base_mm=exp1.BOARD_CENTER,
+        frame=frame,
+    )
+
+    support_ids = exp1.make_support_ids()
+    beta = exp1.make_optimal_beta(support_ids)
+
+    params = exp1.make_scan_pose_parameters(
+        uv=uv,
+        beta_deg=beta,
+    )
+
+    sensor_poses = exp1.make_sensor_poses(
+        pose_params=params,
+        target_points_base=target_points,
+        frame=frame,
+    )
+
+    poses: list[CandidatePose] = []
+    for index, (param, T_base_s) in enumerate(zip(params, sensor_poses)):
+        poses.append(
+            CandidatePose(
+                candidate_id=index,
+                target_u_mm=float(param.target_u_mm),
+                target_v_mm=float(param.target_v_mm),
+                psi_deg=float(param.scanline_azimuth_deg),
+                tilt_deg=float(param.tilt_deg),
+                distance_mm=float(param.distance_mm),
+                beta_deg=float(param.normal_azimuth_sensor_deg),
+                alpha_deg=float(param.azimuth_deg),
+                T_base_s=np.asarray(T_base_s, dtype=float).reshape(4, 4).copy(),
+                T_base_ef=robot_pose_from_sensor_pose(T_base_s, T_ef_s_true),
+            )
+        )
+
+    if len(poses) != BOOTSTRAP_SCAN_COUNT:
+        raise RuntimeError("OPT12 bootstrap does not contain exactly 12 poses")
+
+    return poses
+
+
+# =============================================================================
+# Random pose bank
+# =============================================================================
+
+def sample_random_candidate_pose(
+    *,
+    candidate_id: int,
+    frame,
+    T_ef_s_true: np.ndarray,
+    rng: np.random.Generator,
+    tilt_range_deg: tuple[float, float],
+    distance_range_mm: tuple[float, float],
+    beta_range_deg: tuple[float, float],
+    depth_range_mm: tuple[float, float],
+    max_attempts: int = 10_000,
+) -> CandidatePose:
+    for _attempt in range(max_attempts):
+        psi_deg = float(rng.uniform(0.0, 360.0))
+        psi_rad = np.deg2rad(psi_deg)
+
+        target_u_mm = float(exp1.RADIUS_MM * np.cos(psi_rad))
+        target_v_mm = float(exp1.RADIUS_MM * np.sin(psi_rad))
+
+        tilt_deg = float(rng.uniform(*tilt_range_deg))
+        distance_mm = float(rng.uniform(*distance_range_mm))
+        beta_deg = float(rng.uniform(*beta_range_deg))
+
+        alpha_deg = float(
+            exp1.alpha_for_scanline_direction(
+                scanline_azimuth_deg=np.asarray([psi_deg], dtype=float),
+                tilt_deg=np.asarray([tilt_deg], dtype=float),
+                beta_deg=np.asarray([beta_deg], dtype=float),
+            )[0]
+        )
+
+        target_point = exp1.plane_uv_to_base_points(
+            uv=np.asarray([[target_u_mm, target_v_mm]], dtype=float),
+            target_center_base_mm=exp1.BOARD_CENTER,
+            frame=frame,
+        )[0]
+
+        try:
+            T_base_s = exp1.sensor_pose_from_target_point(
+                target_point_base_mm=target_point,
+                frame=frame,
+                distance_mm=distance_mm,
+                tilt_deg=tilt_deg,
+                azimuth_deg=alpha_deg,
+                normal_azimuth_sensor_deg=beta_deg,
+            )
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            continue
+
+        if not profile_is_feasible(frame, T_base_s, depth_range_mm):
+            continue
+
+        return CandidatePose(
+            candidate_id=int(candidate_id),
+            target_u_mm=target_u_mm,
+            target_v_mm=target_v_mm,
+            psi_deg=psi_deg,
+            tilt_deg=tilt_deg,
+            distance_mm=distance_mm,
+            beta_deg=beta_deg,
+            alpha_deg=alpha_deg,
+            T_base_s=np.asarray(T_base_s, dtype=float).reshape(4, 4).copy(),
+            T_base_ef=robot_pose_from_sensor_pose(T_base_s, T_ef_s_true),
+        )
+
+    raise RuntimeError(
+        f"failed to sample feasible candidate {candidate_id} "
+        f"after {max_attempts} attempts"
+    )
+
+
+def sample_random_pose_set(
+    *,
+    count: int,
+    frame,
+    T_ef_s_true: np.ndarray,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+) -> list[CandidatePose]:
+    return [
+        sample_random_candidate_pose(
+            candidate_id=index,
+            frame=frame,
+            T_ef_s_true=T_ef_s_true,
+            rng=rng,
+            tilt_range_deg=args.tilt_range_deg,
+            distance_range_mm=args.distance_range_mm,
+            beta_range_deg=args.beta_range_deg,
+            depth_range_mm=args.profile_depth_range_mm,
+        )
+        for index in range(count)
+    ]
+
+
+# =============================================================================
+# Fisher state / objective
+# =============================================================================
+
+def parameter_scales(args: argparse.Namespace) -> np.ndarray:
+    return np.asarray(
+        [
+            *([np.deg2rad(args.fisher_rotation_scale_deg)] * 3),
+            *([args.fisher_translation_scale_mm] * 3),
+            np.deg2rad(args.fisher_plane_normal_scale_deg),
+            np.deg2rad(args.fisher_plane_normal_scale_deg),
+            args.fisher_plane_offset_scale_mm,
+        ],
+        dtype=float,
+    )
+
+
+def group_scans(scans: list[LaserScan]) -> dict[int, list[LaserScan]]:
+    return {0: list(scans)}
+
+
+def estimate_state(
+    scans: list[LaserScan],
+    T_initial: np.ndarray,
+    scales: np.ndarray,
+    args: argparse.Namespace,
+    previous: JointCalibrationEstimate | None = None,
+) -> JointCalibrationEstimate:
+    return estimate_joint_calibration(
+        group_scans(scans),
+        T_initial=(
+            np.asarray(T_initial, dtype=float).reshape(4, 4)
+            if previous is None
+            else previous.T_ef_s
+        ),
+        planes_initial=(None if previous is None else previous.planes),
+        parameter_scales=scales,
+        profile_noise_std_mm=args.measurement_noise_std_mm,
+        noise_axis=args.noise_axis,
+        max_iterations=args.estimator_max_iterations,
+        tolerance=args.estimator_tolerance,
+    )
+
+
+def d_optimal_value(estimate: JointCalibrationEstimate) -> float:
+    return float(
+        fisher_objective_value(
+            estimate.information,
+            FISHER_OBJECTIVE,
+        )
+    )
+
+
+def transform_errors(
+    T_est: np.ndarray,
+    T_true: np.ndarray,
+) -> tuple[float, float]:
+    translation_error = float(
+        np.linalg.norm(
+            np.asarray(T_est, dtype=float)[:3, 3]
+            - np.asarray(T_true, dtype=float)[:3, 3]
+        )
+    )
+
+    rotation_error = float(
+        exp1.rotation_error_deg(
+            np.asarray(T_est, dtype=float)[:3, :3],
+            np.asarray(T_true, dtype=float)[:3, :3],
+        )
+    )
+
+    return translation_error, rotation_error
+
+
+def trajectory_row_from_estimate(
+    *,
+    trial: int,
+    method: str,
+    scan_count: int,
+    stage: str,
+    selected_pose: CandidatePose | None,
+    estimate: JointCalibrationEstimate,
+    T_true: np.ndarray,
+) -> TrajectoryRow:
+    dopt = d_optimal_value(estimate)
+    translation_error, rotation_error = transform_errors(
+        estimate.T_ef_s,
+        T_true,
+    )
+
+    accuracy_success = bool(
+        np.isfinite(translation_error)
+        and np.isfinite(rotation_error)
+        and translation_error <= ACCURACY_TRANSLATION_THRESHOLD_MM
+        and rotation_error <= ACCURACY_ROTATION_THRESHOLD_DEG
+    )
+
+    bootstrap = "OPT12" if method.startswith("OPT12") else "RAND12"
+    continuation = "FISHER" if method.endswith("FISHER") else "RANDOM"
+
+    return TrajectoryRow(
+        trial=trial,
+        method=method,
+        bootstrap=bootstrap,
+        continuation=continuation,
+        scan_count=scan_count,
+        stage=stage,
+        selected_candidate_id=(-1 if selected_pose is None else selected_pose.candidate_id),
+        selected_psi_deg=(float("nan") if selected_pose is None else selected_pose.psi_deg),
+        selected_tilt_deg=(float("nan") if selected_pose is None else selected_pose.tilt_deg),
+        selected_distance_mm=(
+            float("nan") if selected_pose is None else selected_pose.distance_mm
+        ),
+        selected_beta_deg=(float("nan") if selected_pose is None else selected_pose.beta_deg),
+        estimator_success=True,
+        estimator_converged=bool(estimate.converged),
+        data_rank=int(estimate.data_rank),
+        d_optimal_half_logdet=dopt,
+        marginal_logdet=2.0 * dopt,
+        translation_error_mm=translation_error,
+        rotation_error_deg=rotation_error,
+        accuracy_success=accuracy_success,
+        error_message="",
+    )
+
+
+def failure_row(
+    *,
+    trial: int,
+    method: str,
+    scan_count: int,
+    stage: str,
+    error_message: str,
+) -> TrajectoryRow:
+    bootstrap = "OPT12" if method.startswith("OPT12") else "RAND12"
+    continuation = "FISHER" if method.endswith("FISHER") else "RANDOM"
+
+    return TrajectoryRow(
+        trial=trial,
+        method=method,
+        bootstrap=bootstrap,
+        continuation=continuation,
+        scan_count=scan_count,
+        stage=stage,
+        selected_candidate_id=-1,
+        selected_psi_deg=float("nan"),
+        selected_tilt_deg=float("nan"),
+        selected_distance_mm=float("nan"),
+        selected_beta_deg=float("nan"),
+        estimator_success=False,
+        estimator_converged=False,
+        data_rank=-1,
+        d_optimal_half_logdet=float("nan"),
+        marginal_logdet=float("nan"),
+        translation_error_mm=float("nan"),
+        rotation_error_deg=float("nan"),
+        accuracy_success=False,
+        error_message=error_message,
+    )
+
+
+# =============================================================================
+# Online branch
+# =============================================================================
+
+def choose_fisher_candidate(
+    *,
+    candidates: list[CandidatePose],
+    selected_mask: np.ndarray,
+    estimate: JointCalibrationEstimate,
+    scales: np.ndarray,
+    args: argparse.Namespace,
+) -> int:
+    best_candidate = -1
+    best_score = -float("inf")
+
+    for candidate_id in np.flatnonzero(~selected_mask):
+        candidate = candidates[int(candidate_id)]
+
+        try:
+            candidate_information = predicted_candidate_information(
+                T_base_ef=candidate.T_base_ef,
+                plane_id=0,
+                estimate=estimate,
+                x_values=exp1.X_VALUES,
+                parameter_scales=scales,
+                profile_noise_std_mm=args.measurement_noise_std_mm,
+                noise_axis=args.noise_axis,
+                depth_range_mm=args.profile_depth_range_mm,
+            )
+
+            if candidate_information is None:
+                continue
+
+            score = float(
+                fisher_objective_value(
+                    estimate.information + candidate_information,
+                    FISHER_OBJECTIVE,
+                )
+            )
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError):
+            continue
+
+        if score > best_score:
+            best_score = score
+            best_candidate = int(candidate_id)
+
+    if best_candidate < 0:
+        raise RuntimeError(
+            "Fisher selection found no candidate visible from the current estimate"
+        )
+
+    return best_candidate
+
+
+def choose_random_candidate(
+    *,
+    random_order: np.ndarray,
+    selected_mask: np.ndarray,
+) -> int:
+    for raw_id in random_order:
+        candidate_id = int(raw_id)
+        if not selected_mask[candidate_id]:
+            return candidate_id
+
+    raise RuntimeError("random continuation exhausted the candidate pool")
+
+
+def run_branch(
+    *,
+    trial: int,
+    method: str,
+    bootstrap_scans: list[LaserScan],
+    candidate_poses: list[CandidatePose],
+    candidate_scans: list[LaserScan],
+    random_order: np.ndarray,
+    T_initial: np.ndarray,
+    T_true: np.ndarray,
+    scales: np.ndarray,
+    args: argparse.Namespace,
+) -> list[TrajectoryRow]:
+    rows: list[TrajectoryRow] = []
+    acquired = list(bootstrap_scans)
+    selected_mask = np.zeros(len(candidate_poses), dtype=bool)
+
+    try:
+        estimate = estimate_state(
+            acquired,
+            T_initial,
+            scales,
+            args,
+            previous=None,
+        )
+
+        rows.append(
+            trajectory_row_from_estimate(
+                trial=trial,
+                method=method,
+                scan_count=BOOTSTRAP_SCAN_COUNT,
+                stage="bootstrap_complete",
+                selected_pose=None,
+                estimate=estimate,
+                T_true=T_true,
+            )
+        )
+    except Exception as exc:
+        message = f"bootstrap {type(exc).__name__}: {exc}"
+        for scan_count in range(BOOTSTRAP_SCAN_COUNT, args.total_scans + 1):
+            rows.append(
+                failure_row(
+                    trial=trial,
+                    method=method,
+                    scan_count=scan_count,
+                    stage="bootstrap_failed",
+                    error_message=message,
+                )
+            )
+        return rows
+
+    continuation = "fisher" if method.endswith("FISHER") else "random"
+
+    while len(acquired) < args.total_scans:
+        next_scan_count = len(acquired) + 1
+
+        try:
+            if continuation == "fisher":
+                candidate_id = choose_fisher_candidate(
+                    candidates=candidate_poses,
+                    selected_mask=selected_mask,
+                    estimate=estimate,
+                    scales=scales,
+                    args=args,
+                )
+            else:
+                candidate_id = choose_random_candidate(
+                    random_order=random_order,
+                    selected_mask=selected_mask,
+                )
+
+            selected_pose = candidate_poses[candidate_id]
+            acquired.append(candidate_scans[candidate_id])
+            selected_mask[candidate_id] = True
+
+            estimate = estimate_state(
+                acquired,
+                T_initial,
+                scales,
+                args,
+                previous=estimate,
+            )
+
+            rows.append(
+                trajectory_row_from_estimate(
+                    trial=trial,
+                    method=method,
+                    scan_count=next_scan_count,
+                    stage=("fisher_d_optimal" if continuation == "fisher" else "random"),
+                    selected_pose=selected_pose,
+                    estimate=estimate,
+                    T_true=T_true,
+                )
+            )
+
+        except Exception as exc:
+            message = f"step {next_scan_count} {type(exc).__name__}: {exc}"
+            for scan_count in range(next_scan_count, args.total_scans + 1):
+                rows.append(
+                    failure_row(
+                        trial=trial,
+                        method=method,
+                        scan_count=scan_count,
+                        stage="continuation_failed",
+                        error_message=message,
+                    )
+                )
+            break
+
+    return rows
+
+
+# =============================================================================
+# One paired trial
+# =============================================================================
+
+def make_noisy_scan_set(
+    poses: list[CandidatePose],
+    frame,
+    noise_seeds: np.ndarray,
+    *,
+    noise_std_mm: float,
+    noise_axis: str,
+    source: str,
+    scan_id_offset: int,
+) -> list[LaserScan]:
+    if len(poses) != len(noise_seeds):
+        raise ValueError("pose/noise-seed counts differ")
+
+    return [
+        noisy_scan_from_pose(
+            pose,
+            frame,
+            noise_std_mm=noise_std_mm,
+            noise_axis=noise_axis,
+            noise_seed=int(noise_seed),
+            scan_id=scan_id_offset + index,
+            source=source,
+        )
+        for index, (pose, noise_seed) in enumerate(zip(poses, noise_seeds))
+    ]
+
+
+def run_trial(
+    *,
+    trial: int,
+    args: argparse.Namespace,
+) -> list[TrajectoryRow]:
+    root = np.random.SeedSequence([args.seed, trial])
+    (
+        gt_sequence,
+        init_sequence,
+        random_bootstrap_geometry_sequence,
+        candidate_geometry_sequence,
+        bootstrap_noise_sequence,
+        candidate_noise_sequence,
+        random_order_sequence,
+    ) = root.spawn(7)
+
+    T_true, _gt_euler_deg, _gt_translation_mm = sample_random_handeye(
+        rng=np.random.default_rng(gt_sequence),
+        trans_range_mm=GT_TRANSLATION_COMPONENT_RANGE_MM,
+        angle_range_deg=GT_EULER_COMPONENT_RANGE_DEG,
+    )
+
+    T_initial = exp1.make_initial_guess_GT(
+        T_true,
+        rng=np.random.default_rng(init_sequence),
+        max_rotation_error_deg=args.init_rotation_deg,
+        max_translation_error_mm=args.init_translation_mm,
+    )
+
+    frame = make_frame()
+    scales = parameter_scales(args)
+
+    # -------------------------------------------------------------------------
+    # Two bootstrap sets.
+    # -------------------------------------------------------------------------
+
+    optimal_bootstrap_poses = build_optimal_bootstrap_poses(
+        frame,
+        T_true,
+    )
+
+    random_bootstrap_poses = sample_random_pose_set(
+        count=BOOTSTRAP_SCAN_COUNT,
+        frame=frame,
+        T_ef_s_true=T_true,
+        rng=np.random.default_rng(random_bootstrap_geometry_sequence),
+        args=args,
+    )
+
+    bootstrap_noise_seeds = bootstrap_noise_sequence.generate_state(
+        BOOTSTRAP_SCAN_COUNT,
+        dtype=np.uint32,
+    )
+
+    optimal_bootstrap_scans = make_noisy_scan_set(
+        optimal_bootstrap_poses,
+        frame,
+        bootstrap_noise_seeds,
+        noise_std_mm=args.measurement_noise_std_mm,
+        noise_axis=args.noise_axis,
+        source="OPT12_BOOTSTRAP",
+        scan_id_offset=0,
+    )
+
+    random_bootstrap_scans = make_noisy_scan_set(
+        random_bootstrap_poses,
+        frame,
+        bootstrap_noise_seeds,
+        noise_std_mm=args.measurement_noise_std_mm,
+        noise_axis=args.noise_axis,
+        source="RAND12_BOOTSTRAP",
+        scan_id_offset=0,
+    )
+
+    # -------------------------------------------------------------------------
+    # Common continuation candidate bank.
+    # -------------------------------------------------------------------------
+
+    candidate_poses = sample_random_pose_set(
+        count=args.candidate_pool_size,
+        frame=frame,
+        T_ef_s_true=T_true,
+        rng=np.random.default_rng(candidate_geometry_sequence),
+        args=args,
+    )
+
+    candidate_noise_seeds = candidate_noise_sequence.generate_state(
+        args.candidate_pool_size,
+        dtype=np.uint32,
+    )
+
+    candidate_scans = make_noisy_scan_set(
+        candidate_poses,
+        frame,
+        candidate_noise_seeds,
+        noise_std_mm=args.measurement_noise_std_mm,
+        noise_axis=args.noise_axis,
+        source="CONTINUATION_CANDIDATE",
+        scan_id_offset=10_000,
+    )
+
+    random_order = np.random.default_rng(random_order_sequence).permutation(
+        args.candidate_pool_size
+    )
+
+    # -------------------------------------------------------------------------
+    # Four paired branches.
+    # -------------------------------------------------------------------------
+
+    branches = (
+        ("OPT12+FISHER", optimal_bootstrap_scans),
+        ("OPT12+RANDOM", optimal_bootstrap_scans),
+        ("RAND12+FISHER", random_bootstrap_scans),
+        ("RAND12+RANDOM", random_bootstrap_scans),
+    )
+
+    rows: list[TrajectoryRow] = []
+    for method, bootstrap_scans in branches:
+        rows.extend(
+            run_branch(
+                trial=trial,
+                method=method,
+                bootstrap_scans=bootstrap_scans,
+                candidate_poses=candidate_poses,
+                candidate_scans=candidate_scans,
+                random_order=random_order,
+                T_initial=T_initial,
+                T_true=T_true,
+                scales=scales,
+                args=args,
+            )
+        )
+
+    return rows
+
+
+# =============================================================================
+# Monte-Carlo
+# =============================================================================
+
+def run_monte_carlo(args: argparse.Namespace) -> list[TrajectoryRow]:
+    all_rows: list[TrajectoryRow] = []
+
+    print("\n" + "=" * 88)
+    print("OPT12/RAND12 BOOTSTRAP x D-OPTIMAL/RANDOM CONTINUATION")
+    print("=" * 88)
+    print(f"trials              : {args.trials}")
+    print(f"bootstrap scans     : {BOOTSTRAP_SCAN_COUNT}")
+    print(f"total scans         : {args.total_scans}")
+    print(f"candidate pool      : {args.candidate_pool_size}")
+    print(f"measurement noise   : {args.measurement_noise_std_mm:g} mm ({args.noise_axis})")
+    print(f"objective           : 0.5 * log det(H_handeye_marginal)")
+    print(f"methods             : {METHODS}")
+
+    for trial in range(args.trials):
+        try:
+            trial_rows = run_trial(trial=trial, args=args)
+        except Exception as exc:
+            # Trial-level generation failure: keep denominators explicit.
+            message = f"trial generation {type(exc).__name__}: {exc}"
+            trial_rows = []
+            for method in METHODS:
+                for scan_count in range(BOOTSTRAP_SCAN_COUNT, args.total_scans + 1):
+                    trial_rows.append(
+                        failure_row(
+                            trial=trial,
+                            method=method,
+                            scan_count=scan_count,
+                            stage="trial_failed",
+                            error_message=message,
+                        )
+                    )
+
+        all_rows.extend(trial_rows)
+
+        completed = trial + 1
+        if completed == 1 or completed % 10 == 0 or completed == args.trials:
+            print(f"  completed: {completed}/{args.trials}")
+
+    return all_rows
+
+
+# =============================================================================
+# CSV aggregation
+# =============================================================================
+
+def finite_quantiles(values: list[float]) -> tuple[int, float, float, float]:
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return 0, float("nan"), float("nan"), float("nan")
+
+    return (
+        int(data.size),
+        float(np.percentile(data, 25)),
+        float(np.percentile(data, 50)),
+        float(np.percentile(data, 75)),
+    )
+
+
+def summarize_by_scan(rows: list[TrajectoryRow]) -> list[dict[str, object]]:
+    summary: list[dict[str, object]] = []
+
+    for method in METHODS:
+        method_rows = [row for row in rows if row.method == method]
+        scan_counts = sorted({row.scan_count for row in method_rows})
+
+        for scan_count in scan_counts:
+            group = [row for row in method_rows if row.scan_count == scan_count]
+
+            d_count, d_q25, d_med, d_q75 = finite_quantiles(
+                [row.d_optimal_half_logdet for row in group]
+            )
+            t_count, t_q25, t_med, t_q75 = finite_quantiles(
+                [row.translation_error_mm for row in group]
+            )
+            r_count, r_q25, r_med, r_q75 = finite_quantiles(
+                [row.rotation_error_deg for row in group]
+            )
+
+            summary.append(
+                {
+                    "method": method,
+                    "scan_count": scan_count,
+                    "trials": len(group),
+                    "valid_d_optimal_count": d_count,
+                    "d_optimal_q25": d_q25,
+                    "d_optimal_median": d_med,
+                    "d_optimal_q75": d_q75,
+                    "valid_translation_count": t_count,
+                    "translation_q25_mm": t_q25,
+                    "translation_median_mm": t_med,
+                    "translation_q75_mm": t_q75,
+                    "valid_rotation_count": r_count,
+                    "rotation_q25_deg": r_q25,
+                    "rotation_median_deg": r_med,
+                    "rotation_q75_deg": r_q75,
+                    "estimator_success_rate": float(
+                        np.mean([row.estimator_success for row in group])
+                    ),
+                    "estimator_converged_rate": float(
+                        np.mean([row.estimator_converged for row in group])
+                    ),
+                    "accuracy_success_rate": float(
+                        np.mean([row.accuracy_success for row in group])
+                    ),
+                }
+            )
+
+    return summary
+
+
+def paired_dopt_advantage(
+    rows: list[TrajectoryRow],
+    method: str,
+    scan_count: int,
+) -> np.ndarray:
+    lookup = {
+        (row.trial, row.method, row.scan_count): row
+        for row in rows
+    }
+
+    values: list[float] = []
+    trials = sorted({row.trial for row in rows})
+    for trial in trials:
+        a = lookup.get((trial, method, scan_count))
+        b = lookup.get((trial, BASELINE_METHOD, scan_count))
+        if a is None or b is None:
+            continue
+        if not np.isfinite(a.d_optimal_half_logdet) or not np.isfinite(
+            b.d_optimal_half_logdet
+        ):
+            continue
+        values.append(a.d_optimal_half_logdet - b.d_optimal_half_logdet)
+
+    return np.asarray(values, dtype=float)
+
+
+def final_comparison_rows(
+    rows: list[TrajectoryRow],
+    summary: list[dict[str, object]],
+    total_scans: int,
+) -> list[dict[str, object]]:
+    final_rows = [
+        row
+        for row in summary
+        if int(row["scan_count"]) == total_scans
+    ]
+
+    output: list[dict[str, object]] = []
+    for row in final_rows:
+        method = str(row["method"])
+        advantage = paired_dopt_advantage(rows, method, total_scans)
+        count, q25, median, q75 = finite_quantiles(advantage.tolist())
+
+        output.append(
+            {
+                **row,
+                "paired_vs_rand12_random_count": count,
+                "paired_dopt_advantage_q25": q25,
+                "paired_dopt_advantage_median": median,
+                "paired_dopt_advantage_q75": q75,
+            }
+        )
+
+    return output
+
+
+# =============================================================================
+# File writers
+# =============================================================================
+
+def write_dataclass_csv(rows: list[TrajectoryRow], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [asdict(row) for row in rows]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(payload[0]))
+        writer.writeheader()
+        writer.writerows(payload)
+
+
+def write_dict_csv(rows: list[dict[str, object]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
+
+def summary_lookup(
+    summary: list[dict[str, object]],
+    method: str,
+) -> list[dict[str, object]]:
+    return sorted(
+        [row for row in summary if row["method"] == method],
+        key=lambda row: int(row["scan_count"]),
+    )
+
+
+def plot_quantile_curve(
+    *,
+    summary: list[dict[str, object]],
+    median_key: str,
+    q25_key: str,
+    q75_key: str,
+    ylabel: str,
+    title: str,
+    path: Path,
+) -> plt.Figure:
+    fig, axis = plt.subplots(figsize=(9.0, 5.6), constrained_layout=True)
+
+    for method in METHODS:
+        data = summary_lookup(summary, method)
+        x = np.asarray([row["scan_count"] for row in data], dtype=float)
+        median = np.asarray([row[median_key] for row in data], dtype=float)
+        q25 = np.asarray([row[q25_key] for row in data], dtype=float)
+        q75 = np.asarray([row[q75_key] for row in data], dtype=float)
+
+        line = axis.plot(x, median, marker="o", markersize=3, label=method)[0]
+        axis.fill_between(
+            x,
+            q25,
+            q75,
+            alpha=0.15,
+            color=line.get_color(),
+        )
+
+    axis.axvline(
+        BOOTSTRAP_SCAN_COUNT,
+        linestyle="--",
+        linewidth=1.0,
+        label="bootstrap end (N=12)",
+    )
+    axis.set_xlabel("Number of acquired scans")
+    axis.set_ylabel(ylabel)
+    axis.set_title(title)
+    axis.grid(alpha=0.25)
+    axis.legend()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    return fig
+
+
+def plot_success_curve(
+    *,
+    summary: list[dict[str, object]],
+    path: Path,
+) -> plt.Figure:
+    fig, axis = plt.subplots(figsize=(9.0, 5.6), constrained_layout=True)
+
+    for method in METHODS:
+        data = summary_lookup(summary, method)
+        x = np.asarray([row["scan_count"] for row in data], dtype=float)
+        y = np.asarray([row["accuracy_success_rate"] for row in data], dtype=float)
+        axis.plot(x, 100.0 * y, marker="o", markersize=3, label=method)
+
+    axis.axvline(
+        BOOTSTRAP_SCAN_COUNT,
+        linestyle="--",
+        linewidth=1.0,
+        label="bootstrap end (N=12)",
+    )
+    axis.set_xlabel("Number of acquired scans")
+    axis.set_ylabel("Accuracy success rate [%]")
+    axis.set_ylim(0.0, 102.0)
+    axis.set_title(
+        f"Accuracy success vs scan count\n"
+        f"T <= {ACCURACY_TRANSLATION_THRESHOLD_MM:g} mm, "
+        f"R <= {ACCURACY_ROTATION_THRESHOLD_DEG:g} deg"
+    )
+    axis.grid(alpha=0.25)
+    axis.legend()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    return fig
+
+
+def plot_dopt_advantage(
+    *,
+    rows: list[TrajectoryRow],
+    total_scans: int,
+    path: Path,
+) -> plt.Figure:
+    fig, axis = plt.subplots(figsize=(9.0, 5.6), constrained_layout=True)
+    scan_counts = np.arange(BOOTSTRAP_SCAN_COUNT, total_scans + 1, dtype=int)
+
+    for method in METHODS:
+        if method == BASELINE_METHOD:
+            continue
+
+        q25_values = []
+        med_values = []
+        q75_values = []
+
+        for scan_count in scan_counts:
+            values = paired_dopt_advantage(rows, method, int(scan_count))
+            if values.size:
+                q25_values.append(float(np.percentile(values, 25)))
+                med_values.append(float(np.median(values)))
+                q75_values.append(float(np.percentile(values, 75)))
+            else:
+                q25_values.append(float("nan"))
+                med_values.append(float("nan"))
+                q75_values.append(float("nan"))
+
+        line = axis.plot(
+            scan_counts,
+            med_values,
+            marker="o",
+            markersize=3,
+            label=f"{method} - {BASELINE_METHOD}",
+        )[0]
+        axis.fill_between(
+            scan_counts,
+            q25_values,
+            q75_values,
+            alpha=0.15,
+            color=line.get_color(),
+        )
+
+    axis.axhline(0.0, linestyle="--", linewidth=1.0)
+    axis.axvline(BOOTSTRAP_SCAN_COUNT, linestyle="--", linewidth=1.0)
+    axis.set_xlabel("Number of acquired scans")
+    axis.set_ylabel("Paired D-optimal advantage [nats]")
+    axis.set_title(
+        f"Paired D-optimal advantage over {BASELINE_METHOD}\n"
+        r"$\Delta[\frac{1}{2}\log\det(H_{HE}^{marg})]$"
+    )
+    axis.grid(alpha=0.25)
+    axis.legend()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    return fig
+
+
+# =============================================================================
+# Console summary
+# =============================================================================
+
+def print_final_summary(
+    final_rows: list[dict[str, object]],
+    total_scans: int,
+) -> None:
+    print("\n" + "=" * 100)
+    print(f"FINAL MONTE-CARLO SUMMARY @ N={total_scans}")
+    print("=" * 100)
+    print(
+        "method             | D-opt median | delta vs RR | T med [mm] | "
+        "R med [deg] | accuracy"
+    )
+    print("-" * 100)
+
+    by_method = {str(row["method"]): row for row in final_rows}
+    for method in METHODS:
+        row = by_method[method]
+        print(
+            f"{method:18s} | "
+            f"{float(row['d_optimal_median']):12.5f} | "
+            f"{float(row['paired_dopt_advantage_median']):11.5f} | "
+            f"{float(row['translation_median_mm']):10.5f} | "
+            f"{float(row['rotation_median_deg']):11.5f} | "
+            f"{100.0 * float(row['accuracy_success_rate']):7.2f}%"
+        )
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> None:
+    args = parse_args()
+
+    plt.switch_backend("Agg" if not args.show else plt.get_backend())
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = run_monte_carlo(args)
+    summary = summarize_by_scan(rows)
+    final_rows = final_comparison_rows(rows, summary, args.total_scans)
+
+    trajectory_path = args.output_dir / "trajectories.csv"
+    summary_path = args.output_dir / "summary_by_scan.csv"
+    final_path = args.output_dir / "final_comparison.csv"
+    config_path = args.output_dir / "config.json"
+
+    write_dataclass_csv(rows, trajectory_path)
+    write_dict_csv(summary, summary_path)
+    write_dict_csv(final_rows, final_path)
+
+    with config_path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "schema": "exp1_opt12_bootstrap_fisher_monte_carlo_v1",
+                "methods": METHODS,
+                "baseline_method": BASELINE_METHOD,
+                "bootstrap_scan_count": BOOTSTRAP_SCAN_COUNT,
+                "trials": args.trials,
+                "total_scans": args.total_scans,
+                "candidate_pool_size": args.candidate_pool_size,
+                "seed": args.seed,
+                "objective": "0.5_logdet_marginal_handeye_information",
+                "measurement_noise_std_mm": args.measurement_noise_std_mm,
+                "noise_axis": args.noise_axis,
+                "init_translation_mm": args.init_translation_mm,
+                "init_rotation_deg": args.init_rotation_deg,
+                "fisher_rotation_scale_deg": args.fisher_rotation_scale_deg,
+                "fisher_translation_scale_mm": args.fisher_translation_scale_mm,
+                "fisher_plane_normal_scale_deg": args.fisher_plane_normal_scale_deg,
+                "fisher_plane_offset_scale_mm": args.fisher_plane_offset_scale_mm,
+                "estimator_max_iterations": args.estimator_max_iterations,
+                "estimator_tolerance": args.estimator_tolerance,
+                "random_pose_domain": {
+                    "uv": f"circle_radius_{exp1.RADIUS_MM:g}_mm",
+                    "tilt_range_deg": args.tilt_range_deg,
+                    "distance_range_mm": args.distance_range_mm,
+                    "beta_range_deg": args.beta_range_deg,
+                    "profile_depth_range_mm": args.profile_depth_range_mm,
+                    "physical_scanline": "radial",
+                },
+                "accuracy_threshold_translation_mm": (
+                    ACCURACY_TRANSLATION_THRESHOLD_MM
+                ),
+                "accuracy_threshold_rotation_deg": (
+                    ACCURACY_ROTATION_THRESHOLD_DEG
+                ),
+                "fairness": {
+                    "same_gt_within_trial": True,
+                    "same_initial_estimate_within_trial": True,
+                    "same_continuation_candidate_bank_within_trial": True,
+                    "same_candidate_measurement_noise_within_trial": True,
+                    "same_random_continuation_order_for_random_branches": True,
+                    "paired_bootstrap_noise_seed_by_scan_index": True,
+                    "fisher_uses_future_profile": False,
+                },
+            },
+            stream,
+            indent=2,
+            allow_nan=False,
+        )
+        stream.write("\n")
+
+    figures = [
+        plot_quantile_curve(
+            summary=summary,
+            median_key="d_optimal_median",
+            q25_key="d_optimal_q25",
+            q75_key="d_optimal_q75",
+            ylabel=r"D-optimal score $\frac{1}{2}\log\det(H_{HE}^{marg})$",
+            title="D-optimal information vs scan count (median and IQR)",
+            path=args.output_dir / "d_optimal_vs_scan_count.png",
+        ),
+        plot_dopt_advantage(
+            rows=rows,
+            total_scans=args.total_scans,
+            path=args.output_dir / "d_optimal_advantage_vs_random_random.png",
+        ),
+        plot_quantile_curve(
+            summary=summary,
+            median_key="translation_median_mm",
+            q25_key="translation_q25_mm",
+            q75_key="translation_q75_mm",
+            ylabel="Translation error [mm]",
+            title="Translation error vs scan count (median and IQR)",
+            path=args.output_dir / "translation_error_vs_scan_count.png",
+        ),
+        plot_quantile_curve(
+            summary=summary,
+            median_key="rotation_median_deg",
+            q25_key="rotation_q25_deg",
+            q75_key="rotation_q75_deg",
+            ylabel="Rotation error [deg]",
+            title="Rotation error vs scan count (median and IQR)",
+            path=args.output_dir / "rotation_error_vs_scan_count.png",
+        ),
+        plot_success_curve(
+            summary=summary,
+            path=args.output_dir / "accuracy_success_vs_scan_count.png",
+        ),
+    ]
+
+    print_final_summary(final_rows, args.total_scans)
+
+    print("\nSaved:")
+    for path in (
+        config_path,
+        trajectory_path,
+        summary_path,
+        final_path,
+        args.output_dir / "d_optimal_vs_scan_count.png",
+        args.output_dir / "d_optimal_advantage_vs_random_random.png",
+        args.output_dir / "translation_error_vs_scan_count.png",
+        args.output_dir / "rotation_error_vs_scan_count.png",
+        args.output_dir / "accuracy_success_vs_scan_count.png",
+    ):
+        print(f"  {path}")
+
+    if args.show:
+        plt.show()
+
+    for figure in figures:
+        plt.close(figure)
+
+
+if __name__ == "__main__":
+    main()

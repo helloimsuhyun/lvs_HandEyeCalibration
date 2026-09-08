@@ -1,12 +1,11 @@
 from __future__ import annotations
 from typing import Literal
 import numpy as np
-from .data import LaserScan
+from .data import LaserScan, PlaneFrame
 from .se3 import make_T, inv_T, euler_xyz_deg
 
 
 PoseGeometry = Literal["paper_incidence", "observable_dihedral"]
-
 
 # board pose로부터 board pose 방정식을 계산
 def make_plane_from_pose(R_base_plane: np.ndarray, t_base_plane: np.ndarray) -> tuple[np.ndarray, float]:
@@ -17,12 +16,199 @@ def make_plane_from_pose(R_base_plane: np.ndarray, t_base_plane: np.ndarray) -> 
         n, l = -n, -l
     return n, l
 
+# sensor pose가 주어졌을 때, 보드에 맺히는 프로파일을 시뮬레이션
+def simulate_profile_from_sensor_pose(
+    T_base_s: np.ndarray,
+    frame: PlaneFrame,
+    x_values: np.ndarray,
+) -> np.ndarray:
+    """
+    T_base_s : 센서 월드 4x4 
+    frame : PlaneFrame
+
+    x_values : (N,) ndarray
+              레이저 프로파일 센서의 x축 해상도 점 [ ex) N=5 >> -2.0 -1.0 0 1.0 2.0 ]
+
+    Returns
+    -------
+    points_s : (N, 3) ndarray
+        sensor coordinates 프로파일 점 [x, 0, z].
+    """
+
+    T_base_s = np.asarray(
+        T_base_s,
+        dtype=float,
+    ).reshape(4, 4)
+
+    x_values = np.asarray(
+        x_values,
+        dtype=float,
+    ).reshape(-1)
+
+    R_base_s = T_base_s[:3, :3]
+    t_base_s = T_base_s[:3, 3]
+
+    n_s = R_base_s.T @ frame.n
+
+    c = float(
+        frame.n @ t_base_s
+        - frame.offset_mm
+    )
+
+    if abs(n_s[2]) < 1e-9:
+        raise ValueError(
+            "cannot solve z(x): target plane is degenerate "
+            "with respect to the sensor scan geometry"
+        )
+
+    z_values = -(
+        n_s[0] * x_values + c
+    ) / n_s[2]
+
+    points_s = np.column_stack([
+        x_values,
+        np.zeros_like(x_values),
+        z_values,
+    ])
+
+    return points_s
+
+# 센서 포즈, GT핸드아이, 프로파일 데이터 시뮬레이션 >>> LaserScan (TCP 포즈 / 센서포즈 / 프로파일 묶음)
+def laser_scan_from_sensor_pose_and_profile(
+    T_base_s: np.ndarray,
+    points_s: np.ndarray,
+    T_ef_s_true: np.ndarray,
+
+    noise_std: float = 0.0,
+    rng: np.random.Generator | None = None,
+
+    plane_id: int = 0,
+    scan_id: int | None = None,
+    meta: dict | None = None,
+) -> LaserScan:
+    """
+    T_base_s : 센서 Base 4x4
+    points_s : (N, 3) ndarray 센서좌표계 프로파일 데이터
+    T_ef_s_true : (4, 4) ndarray GT 핸드아이
+    Returns >>>  LaserScan
+    """
+
+    rng = np.random.default_rng() if rng is None else rng
+
+    T_base_s = np.asarray(
+        T_base_s,
+        dtype=float,
+    ).reshape(4, 4)
+
+    T_ef_s_true = np.asarray(
+        T_ef_s_true,
+        dtype=float,
+    ).reshape(4, 4)
+
+    points_s = np.asarray(
+        points_s,
+        dtype=float,
+    ).reshape(-1, 3)
+
+    if not np.all(np.isfinite(T_base_s)):
+        raise ValueError("T_base_s must contain only finite values")
+
+    if not np.all(np.isfinite(T_ef_s_true)):
+        raise ValueError("T_ef_s_true must contain only finite values")
+
+    if not np.all(np.isfinite(points_s)):
+        raise ValueError("points_s must contain only finite values")
+
+    if noise_std < 0.0 or not np.isfinite(noise_std):
+        raise ValueError(
+            "noise_std must be non-negative and finite"
+        )
+
+    # ---------------------------------------------------------------
+    # Sensor pose -> corresponding EF pose
+
+    T_base_ef = (
+        T_base_s
+        @ inv_T(T_ef_s_true)
+    )
+
+    # ---------------------------------------------------------------
+    # Optional profile measurement noise
+
+    points_out = points_s.copy()
+    meta_out = dict(meta or {})
+
+    if noise_std > 0.0:
+        noise_xz = rng.normal(
+            loc=0.0,
+            scale=float(noise_std),
+            size=(len(points_out), 2),
+        )
+
+        points_out[:, 0] += noise_xz[:, 0]
+        points_out[:, 2] += noise_xz[:, 1]
+
+        meta_out["noise_x_mm"] = noise_xz[:, 0].copy()
+        meta_out["noise_z_mm"] = noise_xz[:, 1].copy()
+        meta_out["noise_std_command_mm"] = float(
+            noise_std
+        )
+
+    meta_out["generated_from_sensor_pose"] = True
+
+    return LaserScan(
+        T_base_ef=T_base_ef,
+        points_s=points_out,
+        plane_id=plane_id,
+        scan_id=scan_id,
+        meta=meta_out,
+    )
+
+# pose_design.py 에서 나오는 센서 포즈로부터 프로파일 데이터와 TCP 포즈 생성 위 함수들 wrapper
+def simulate_scan_from_sensor_pose(
+    T_base_s: np.ndarray,
+    T_ef_s_true: np.ndarray,
+    frame: PlaneFrame,
+    x_values: np.ndarray,
+    
+    noise_std: float = 0.0,
+    rng: np.random.Generator | None = None,
+    plane_id: int = 0,
+    scan_id: int | None = None,
+    meta: dict | None = None,
+) -> LaserScan:
+
+    # ---------------------------------------------------------------
+    # 센서포즈 > 프로파일 데이터
+    points_s = simulate_profile_from_sensor_pose(
+        T_base_s=T_base_s,
+        frame=frame,
+        x_values=x_values,
+    )
+
+    # ---------------------------------------------------------------
+    # 센서포즈 > TCP포즈 + 프로파일데이터 + 센서포즈 묶음
+    return laser_scan_from_sensor_pose_and_profile(
+        T_base_s=T_base_s,
+        points_s=points_s,
+        T_ef_s_true=T_ef_s_true,
+        noise_std=noise_std,
+        rng=rng,
+        plane_id=plane_id,
+        scan_id=scan_id,
+        meta=meta,
+    )
+
+# --------------------------------------------------------------------------------------------------------------------------
+
+
+
 # 보드 위에 맺히는 레이저 프로파일을 시뮬레이션
+# EF pose + GT hand-eye가 주어졌을 때 profile을 생성하고 LaserScan으로 반환
 def simulate_profile_on_plane(
     T_base_ef: np.ndarray,
     T_ef_s_true: np.ndarray,
-    plane_n: np.ndarray,
-    plane_l: float,
+    frame: PlaneFrame,
     x_values: np.ndarray,
     noise_std: float = 0.0,
     rng: np.random.Generator | None = None,
@@ -31,25 +217,82 @@ def simulate_profile_on_plane(
     meta: dict | None = None,
 ) -> LaserScan:
     """
-    The 2D laser profile is represented in the sensor frame as points [x, 0, z].
+    Generate one laser scan from a robot flange pose.
+
+    Flow
+    ----
+    T_base_ef
+        -> T_base_s = T_base_ef @ T_ef_s_true
+        -> ideal sensor-frame profile
+        -> optional measurement noise
+        -> LaserScan
+
+    Parameters
+    ----------
+    T_base_ef : (4, 4) ndarray
+        End-effector pose in robot-base coordinates.
+
+    T_ef_s_true : (4, 4) ndarray
+        Ground-truth hand-eye transform.
+
+    frame : PlaneFrame
+        Calibration plane expressed in robot-base coordinates.
+
+    x_values : (N,) ndarray
+        Sensor X sampling positions [mm].
+
+    noise_std : float
+        Standard deviation of Gaussian noise added independently
+        to sensor X and Z coordinates [mm].
+
+    Returns
+    -------
+    LaserScan
+        Robot flange pose and simulated sensor-frame profile.
     """
 
     rng = np.random.default_rng() if rng is None else rng
+
+    T_base_ef = np.asarray(
+        T_base_ef,
+        dtype=float,
+    ).reshape(4, 4)
+
+    T_ef_s_true = np.asarray(
+        T_ef_s_true,
+        dtype=float,
+    ).reshape(4, 4)
+
+    # ---------------------------------------------------------------
+    # 1. Robot flange pose -> actual sensor pose
+    #
+    # T_BS = T_BE * T_ES
+    # ---------------------------------------------------------------
     T_base_s = T_base_ef @ T_ef_s_true
-    Rbs = T_base_s[:3, :3]
-    tbs = T_base_s[:3, 3]
-    n_s = Rbs.T @ plane_n
-    c = float(plane_n @ tbs - plane_l)
-    if abs(n_s[2]) < 1e-9:
-        raise ValueError('sensor scan plane is nearly parallel to target plane; cannot solve z(x)')
-    pts = []
-    for x in x_values:
-        z = -(n_s[0] * x + c) / n_s[2]
-        pts.append([x, 0.0, z])
-    pts = np.asarray(pts)
+
+    # ---------------------------------------------------------------
+    # 2. Ideal profile generation
+    # ---------------------------------------------------------------
+    pts = simulate_profile_from_sensor_pose(
+        T_base_s=T_base_s,
+        frame=frame,
+        x_values=x_values,
+    )
+
+    # ---------------------------------------------------------------
+    # 3. Measurement noise
+
     meta_out = dict(meta or {})
-    if noise_std > 0:
-        noise_xz = rng.normal(0.0, noise_std, size=(len(pts), 2))
+
+    if noise_std > 0.0:
+        noise_xz = rng.normal(
+            loc=0.0,
+            scale=float(noise_std),
+            size=(len(pts), 2),
+        )
+
+        pts = pts.copy()
+
         pts[:, 0] += noise_xz[:, 0]
         pts[:, 2] += noise_xz[:, 1]
 
