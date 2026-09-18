@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
 """
 
 Example:
 python /home/choisuhyun/lvs_HandEyeCalibration/pose_estimation/active_scan_besian.py \
     /home/choisuhyun/lvs_HandEyeCalibration/pose_estimation/미그럼틀.stl \
     --mesh-unit mm \
+    --scan-length-mm 10 \
     --show
 """
 
@@ -106,10 +106,9 @@ def probability(v: str) -> float:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Active 2-D laser scan: cumulative PPF registration + "
-            "CAD-only FPFH next-scan policy. Offline global-unique CAD patches "
-            "form the candidate pool; online selection maximizes FPFH disagreement "
-            "among current PPF pose hypotheses."
+            "Random 2-D laser scanning: PPF pose proposals + sensor-agnostic Bayesian "
+            "SE(3) Gaussian-mixture posterior. PPF votes generate pose proposals only; "
+            "all scan locations/directions are sampled randomly from the CAD surface."
         )
     )
     p.add_argument("cad", type=Path)
@@ -163,7 +162,12 @@ def parse_args() -> argparse.Namespace:
 
     g = p.add_argument_group("Virtual 2-D laser scan")
     # Keep the latest uploaded defaults unchanged.
-    g.add_argument("--scan-length-mm", type=positive_float, default=30.0)
+    g.add_argument(
+        "--scan-length-mm",
+        type=positive_float,
+        default=30.0,
+        help="Linear sweep length of EVERY random scan in mm.",
+    )
     g.add_argument("--scan-step-mm", type=positive_float, default=1.0)
     g.add_argument("--profile-width-mm", type=positive_float, default=32.0)
     g.add_argument("--profile-points", type=positive_int, default=321)
@@ -174,10 +178,29 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--dropout-rate", type=probability, default=0.03)
     g.add_argument("--outlier-rate", type=probability, default=0.01)
     g.add_argument("--outlier-sigma-mm", type=positive_float, default=3.0)
+    g.add_argument(
+        "--random-scan-max-attempts",
+        type=positive_int,
+        default=100,
+        help=(
+            "Maximum random re-draws when a sampled scan is too close to a previous "
+            "scan or produces fewer than --min-new-scan-points."
+        ),
+    )
 
     g = p.add_argument_group("Hidden GT (simulation only)")
-    g.add_argument("--gt-translation-mm", type=float, default=40.0)
-    g.add_argument("--gt-rotation-deg", type=float, default=20.0)
+    g.add_argument(
+        "--gt-generation",
+        choices=("prior-gaussian", "fixed-magnitude"),
+        default="prior-gaussian",
+        help=(
+            "How hidden GT is generated. 'prior-gaussian' samples GT around the supplied "
+            "initial pose using the same SE(3) Gaussian prior sigmas. 'fixed-magnitude' "
+            "uses --gt-translation-mm/--gt-rotation-deg around the supplied initial pose."
+        ),
+    )
+    g.add_argument("--gt-translation-mm", type=float, default=30.0)
+    g.add_argument("--gt-rotation-deg", type=float, default=5.0)
 
     g = p.add_argument_group("PCL PPF registration")
     g.add_argument(
@@ -205,29 +228,117 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    g = p.add_argument_group("Pose clustering + Top1-relative hypothesis set")
+    g = p.add_argument_group("PPF proposal clustering")
     g.add_argument("--cluster-translation-mm", type=positive_float, default=10.0)
     g.add_argument("--cluster-rotation-deg", type=positive_float, default=10.0)
-    g.add_argument(
-        "--plausible-vote-relative",
-        type=float,
-        default=0.80,
-        help=(
-            "Keep a PPF pose cluster as plausible when score_i / score_1 is "
-            "at least this value. Default 0.50 means >= 50%% of Top1 support."
-        ),
-    )
-    g.add_argument(
-        "--stop-runnerup-relative",
-        type=float,
-        default=0.65,
-        help=(
-            "Stop active scanning when score_2 / score_1 is below this value. "
-            "Default 0.30 means the runner-up has < 30%% of Top1 support."
-        ),
-    )
     g.add_argument("--plot-top-clusters", type=positive_int, default=20)
     g.add_argument("--visualize-max-hypotheses", type=positive_int, default=8)
+
+    g = p.add_argument_group("Bayesian pose posterior (sensor-agnostic geometry)")
+    g.add_argument(
+        "--prior-pose-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file containing a 4x4 initial T_model_to_world, either as "
+            "a bare 4x4 array or under key 'T_model_to_world'. In simulation, the "
+            "default prior mean is identity, i.e. the nominal initial object pose."
+        ),
+    )
+    g.add_argument("--prior-translation-sigma-mm", type=positive_float, default=30.0)
+    g.add_argument("--prior-rotation-sigma-deg", type=positive_float, default=5.0)
+    g.add_argument(
+        "--prior-gate-mahalanobis",
+        type=positive_float,
+        default=4.48,
+        help=(
+            "Hard SE(3) prior gate on PPF/refined poses. 4.48 is approximately the "
+            "99.73%% chi-square radius for 6 DoF. Candidates outside this ellipsoid "
+            "are rejected instead of being allowed to overpower the prior via geometry."
+        ),
+    )
+    g.add_argument("--posterior-max-hypotheses", type=positive_int, default=20)
+    g.add_argument(
+        "--posterior-plausible-relative",
+        type=float,
+        default=0.20,
+        help="Keep hypotheses whose posterior weight is at least this fraction of MAP.",
+    )
+    g.add_argument(
+        "--posterior-stop-runnerup-relative",
+        type=float,
+        default=0.05,
+        help="Stop when posterior runner-up / MAP weight falls below this value.",
+    )
+    g.add_argument(
+        "--geom-sigma-normal-mm",
+        type=positive_float,
+        default=1.0,
+        help="Gaussian surface thickness along the CAD normal; geometric-model scale.",
+    )
+    g.add_argument(
+        "--geom-sigma-tangent-mm",
+        type=positive_float,
+        default=3.0,
+        help="Gaussian scale in the CAD tangent plane; geometric-model scale.",
+    )
+    g.add_argument(
+        "--geom-object-prior",
+        type=float,
+        default=0.80,
+        help="Mixture prior P(point came from target object), in (0,1).",
+    )
+    g.add_argument(
+        "--geom-outlier-halfwidth-mm",
+        type=positive_float,
+        default=100.0,
+        help="Half-width of the 3-D uniform background/outlier component.",
+    )
+    g.add_argument(
+        "--geom-max-points",
+        type=positive_int,
+        default=3000,
+        help="Deterministic cap on cumulative scan points used for likelihood scoring.",
+    )
+    g.add_argument(
+        "--geom-observation-spacing-mm",
+        type=positive_float,
+        default=2.0,
+        help=(
+            "Minimum spatial spacing for geometric-likelihood observations. "
+            "This reduces overconfidence from densely correlated points."
+        ),
+    )
+    g.add_argument(
+        "--posterior-local-refine-iterations",
+        type=positive_int,
+        default=8,
+        help="Robust Gauss-Newton iterations used to refine each PPF proposal locally.",
+    )
+    g.add_argument(
+        "--posterior-local-refine-max-translation-step-mm",
+        type=positive_float,
+        default=5.0,
+        help="Maximum translation norm of one local SE(3) refinement step.",
+    )
+    g.add_argument(
+        "--posterior-local-refine-max-rotation-step-deg",
+        type=positive_float,
+        default=2.0,
+        help="Maximum rotation norm of one local SE(3) refinement step.",
+    )
+    g.add_argument(
+        "--posterior-stop-translation-std-mm",
+        type=positive_float,
+        default=1.0,
+        help="Require every MAP local translation std axis to be below this to stop.",
+    )
+    g.add_argument(
+        "--posterior-stop-rotation-std-deg",
+        type=positive_float,
+        default=1.0,
+        help="Require every MAP local rotation std axis to be below this to stop.",
+    )
 
     g = p.add_argument_group("CAD FPFH")
     g.add_argument("--fpfh-voxel-mm", type=positive_float, default=2.0)
@@ -296,16 +407,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("dropout + outlier rate must be < 1")
     if args.gt_translation_mm < 0 or args.gt_rotation_deg < 0:
         raise ValueError("GT magnitudes must be non-negative")
-    if not 0.0 < args.plausible_vote_relative <= 1.0:
-        raise ValueError("--plausible-vote-relative must be in (0,1]")
-    if not 0.0 <= args.stop_runnerup_relative < 1.0:
-        raise ValueError("--stop-runnerup-relative must be in [0,1)")
-    if args.stop_runnerup_relative >= args.plausible_vote_relative:
+    if args.prior_pose_json is not None and not args.prior_pose_json.is_file():
+        raise ValueError(f"--prior-pose-json does not exist: {args.prior_pose_json}")
+    if not 0.0 < args.posterior_plausible_relative <= 1.0:
+        raise ValueError("--posterior-plausible-relative must be in (0,1]")
+    if not 0.0 <= args.posterior_stop_runnerup_relative < 1.0:
+        raise ValueError("--posterior-stop-runnerup-relative must be in [0,1)")
+    if args.posterior_stop_runnerup_relative >= args.posterior_plausible_relative:
         raise ValueError(
-            "--stop-runnerup-relative should be smaller than "
-            "--plausible-vote-relative so an ambiguous Top2 can be retained "
-            "for active discrimination before stopping."
+            "--posterior-stop-runnerup-relative should be smaller than "
+            "--posterior-plausible-relative."
         )
+    if not 0.0 < args.geom_object_prior < 1.0:
+        raise ValueError("--geom-object-prior must be in (0,1)")
     if not 0.0 < args.fpfh_max_incidence_deg < 90.0:
         raise ValueError("--fpfh-max-incidence-deg must be in (0,90)")
     if args.rescan_exclusion_mm < 0:
@@ -328,6 +442,84 @@ def invert_transform(T: np.ndarray) -> np.ndarray:
 def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     return points @ T[:3, :3].T + T[:3, 3]
+
+
+def skew(v: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(v, dtype=np.float64)
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+
+
+def se3_log_vector(T: np.ndarray) -> np.ndarray:
+    """Return xi=[rho, phi] with T=Exp(xi^) using the SE(3) logarithm."""
+    T = np.asarray(T, dtype=np.float64)
+    phi = Rotation.from_matrix(T[:3, :3]).as_rotvec()
+    theta = float(np.linalg.norm(phi))
+    Omega = skew(phi)
+    if theta < 1.0e-8:
+        V = np.eye(3) + 0.5 * Omega + (1.0 / 6.0) * (Omega @ Omega)
+    else:
+        theta2 = theta * theta
+        V = (
+            np.eye(3)
+            + ((1.0 - math.cos(theta)) / theta2) * Omega
+            + ((theta - math.sin(theta)) / (theta2 * theta)) * (Omega @ Omega)
+        )
+    rho = np.linalg.solve(V, T[:3, 3])
+    return np.r_[rho, phi]
+
+
+def se3_exp_vector(xi: np.ndarray) -> np.ndarray:
+    """Return T=Exp(xi^) for xi=[rho, phi]."""
+    xi = np.asarray(xi, dtype=np.float64).reshape(6)
+    rho = xi[:3]
+    phi = xi[3:]
+    theta = float(np.linalg.norm(phi))
+    Omega = skew(phi)
+    if theta < 1.0e-8:
+        Rm = np.eye(3) + Omega + 0.5 * (Omega @ Omega)
+        V = np.eye(3) + 0.5 * Omega + (1.0 / 6.0) * (Omega @ Omega)
+    else:
+        theta2 = theta * theta
+        Rm = Rotation.from_rotvec(phi).as_matrix()
+        V = (
+            np.eye(3)
+            + ((1.0 - math.cos(theta)) / theta2) * Omega
+            + ((theta - math.sin(theta)) / (theta2 * theta)) * (Omega @ Omega)
+        )
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = Rm
+    T[:3, 3] = V @ rho
+    return T
+
+
+def load_prior_pose(args) -> np.ndarray:
+    """Load the externally supplied nominal object pose; identity is the simulation default."""
+    if args.prior_pose_json is None:
+        return np.eye(4, dtype=np.float64)
+    with args.prior_pose_json.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    raw = obj.get("T_model_to_world") if isinstance(obj, dict) else obj
+    T = np.asarray(raw, dtype=np.float64)
+    if T.shape != (4, 4):
+        raise ValueError("--prior-pose-json must contain a 4x4 T_model_to_world")
+    if not np.all(np.isfinite(T)):
+        raise ValueError("--prior-pose-json contains non-finite values")
+    if not np.allclose(T[3], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-8):
+        raise ValueError("--prior-pose-json last row must be [0,0,0,1]")
+    return T
+
+
+def pose_prior_log_score(T: np.ndarray, prior_T: np.ndarray, args) -> tuple[float, float, np.ndarray]:
+    """Unnormalized log N_SE3(T; prior_T, Sigma0) and its Mahalanobis distance."""
+    xi = se3_log_vector(invert_transform(prior_T) @ T)
+    sigma_t = args.prior_translation_sigma_mm / 1000.0
+    sigma_r = math.radians(args.prior_rotation_sigma_deg)
+    inv_var = np.array(
+        [1.0 / sigma_t**2] * 3 + [1.0 / sigma_r**2] * 3,
+        dtype=np.float64,
+    )
+    mahal2 = float(np.sum(xi * xi * inv_var))
+    return -0.5 * mahal2, math.sqrt(max(mahal2, 0.0)), xi
 
 def rotation_distance_deg(R1: np.ndarray, R2: np.ndarray) -> float:
     R = R1.T @ R2
@@ -526,17 +718,34 @@ def sample_oriented_cad_drost(mesh, sample_points: int, diameter_m: float, args)
     )
     return points, normals
 
-def random_gt_transform(args, rng):
-    T = np.eye(4)
+def random_gt_transform(prior_T: np.ndarray, args, rng):
+    """Generate hidden GT *around the supplied initial pose*.
+
+    This is important: the initial pose is the prior mean.  The hidden true pose must
+    therefore be a perturbation of that mean, not an unrelated transform around identity.
+    """
+    prior_T = np.asarray(prior_T, dtype=np.float64)
+
+    if args.gt_generation == "prior-gaussian":
+        sigma_t = args.prior_translation_sigma_mm / 1000.0
+        sigma_r = math.radians(args.prior_rotation_sigma_deg)
+        xi = np.r_[
+            rng.normal(0.0, sigma_t, size=3),
+            rng.normal(0.0, sigma_r, size=3),
+        ]
+        return prior_T @ se3_exp_vector(xi)
+
+    # Fixed-magnitude perturbation, still centered on the supplied initial pose.
+    delta = np.eye(4, dtype=np.float64)
     if args.gt_rotation_deg > 0:
         axis = normalize(rng.normal(size=3))
-        T[:3, :3] = Rotation.from_rotvec(
+        delta[:3, :3] = Rotation.from_rotvec(
             axis * math.radians(args.gt_rotation_deg)
         ).as_matrix()
     if args.gt_translation_mm > 0:
         direction = normalize(rng.normal(size=3))
-        T[:3, 3] = direction * args.gt_translation_mm / 1000.0
-    return T
+        delta[:3, 3] = direction * args.gt_translation_mm / 1000.0
+    return prior_T @ delta
 
 def build_raycast_scene(mesh):
     o3d = require_open3d()
@@ -788,6 +997,296 @@ def make_icp_target(mesh, args):
         )
     )
     return cloud
+
+
+def prepare_geometric_likelihood_target(target_cloud) -> dict[str, Any]:
+    """Common CAD surface representation used by every sensor type after 3-D conversion."""
+    points = np.asarray(target_cloud.points, dtype=np.float64)
+    normals = np.asarray(target_cloud.normals, dtype=np.float64)
+    if len(points) == 0 or len(normals) != len(points):
+        raise RuntimeError("Geometric likelihood target requires CAD points and normals")
+    normals = np.asarray([normalize(n) for n in normals], dtype=np.float64)
+    return {"points_m": points, "normals": normals, "tree": cKDTree(points)}
+
+
+def prepare_geometric_observations(points_world: np.ndarray, args) -> np.ndarray:
+    """Spatially decorrelate dense observations before likelihood/information use."""
+    pts = np.asarray(points_world, dtype=np.float64)
+    if len(pts) == 0:
+        raise RuntimeError("Cannot evaluate geometric likelihood on an empty scan")
+
+    spacing_m = args.geom_observation_spacing_mm / 1000.0
+    if spacing_m > 0.0 and len(pts) > 1:
+        keep = deterministic_min_distance_sample_indices(pts, spacing_m)
+        pts = pts[keep]
+
+    if len(pts) > args.geom_max_points:
+        ids = np.linspace(0, len(pts) - 1, args.geom_max_points, dtype=np.int64)
+        pts = pts[ids]
+    return pts
+
+
+def geometric_mixture_terms(
+    prepared_points_world: np.ndarray,
+    hypothesis_model_to_world: np.ndarray,
+    geom_db: dict[str, Any],
+    args,
+) -> dict[str, Any]:
+    """Evaluate robust object/background mixture and local CAD correspondences."""
+    pts = np.asarray(prepared_points_world, dtype=np.float64)
+    world_to_model = invert_transform(hypothesis_model_to_world)
+    x = transform_points(pts, world_to_model)
+    nn_dist, nn_id = geom_db["tree"].query(x, k=1, workers=-1)
+    m = geom_db["points_m"][nn_id]
+    n = geom_db["normals"][nn_id]
+    delta = x - m
+
+    e_n = np.einsum("ij,ij->i", delta, n)
+    d2 = np.einsum("ij,ij->i", delta, delta)
+    e_t2 = np.maximum(d2 - e_n * e_n, 0.0)
+
+    sigma_n = args.geom_sigma_normal_mm / 1000.0
+    sigma_t = args.geom_sigma_tangent_mm / 1000.0
+    log_norm_obj = (
+        -1.5 * math.log(2.0 * math.pi)
+        - math.log(sigma_n)
+        - 2.0 * math.log(sigma_t)
+    )
+    logp_obj = log_norm_obj - 0.5 * (
+        (e_n / sigma_n) ** 2 + e_t2 / (sigma_t * sigma_t)
+    )
+
+    pi_obj = float(args.geom_object_prior)
+    half = args.geom_outlier_halfwidth_mm / 1000.0
+    outlier_volume = max((2.0 * half) ** 3, EPS)
+    logp_out = -math.log(outlier_volume)
+
+    a = math.log(pi_obj) + logp_obj
+    b = math.log(1.0 - pi_obj) + logp_out
+    log_mix = np.logaddexp(a, b)
+    gamma_obj = np.exp(a - log_mix)
+
+    return {
+        "points_world": pts,
+        "points_model": x,
+        "cad_points": m,
+        "cad_normals": n,
+        "delta": delta,
+        "nn_dist": nn_dist,
+        "normal_residual": e_n,
+        "gamma_obj": gamma_obj,
+        "log_mix": log_mix,
+    }
+
+
+def geometric_information_and_gradient(
+    terms: dict[str, Any],
+    args,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Gauss-Newton information/gradient for the robust anisotropic surface model.
+
+    The latent object responsibility gamma downweights background/outlier points.
+    A right perturbation T' = T Exp(dxi^) gives, in the model frame,
+        x' ~= x + [-I, [x]_x] dxi.
+    """
+    sigma_n = args.geom_sigma_normal_mm / 1000.0
+    sigma_t = args.geom_sigma_tangent_mm / 1000.0
+    inv_t2 = 1.0 / (sigma_t * sigma_t)
+    inv_n2 = 1.0 / (sigma_n * sigma_n)
+
+    H = np.zeros((6, 6), dtype=np.float64)
+    g = np.zeros(6, dtype=np.float64)
+    I3 = np.eye(3, dtype=np.float64)
+
+    for x, n, delta, gamma in zip(
+        terms["points_model"],
+        terms["cad_normals"],
+        terms["delta"],
+        terms["gamma_obj"],
+    ):
+        # Inverse covariance: tangent variance sigma_t^2, normal variance sigma_n^2.
+        W = inv_t2 * I3 + (inv_n2 - inv_t2) * np.outer(n, n)
+        J = np.hstack((-I3, skew(x)))
+        wg = float(gamma)
+        H += wg * (J.T @ W @ J)
+        g += wg * (J.T @ W @ delta)
+    return H, g
+
+
+def prior_information_matrix(args) -> np.ndarray:
+    sigma_t = args.prior_translation_sigma_mm / 1000.0
+    sigma_r = math.radians(args.prior_rotation_sigma_deg)
+    return np.diag([1.0 / sigma_t**2] * 3 + [1.0 / sigma_r**2] * 3)
+
+
+def robust_geometric_log_likelihood(
+    points_world: np.ndarray,
+    hypothesis_model_to_world: np.ndarray,
+    geom_db: dict[str, Any],
+    args,
+) -> dict[str, float]:
+    """Sensor-agnostic robust surface likelihood on spatially decorrelated points."""
+    pts = prepare_geometric_observations(points_world, args)
+    terms = geometric_mixture_terms(pts, hypothesis_model_to_world, geom_db, args)
+    return {
+        "log_likelihood": float(np.sum(terms["log_mix"])),
+        "mean_log_likelihood": float(np.mean(terms["log_mix"])),
+        "expected_object_fraction": float(np.mean(terms["gamma_obj"])),
+        "mean_abs_normal_residual_mm": float(
+            np.mean(np.abs(terms["normal_residual"])) * 1000.0
+        ),
+        "median_nn_distance_mm": float(np.median(terms["nn_dist"]) * 1000.0),
+        "evaluated_points": int(len(pts)),
+    }
+
+
+def local_refine_and_covariance(
+    initial_T: np.ndarray,
+    prepared_points_world: np.ndarray,
+    prior_T: np.ndarray,
+    geom_db: dict[str, Any],
+    args,
+) -> dict[str, Any]:
+    """Refine one PPF proposal and build its Laplace/Gauss-Newton covariance.
+
+    This turns a discrete PPF proposal into one Gaussian component (T_i, Sigma_i).
+    The prior is included as local information.  The SE(3) prior Jacobian is
+    approximated as identity in the local tangent space, which is the standard
+    small-perturbation Gauss-Newton approximation used here.
+    """
+    T = np.asarray(initial_T, dtype=np.float64).copy()
+    Lambda0 = prior_information_matrix(args)
+
+    def score(Tq: np.ndarray) -> tuple[float, dict[str, Any], np.ndarray, float]:
+        terms_q = geometric_mixture_terms(prepared_points_world, Tq, geom_db, args)
+        prior_log, prior_mahal, xi_q = pose_prior_log_score(Tq, prior_T, args)
+        if prior_mahal > args.prior_gate_mahalanobis:
+            total = -float("inf")
+        else:
+            total = float(prior_log + np.sum(terms_q["log_mix"]))
+        return total, terms_q, xi_q, float(prior_mahal)
+
+    current_score, terms, xi_prior, prior_mahal = score(T)
+    iterations = 0
+
+    for it in range(args.posterior_local_refine_iterations):
+        H_geom, g_geom = geometric_information_and_gradient(terms, args)
+        H = H_geom + Lambda0
+        # Local approximation of the prior gradient.
+        g = g_geom + Lambda0 @ xi_prior
+
+        # Small Levenberg damping only for numerical stability; prior keeps H SPD.
+        damp = max(float(np.max(np.diag(H))), 1.0) * 1.0e-10
+        try:
+            dxi = -np.linalg.solve(H + damp * np.eye(6), g)
+        except np.linalg.LinAlgError:
+            dxi = -np.linalg.pinv(H + damp * np.eye(6), rcond=1.0e-12) @ g
+
+        max_t = args.posterior_local_refine_max_translation_step_mm / 1000.0
+        max_r = math.radians(args.posterior_local_refine_max_rotation_step_deg)
+        nt = float(np.linalg.norm(dxi[:3]))
+        nr = float(np.linalg.norm(dxi[3:]))
+        if nt > max_t:
+            dxi[:3] *= max_t / max(nt, EPS)
+        if nr > max_r:
+            dxi[3:] *= max_r / max(nr, EPS)
+
+        if np.linalg.norm(dxi[:3]) < 1.0e-7 and np.linalg.norm(dxi[3:]) < 1.0e-6:
+            break
+
+        accepted = False
+        for alpha in (1.0, 0.5, 0.25, 0.1):
+            T_try = T @ se3_exp_vector(alpha * dxi)
+            try_score, try_terms, try_xi, try_mahal = score(T_try)
+            if try_score > current_score + 1.0e-9:
+                T = T_try
+                current_score = try_score
+                terms = try_terms
+                xi_prior = try_xi
+                prior_mahal = try_mahal
+                accepted = True
+                break
+        iterations = it + 1
+        if not accepted:
+            break
+
+    # Laplace covariance at the locally refined component center.
+    H_geom, _ = geometric_information_and_gradient(terms, args)
+    H = H_geom + Lambda0
+    H = 0.5 * (H + H.T)
+    eigval, eigvec = np.linalg.eigh(H)
+    floor = max(float(np.max(eigval)), 1.0) * 1.0e-12
+    eigval = np.maximum(eigval, floor)
+    covariance = (eigvec * (1.0 / eigval)[None, :]) @ eigvec.T
+    covariance = 0.5 * (covariance + covariance.T)
+
+    std_t_mm = np.sqrt(np.maximum(np.diag(covariance)[:3], 0.0)) * 1000.0
+    std_r_deg = np.degrees(np.sqrt(np.maximum(np.diag(covariance)[3:], 0.0)))
+
+    return {
+        "T_model_to_world": T,
+        "covariance_6x6": covariance,
+        "local_std_translation_mm": std_t_mm,
+        "local_std_rotation_deg": std_r_deg,
+        "log_posterior_unnormalized": float(current_score),
+        "prior_mahalanobis": float(prior_mahal),
+        "prior_xi": xi_prior,
+        "log_likelihood": float(np.sum(terms["log_mix"])),
+        "mean_log_likelihood": float(np.mean(terms["log_mix"])),
+        "expected_object_fraction": float(np.mean(terms["gamma_obj"])),
+        "mean_abs_normal_residual_mm": float(
+            np.mean(np.abs(terms["normal_residual"])) * 1000.0
+        ),
+        "median_nn_distance_mm": float(np.median(terms["nn_dist"]) * 1000.0),
+        "evaluated_points": int(len(prepared_points_world)),
+        "refine_iterations": int(iterations),
+    }
+
+
+def expected_covariance_information_gain(
+    candidate: dict[str, Any],
+    current_covariance: np.ndarray,
+    geom_db: dict[str, Any],
+    args,
+) -> dict[str, float]:
+    """Expected local information gain from the CAD geometry in one scan footprint."""
+    pts = np.asarray(candidate["expected_scan_cad"].clean_points_m, dtype=np.float64)
+    if len(pts) == 0:
+        return {"information_gain": 0.0, "predicted_max_t_std_mm": float("inf"),
+                "predicted_max_r_std_deg": float("inf")}
+    pts = prepare_geometric_observations(pts, args)
+    _, nn_id = geom_db["tree"].query(pts, k=1, workers=-1)
+    n = geom_db["normals"][nn_id]
+
+    sigma_n = args.geom_sigma_normal_mm / 1000.0
+    sigma_t = args.geom_sigma_tangent_mm / 1000.0
+    inv_t2 = 1.0 / (sigma_t * sigma_t)
+    inv_n2 = 1.0 / (sigma_n * sigma_n)
+    I3 = np.eye(3, dtype=np.float64)
+    Hscan = np.zeros((6, 6), dtype=np.float64)
+    # Expected inlier weight: use the object-mixture prior before seeing the scan.
+    gamma_expected = float(args.geom_object_prior)
+    for x, ni in zip(pts, n):
+        W = inv_t2 * I3 + (inv_n2 - inv_t2) * np.outer(ni, ni)
+        J = np.hstack((-I3, skew(x)))
+        Hscan += gamma_expected * (J.T @ W @ J)
+
+    current_covariance = 0.5 * (current_covariance + current_covariance.T)
+    current_info = np.linalg.pinv(current_covariance, rcond=1.0e-12)
+    post_info = 0.5 * (current_info + Hscan + (current_info + Hscan).T)
+    post_cov = np.linalg.pinv(post_info, rcond=1.0e-12)
+    post_cov = 0.5 * (post_cov + post_cov.T)
+
+    sign0, logdet0 = np.linalg.slogdet(current_covariance)
+    sign1, logdet1 = np.linalg.slogdet(post_cov)
+    info_gain = 0.0 if sign0 <= 0 or sign1 <= 0 else 0.5 * float(logdet0 - logdet1)
+    std_t = np.sqrt(np.maximum(np.diag(post_cov)[:3], 0.0)) * 1000.0
+    std_r = np.degrees(np.sqrt(np.maximum(np.diag(post_cov)[3:], 0.0)))
+    return {
+        "information_gain": float(max(info_gain, 0.0)),
+        "predicted_max_t_std_mm": float(np.max(std_t)),
+        "predicted_max_r_std_deg": float(np.max(std_r)),
+    }
 
 def orient_surface_normal_for_raycast(
     scene,
@@ -1262,80 +1761,233 @@ def build_global_unique_candidate_pool(
     return candidates, actions
 
 
-def select_plausible_clusters(
+def build_posterior_state(
     clusters: list[PoseCluster],
+    cumulative_world_points: np.ndarray,
+    prior_T: np.ndarray,
+    geom_db: dict[str, Any],
     args,
 ) -> dict[str, Any]:
-    """Select pose hypotheses by support relative to the best PPF cluster.
+    """Convert PPF proposals into a Gaussian-mixture posterior on SE(3).
 
-    Primary rule:
-        H_i is plausible iff score_i / score_1 >= plausible_vote_relative.
-
-    Stop rule:
-        stop when score_2 / score_1 < stop_runnerup_relative
-        (or only one cluster exists).
-
-    If the primary plausible set contains only H1 but H2 is still above the
-    stop threshold, H2 is temporarily retained in the active bank.  Pairwise
-    FPFH disagreement needs at least two hypotheses to choose an informative
-    next scan.
+    Each PPF proposal is only an initializer.  It is locally refined under the
+    robust geometric likelihood and SE(3) prior, then assigned a Laplace/GN
+    covariance Sigma_i.  Refined proposals that converge to the same local basin
+    are de-duplicated so proposal multiplicity does not become probability mass.
     """
     if not clusters:
-        raise RuntimeError("Cannot select plausible hypotheses from zero clusters")
+        raise RuntimeError("Cannot build posterior from zero PPF proposals")
 
-    scores = np.asarray([max(float(c.score), EPS) for c in clusters], dtype=float)
-    relative = scores / scores[0]
+    prepared_points = prepare_geometric_observations(cumulative_world_points, args)
+    proposals = clusters[: min(len(clusters), args.posterior_max_hypotheses)]
+    raw_records: list[dict[str, Any]] = []
 
-    plausible_count = int(np.count_nonzero(relative >= args.plausible_vote_relative))
-    plausible_count = max(1, plausible_count)
+    rejected_by_prior = 0
+    nearest_rejected_mahal = float("inf")
+    for cluster in proposals:
+        _, proposal_prior_mahal, _ = pose_prior_log_score(
+            cluster.transform_model_to_world, prior_T, args
+        )
+        if proposal_prior_mahal > args.prior_gate_mahalanobis:
+            rejected_by_prior += 1
+            nearest_rejected_mahal = min(nearest_rejected_mahal, proposal_prior_mahal)
+            continue
 
-    if len(scores) == 1:
+        local = local_refine_and_covariance(
+            cluster.transform_model_to_world,
+            prepared_points,
+            prior_T,
+            geom_db,
+            args,
+        )
+        if not np.isfinite(local["log_posterior_unnormalized"]):
+            rejected_by_prior += 1
+            nearest_rejected_mahal = min(nearest_rejected_mahal, local["prior_mahalanobis"])
+            continue
+        refined_cluster = PoseCluster(
+            rank=int(cluster.rank),
+            transform_model_to_world=local["T_model_to_world"].copy(),
+            score=float(cluster.score),
+            member_count=int(cluster.member_count),
+            members=list(cluster.members),
+            translation_spread_mm=float(cluster.translation_spread_mm),
+            rotation_spread_deg=float(cluster.rotation_spread_deg),
+        )
+        raw_records.append({
+            "cluster": refined_cluster,
+            "proposal_transform_model_to_world": cluster.transform_model_to_world.copy(),
+            "source_cluster_rank": int(cluster.rank),
+            "ppf_vote": float(cluster.score),
+            "prior_log_score": float(-0.5 * local["prior_mahalanobis"] ** 2),
+            **local,
+            "merged_proposal_count": 1,
+        })
+
+    if not raw_records:
+        nearest_msg = (
+            f", nearest rejected priorD={nearest_rejected_mahal:.2f}"
+            if np.isfinite(nearest_rejected_mahal) else ""
+        )
+        raise RuntimeError(
+            "All PPF proposals were rejected by the initial-pose prior gate "
+            f"(Mahalanobis radius <= {args.prior_gate_mahalanobis:.2f}{nearest_msg}). "
+            "This means PPF did not return a pose consistent with the supplied initial "
+            "estimate. Increase the prior sigmas/gate only if the initial estimate is "
+            "actually that uncertain; do not silently snap to a distant pose."
+        )
+
+    # Remove duplicate local modes.  PPF proposal multiplicity is not Bayesian mass.
+    raw_records.sort(key=lambda r: r["log_posterior_unnormalized"], reverse=True)
+    records: list[dict[str, Any]] = []
+    trans_thr = args.cluster_translation_mm / 1000.0
+    rot_thr = args.cluster_rotation_deg
+    for rec in raw_records:
+        T = rec["T_model_to_world"]
+        duplicate_of = None
+        for kept in records:
+            Tk = kept["T_model_to_world"]
+            dt = float(np.linalg.norm(T[:3, 3] - Tk[:3, 3]))
+            dr = rotation_distance_deg(T[:3, :3], Tk[:3, :3])
+            if dt <= trans_thr and dr <= rot_thr:
+                duplicate_of = kept
+                break
+        if duplicate_of is None:
+            records.append(rec)
+        else:
+            duplicate_of["merged_proposal_count"] += 1
+
+    logw = np.asarray([r["log_posterior_unnormalized"] for r in records], dtype=float)
+    logw -= float(np.max(logw))
+    w = np.exp(logw)
+    w /= max(float(np.sum(w)), EPS)
+    for r, wi in zip(records, w):
+        r["posterior_weight"] = float(wi)
+
+    records.sort(key=lambda r: r["posterior_weight"], reverse=True)
+    weights = np.asarray([r["posterior_weight"] for r in records], dtype=float)
+    relative = weights / max(weights[0], EPS)
+
+    plausible_count = max(
+        1,
+        int(np.count_nonzero(relative >= args.posterior_plausible_relative)),
+    )
+    if len(records) == 1:
         runnerup_relative = 0.0
-        stop_ready = True
+        mode_separated = True
     else:
         runnerup_relative = float(relative[1])
-        stop_ready = runnerup_relative < args.stop_runnerup_relative
+        mode_separated = runnerup_relative < args.posterior_stop_runnerup_relative
 
-    # Keep H2 as a comparison hypothesis when H1 is not yet separated enough
-    # to stop, even if H2 lies below the normal plausible threshold.
-    active_count = plausible_count
-    comparison_guard = False
-    if not stop_ready and active_count == 1 and len(clusters) >= 2:
-        active_count = 2
-        comparison_guard = True
+    map_rec = records[0]
+    max_t_std_mm = float(np.max(map_rec["local_std_translation_mm"]))
+    max_r_std_deg = float(np.max(map_rec["local_std_rotation_deg"]))
+    local_confident = (
+        max_t_std_mm <= args.posterior_stop_translation_std_mm
+        and max_r_std_deg <= args.posterior_stop_rotation_std_deg
+    )
+    stop_ready = bool(mode_separated and local_confident)
 
+    if not mode_separated:
+        active_count = plausible_count
+        comparison_guard = False
+        if active_count == 1 and len(records) >= 2:
+            active_count = 2
+            comparison_guard = True
+        planning_mode = "mode_disambiguation"
+    elif not local_confident:
+        # One mode is dominant, but its continuous covariance is still too large.
+        active_count = 1
+        comparison_guard = False
+        planning_mode = "local_covariance_reduction"
+    else:
+        active_count = 1
+        comparison_guard = False
+        planning_mode = "stop"
+
+    active = records[:active_count]
+    plausible = records[:plausible_count]
     return {
-        "clusters": clusters[:active_count],
-        "plausible_clusters": clusters[:plausible_count],
+        "records": records,
+        "active_records": active,
+        "plausible_records": plausible,
+        "clusters": [r["cluster"] for r in active],
+        "plausible_clusters": [r["cluster"] for r in plausible],
         "count": int(active_count),
         "plausible_count": int(plausible_count),
         "relative_support": relative,
         "runnerup_relative": float(runnerup_relative),
-        "plausible_threshold": float(args.plausible_vote_relative),
-        "stop_threshold": float(args.stop_runnerup_relative),
-        "method": "relative_to_top1",
+        "plausible_threshold": float(args.posterior_plausible_relative),
+        "stop_threshold": float(args.posterior_stop_runnerup_relative),
+        "method": "se3_gmm_prior_x_robust_geometric_likelihood",
         "comparison_guard": bool(comparison_guard),
-        "stop_ready": bool(stop_ready),
+        "mode_separated": bool(mode_separated),
+        "local_confident": bool(local_confident),
+        "map_max_translation_std_mm": max_t_std_mm,
+        "map_max_rotation_std_deg": max_r_std_deg,
+        "planning_mode": planning_mode,
+        "stop_ready": stop_ready,
+        "prepared_geometric_points": int(len(prepared_points)),
+        "ppf_rejected_by_prior_gate": int(rejected_by_prior),
     }
 
 
 def build_hypothesis_bank(
-    relative_state: dict[str, Any],
+    posterior_state: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    kept = relative_state["clusters"]
-    scores = np.asarray([max(float(c.score), EPS) for c in kept], dtype=float)
-    weights = scores / np.sum(scores)
     bank: list[dict[str, Any]] = []
-    for k, (cluster, weight) in enumerate(zip(kept, weights), start=1):
+    for k, rec in enumerate(posterior_state["active_records"], start=1):
         bank.append({
             "bank_id": k,
-            "source_cluster_rank": cluster.rank,
-            "ppf_score": float(cluster.score),
-            "relative_to_top1": float(cluster.score / max(kept[0].score, EPS)),
-            "weight": float(weight),
-            "T_model_to_world": cluster.transform_model_to_world.copy(),
+            "source_cluster_rank": rec["source_cluster_rank"],
+            "ppf_score": rec["ppf_vote"],
+            "relative_to_top1": float(
+                rec["posterior_weight"]
+                / max(posterior_state["active_records"][0]["posterior_weight"], EPS)
+            ),
+            "weight": rec["posterior_weight"],
+            "posterior_weight": rec["posterior_weight"],
+            "prior_mahalanobis": rec["prior_mahalanobis"],
+            "geometric_log_likelihood": rec["log_likelihood"],
+            "expected_object_fraction": rec["expected_object_fraction"],
+            "mean_abs_normal_residual_mm": rec["mean_abs_normal_residual_mm"],
+            "median_nn_distance_mm": rec["median_nn_distance_mm"],
+            "local_covariance_6x6": rec["covariance_6x6"].copy(),
+            "local_std_translation_mm": rec["local_std_translation_mm"].copy(),
+            "local_std_rotation_deg": rec["local_std_rotation_deg"].copy(),
+            "refine_iterations": rec["refine_iterations"],
+            "merged_proposal_count": rec["merged_proposal_count"],
+            "T_model_to_world": rec["T_model_to_world"].copy(),
         })
+    z = sum(h["weight"] for h in bank)
+    for h in bank:
+        h["weight"] /= max(z, EPS)
     return bank
+
+
+def posterior_gmm_covariance(bank: list[dict[str, Any]]) -> np.ndarray:
+    """Total GMM covariance = within-component + between-component covariance."""
+    if not bank:
+        return np.full((6, 6), np.nan)
+    T_ref = bank[0]["T_model_to_world"]
+    w = np.asarray([h["weight"] for h in bank], dtype=float)
+    w /= max(float(np.sum(w)), EPS)
+    xi = np.asarray([
+        se3_log_vector(invert_transform(T_ref) @ h["T_model_to_world"])
+        for h in bank
+    ])
+    mu = np.sum(w[:, None] * xi, axis=0)
+    cov = np.zeros((6, 6), dtype=np.float64)
+    for wi, h, xii in zip(w, bank, xi):
+        d = xii - mu
+        cov += wi * (h["local_covariance_6x6"] + np.outer(d, d))
+    return 0.5 * (cov + cov.T)
+
+
+def posterior_local_covariance(bank: list[dict[str, Any]]) -> np.ndarray:
+    """Backward-compatible alias: return the MAP component's local covariance."""
+    if not bank:
+        return np.full((6, 6), np.nan)
+    return np.asarray(bank[0]["local_covariance_6x6"], dtype=np.float64)
 
 def select_discriminative_next_scan(
     candidates: list[dict[str, Any]],
@@ -1344,27 +1996,25 @@ def select_discriminative_next_scan(
     bank: list[dict[str, Any]],
     map_model_to_world: np.ndarray,
     fpfh_db: dict[str, Any],
+    posterior_state: dict[str, Any],
+    geom_db: dict[str, Any],
     args,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Select the next scan using only CAD-patch FPFH hypothesis separation.
+    """Adaptive next-scan planner.
 
-    Offline:
-        candidates were already chosen for high CAD-global FPFH uniqueness.
-
-    Online:
-        - place each candidate in the world using the current PPF Top1 pose,
-        - map that same world footprint back through every active hypothesis,
-        - require a valid CAD patch under every hypothesis,
-        - choose the action with maximum weighted pairwise FPFH distance.
-
-    This is deliberately the *only* next-scan score.
+    - Multi-modal posterior: choose a scan that maximally separates pose modes
+      using weighted CAD-FPFH disagreement.
+    - Single dominant mode but large local covariance: choose a scan with maximal
+      expected local Fisher information / covariance reduction.
     """
+    mode = posterior_state["planning_mode"]
     weights = np.asarray([h["weight"] for h in bank], dtype=float)
-    weights /= np.sum(weights)
+    weights /= max(float(np.sum(weights)), EPS)
 
     best: dict[str, Any] | None = None
     evaluations: list[dict[str, Any]] = []
     exclude_m = args.rescan_exclusion_mm / 1000.0
+    current_cov = np.asarray(bank[0]["local_covariance_6x6"], dtype=np.float64)
 
     for candidate in candidates:
         candidate_id = int(candidate["candidate_id"])
@@ -1379,52 +2029,73 @@ def select_discriminative_next_scan(
             if dmin < exclude_m:
                 continue
 
-        predicted = [
-            predicted_cad_fpfh_patch(
-                candidate["plan"],
-                map_model_to_world,
-                h["T_model_to_world"],
-                fpfh_db,
-                args,
+        if mode == "mode_disambiguation":
+            predicted = [
+                predicted_cad_fpfh_patch(
+                    candidate["plan"],
+                    map_model_to_world,
+                    h["T_model_to_world"],
+                    fpfh_db,
+                    args,
+                )
+                for h in bank
+            ]
+            utility = fpfh_hypothesis_disagreement_score(
+                predicted, weights, fpfh_db, args
             )
-            for h in bank
-        ]
+            row = {
+                "candidate_id": candidate_id,
+                "planner_mode": mode,
+                "global_uniqueness": float(candidate["global_uniqueness"]),
+                "valid_under_all_hypotheses": bool(utility["valid"]),
+                "valid_patch_count": int(utility["valid_patch_count"]),
+                "hypothesis_count": int(utility["hypothesis_count"]),
+                "fpfh_disagreement": float(utility["score"]),
+                "information_gain": 0.0,
+                "max_raw_feature_distance": float(utility["max_raw_feature_distance"]),
+                "mean_raw_feature_distance": float(utility["mean_raw_feature_distance"]),
+                "planner_score": float(utility["score"]),
+            }
+            evaluations.append(row)
+            if not utility["valid"]:
+                continue
+            result = dict(candidate)
+            result.update(row)
+            result["predicted_patches"] = predicted
 
-        utility = fpfh_hypothesis_disagreement_score(
-            predicted,
-            weights,
-            fpfh_db,
-            args,
-        )
-
-        row = {
-            "candidate_id": candidate_id,
-            "global_uniqueness": float(candidate["global_uniqueness"]),
-            "valid_under_all_hypotheses": bool(utility["valid"]),
-            "valid_patch_count": int(utility["valid_patch_count"]),
-            "hypothesis_count": int(utility["hypothesis_count"]),
-            "fpfh_disagreement": float(utility["score"]),
-            "max_raw_feature_distance": float(utility["max_raw_feature_distance"]),
-            "mean_raw_feature_distance": float(utility["mean_raw_feature_distance"]),
-        }
-        evaluations.append(row)
-
-        if not utility["valid"]:
-            continue
-
-        result = dict(candidate)
-        result.update(row)
-        result["predicted_patches"] = predicted
-        result["planner_score"] = float(utility["score"])
+        elif mode == "local_covariance_reduction":
+            info = expected_covariance_information_gain(
+                candidate, current_cov, geom_db, args
+            )
+            row = {
+                "candidate_id": candidate_id,
+                "planner_mode": mode,
+                "global_uniqueness": float(candidate["global_uniqueness"]),
+                "valid_under_all_hypotheses": True,
+                "valid_patch_count": 1,
+                "hypothesis_count": 1,
+                "fpfh_disagreement": 0.0,
+                "information_gain": float(info["information_gain"]),
+                "predicted_max_t_std_mm": float(info["predicted_max_t_std_mm"]),
+                "predicted_max_r_std_deg": float(info["predicted_max_r_std_deg"]),
+                "max_raw_feature_distance": 0.0,
+                "mean_raw_feature_distance": 0.0,
+                "planner_score": float(info["information_gain"]),
+            }
+            evaluations.append(row)
+            result = dict(candidate)
+            result.update(row)
+            result["predicted_patches"] = []
+        else:
+            raise RuntimeError(f"Unexpected planning mode: {mode}")
 
         if best is None or result["planner_score"] > best["planner_score"]:
             best = result
 
     if best is None:
         raise RuntimeError(
-            "No unused offline candidate has a valid CAD patch under every "
-            "active PPF hypothesis. Increase --candidate-count, reduce "
-            "--rescan-exclusion-mm, or relax CAD patch support parameters."
+            "No unused offline candidate is feasible for the current posterior planner. "
+            "Increase --candidate-count or reduce --rescan-exclusion-mm."
         )
 
     return best, evaluations
@@ -1538,82 +2209,50 @@ def plot_global_uniqueness(
     plt.close(fig)
 
 
-def plot_ppf_relative_support(
+def plot_posterior_support(
     output_dir: Path,
-    clusters: list[PoseCluster],
-    relative_state: dict[str, Any],
+    posterior_state: dict[str, Any],
     round_id: int,
     args,
 ) -> None:
-    """Plot PPF votes together with Top1-relative selection thresholds."""
+    """Plot posterior hypothesis weights; PPF votes are shown only as annotations."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return
 
-    n_show = min(
-        len(clusters),
-        max(args.plot_top_clusters, relative_state["count"] + 3),
-    )
-    shown = clusters[:n_show]
-    scores = np.asarray([c.score for c in shown], dtype=float)
-    relative = scores / max(scores[0], EPS)
-    x = np.arange(1, n_show + 1)
-
+    records = posterior_state["records"][: min(args.plot_top_clusters, len(posterior_state["records"]))]
+    if not records:
+        return
+    weights = np.asarray([r["posterior_weight"] for r in records], dtype=float)
+    x = np.arange(1, len(records) + 1)
     colors = []
-    for i in range(n_show):
-        if i < relative_state["plausible_count"]:
+    for i in range(len(records)):
+        if i < posterior_state["plausible_count"]:
             colors.append("tab:blue")
-        elif i < relative_state["count"]:
-            # H2 can be kept only as a comparison guard when it is below the
-            # normal plausible threshold but still too strong to stop.
+        elif i < posterior_state["count"]:
             colors.append("tab:orange")
         else:
             colors.append("0.72")
 
     fig, ax = plt.subplots(figsize=(10.8, 6.0))
-    ax.bar(x, scores, color=colors)
-
-    plausible_y = args.plausible_vote_relative * scores[0]
-    stop_y = args.stop_runnerup_relative * scores[0]
-    ax.axhline(
-        plausible_y, linestyle="--", linewidth=1.8, color="tab:red",
-        label=f"Plausible threshold = {args.plausible_vote_relative:.0%} of Top1",
-    )
-    ax.axhline(
-        stop_y, linestyle=":", linewidth=1.8, color="tab:green",
-        label=f"Stop runner-up threshold = {args.stop_runnerup_relative:.0%} of Top1",
-    )
-
-    ax.set_xlabel("PPF pose-cluster rank")
-    ax.set_ylabel("Summed PPF votes")
+    ax.bar(x, weights, color=colors)
+    ax.set_xlabel("Posterior pose-hypothesis rank")
+    ax.set_ylabel("Posterior weight")
     ax.set_title(
-        f"PPF vote distribution — round {round_id} | "
-        f"plausible={relative_state['plausible_count']} | "
-        f"H2/H1={relative_state['runnerup_relative']:.2f}"
+        f"SE(3) prior x robust geometric likelihood — round {round_id} | "
+        f"plausible={posterior_state['plausible_count']} | "
+        f"W2/W1={posterior_state['runnerup_relative']:.3f}"
     )
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(loc="upper right")
-    ax.text(
-        0.99, 0.80,
-        f"selection=relative_to_top1\n"
-        f"active bank={relative_state['count']}\n"
-        f"Top1=1.00, H2={relative_state['runnerup_relative']:.2f}",
-        transform=ax.transAxes, ha="right", va="top",
-    )
-
-    # Annotate the first few relative supports so the selection is visually obvious.
-    for i in range(min(8, n_show)):
+    for i, r in enumerate(records[:8]):
         ax.annotate(
-            f"{relative[i]:.2f}",
-            xy=(x[i], scores[i]),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center", va="bottom", fontsize=8,
+            f"PPF#{r['source_cluster_rank']}\nV={r['ppf_vote']:.0f}",
+            xy=(x[i], weights[i]), xytext=(0, 4), textcoords="offset points",
+            ha="center", va="bottom", fontsize=7,
         )
-
     fig.tight_layout()
-    out = output_dir / f"ppf_votes_round_{round_id:02d}.png"
+    out = output_dir / f"posterior_weights_round_{round_id:02d}.png"
     fig.savefig(out, dpi=180)
     print(f"  saved: {out}")
     if args.show:
@@ -1628,12 +2267,7 @@ def plot_candidate_scores(
     attempt_id: int,
     args,
 ) -> None:
-    """Plot only the online CAD-FPFH separation score.
-
-    Invalid candidates are not given an artificial disagreement value. They are
-    shown separately as a count because they fail the prerequisite that every
-    active hypothesis predicts a usable CAD patch.
-    """
+    """Plot whichever posterior-driven next-scan utility is active."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -1641,32 +2275,18 @@ def plot_candidate_scores(
     if not evaluations:
         return
 
-    valid_rows = [
-        r for r in evaluations
-        if r["valid_under_all_hypotheses"]
-    ]
-    invalid_count = len(evaluations) - len(valid_rows)
+    mode = evaluations[0].get("planner_mode", "mode_disambiguation")
+    valid_rows = [r for r in evaluations if r.get("valid_under_all_hypotheses", True)]
     if not valid_rows:
         return
-
-    rows = sorted(
-        valid_rows,
-        key=lambda r: r["fpfh_disagreement"],
-        reverse=True,
-    )[:min(24, len(valid_rows))]
-
+    rows = sorted(valid_rows, key=lambda r: r["planner_score"], reverse=True)
+    rows = rows[:min(24, len(rows))]
     if not any(r["candidate_id"] == selected_id for r in rows):
-        selected_row = next(
-            r for r in valid_rows
-            if r["candidate_id"] == selected_id
-        )
+        selected_row = next(r for r in valid_rows if r["candidate_id"] == selected_id)
         rows[-1] = selected_row
 
     labels = [f"C{r['candidate_id']}" for r in rows]
-    scores = np.asarray(
-        [r["fpfh_disagreement"] for r in rows],
-        dtype=float,
-    )
+    scores = np.asarray([r["planner_score"] for r in rows], dtype=float)
     colors = [
         "tab:pink" if r["candidate_id"] == selected_id else "tab:blue"
         for r in rows
@@ -1675,22 +2295,14 @@ def plot_candidate_scores(
     fig, ax = plt.subplots(figsize=(11.5, 6.0))
     ax.bar(np.arange(len(rows)), scores, color=colors)
     ax.set_xticks(np.arange(len(rows)), labels, rotation=45, ha="right")
-    ax.set_ylabel("Weighted CAD-FPFH disagreement U(a)")
-    ax.set_xlabel("Valid offline global-unique candidate")
-    ax.set_title(
-        f"Next-scan CAD-FPFH hypothesis separation — selection {attempt_id}"
-    )
+    ax.set_xlabel("Offline global-unique candidate")
+    if mode == "mode_disambiguation":
+        ax.set_ylabel("Weighted CAD-FPFH disagreement U(a)")
+        ax.set_title(f"Next-scan mode disambiguation — selection {attempt_id}")
+    else:
+        ax.set_ylabel("Expected information gain 0.5 log det ratio")
+        ax.set_title(f"Next-scan local covariance reduction — selection {attempt_id}")
     ax.grid(axis="y", alpha=0.25)
-    ax.text(
-        0.99,
-        0.97,
-        f"valid={len(valid_rows)} / evaluated={len(evaluations)}\n"
-        f"invalid under ≥1 hypothesis={invalid_count}",
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-    )
-
     fig.tight_layout()
     out = output_dir / f"candidate_scores_attempt_{attempt_id:02d}.png"
     fig.savefig(out, dpi=180)
@@ -1752,12 +2364,14 @@ def show_current_ppf_state(mesh, accepted_scans, bank, relative_state, args) -> 
         cad.paint_uniform_color(CLUSTER_COLORS[i % len(CLUSTER_COLORS)])
         geoms.append(cad)
     draw_stage(
-        f"02 - Current PPF plausible hypotheses ({len(accepted_scans)} scan(s))",
+        f"02 - Current Bayesian pose hypotheses ({len(accepted_scans)} scan(s))",
         geoms,
         (
-            f"Plausible={relative_state['plausible_count']} by Top1-relative vote; "
-            f"active bank={len(bank)}, showing {len(shown)} CAD hypotheses. "
-            f"H2/H1={relative_state['runnerup_relative']:.2f}."
+            f"Plausible={relative_state['plausible_count']}; active bank={len(bank)}; "
+            f"W2/W1={relative_state['runnerup_relative']:.2f}; "
+            f"MAP max std={relative_state['map_max_translation_std_mm']:.2f} mm / "
+            f"{relative_state['map_max_rotation_std_deg']:.2f} deg; "
+            f"planner={relative_state['planning_mode']}."
         ),
         point_size=3.0,
     )
@@ -1791,17 +2405,18 @@ def show_next_scan_candidates(
         transform_points(selected["expected_scan_cad"].path_origins_m, map_model_to_world),
         (1.0, 0.2, 0.75),
     ))
-    draw_stage(
-        "03 - Selected next scan",
-        geoms,
-        (
-            f"C{selected['candidate_id']}: offline global uniqueness={selected['global_uniqueness']:.3f}, "
-            f"online CAD-FPFH disagreement={selected['fpfh_disagreement']:.3f}. "
-            "All active hypotheses predict a valid CAD patch."
-        ),
-        point_size=8.0,
-    )
-
+    if selected["planner_mode"] == "mode_disambiguation":
+        note = (
+            f"C{selected['candidate_id']}: FPFH mode-disagreement={selected['fpfh_disagreement']:.3f}; "
+            "chosen to separate remaining posterior modes."
+        )
+    else:
+        note = (
+            f"C{selected['candidate_id']}: expected information gain={selected['information_gain']:.3f}; "
+            f"predicted max std={selected['predicted_max_t_std_mm']:.2f} mm / "
+            f"{selected['predicted_max_r_std_deg']:.2f} deg."
+        )
+    draw_stage("03 - Selected next scan", geoms, note, point_size=8.0)
 
 def show_selected_prediction_patches(mesh, selected, bank, fpfh_db, args) -> None:
     if not args.show:
@@ -1870,11 +2485,11 @@ def show_updated_registration(mesh, accepted_scans, relative_state, args) -> Non
     top1.paint_uniform_color((0.10, 0.85, 0.25))
     geoms = accumulated_scan_geometries(accepted_scans) + [top1]
     draw_stage(
-        f"06 - Cumulative PPF updated ({len(accepted_scans)} scans)",
+        f"06 - Bayesian posterior updated ({len(accepted_scans)} scans)",
         geoms,
         (
-            f"Green=new cumulative PPF Top1; plausible={relative_state['plausible_count']}; "
-            f"H2/H1={relative_state['runnerup_relative']:.2f}."
+            f"Green=new posterior MAP; plausible={relative_state['plausible_count']}; "
+            f"W2/W1={relative_state['runnerup_relative']:.2f}."
         ),
         point_size=3.5,
     )
@@ -1966,6 +2581,7 @@ def save_active_scan_outputs(
     final_model_to_world: np.ndarray,
     gt_model_to_world: np.ndarray,
     stop_reason: str,
+    prior_T: np.ndarray,
     args,
     metadata: dict[str, Any],
 ) -> None:
@@ -1992,26 +2608,40 @@ def save_active_scan_outputs(
             w.writeheader()
             w.writerows(attempt_history)
 
-    plausible_ranks = {c.rank for c in final_relative_state["plausible_clusters"]}
-    with (output_dir / "final_ppf_clusters.csv").open(
+    plausible_ranks = {r["source_cluster_rank"] for r in final_relative_state["plausible_records"]}
+    posterior_by_rank = {r["source_cluster_rank"]: r for r in final_relative_state["records"]}
+    with (output_dir / "final_pose_hypotheses.csv").open(
         "w", newline="", encoding="utf-8"
     ) as f:
         fields = [
-            "rank", "score", "plausible", "member_count",
-            "translation_spread_mm", "rotation_spread_deg",
+            "ppf_rank", "ppf_vote", "posterior_weight", "plausible",
+            "prior_mahalanobis", "geometric_log_likelihood",
+            "expected_object_fraction", "mean_abs_normal_residual_mm",
+            "median_nn_distance_mm", "merged_proposal_count", "refine_iterations",
+            "max_translation_std_mm", "max_rotation_std_deg",
             "gt_translation_error_mm", "gt_rotation_error_deg",
         ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for c in clusters:
-            err = pose_error_model_to_world(c.transform_model_to_world, gt_model_to_world)
+            if c.rank not in posterior_by_rank:
+                continue
+            r = posterior_by_rank[c.rank]
+            err = pose_error_model_to_world(r["T_model_to_world"], gt_model_to_world)
             w.writerow({
-                "rank": c.rank,
-                "score": c.score,
+                "ppf_rank": c.rank,
+                "ppf_vote": c.score,
+                "posterior_weight": r["posterior_weight"],
                 "plausible": int(c.rank in plausible_ranks),
-                "member_count": c.member_count,
-                "translation_spread_mm": c.translation_spread_mm,
-                "rotation_spread_deg": c.rotation_spread_deg,
+                "prior_mahalanobis": r["prior_mahalanobis"],
+                "geometric_log_likelihood": r["log_likelihood"],
+                "expected_object_fraction": r["expected_object_fraction"],
+                "mean_abs_normal_residual_mm": r["mean_abs_normal_residual_mm"],
+                "median_nn_distance_mm": r["median_nn_distance_mm"],
+                "merged_proposal_count": r["merged_proposal_count"],
+                "refine_iterations": r["refine_iterations"],
+                "max_translation_std_mm": float(np.max(r["local_std_translation_mm"])),
+                "max_rotation_std_deg": float(np.max(r["local_std_rotation_deg"])),
                 "gt_translation_error_mm": err["translation_mm"],
                 "gt_rotation_error_deg": err["rotation_deg"],
             })
@@ -2033,27 +2663,60 @@ def save_active_scan_outputs(
             "registration_backend": "pclpybridge -> PCL PPFRegistration",
             "max_candidates": args.ppf_max_candidates,
         },
-        "offline_candidates": {
-            "count": len(candidates),
-            "candidate_nms_mm": args.candidate_nms_mm,
-            "global_uniqueness_knn": args.global_uniqueness_knn,
-            "global_uniqueness_exclude_mm": args.global_uniqueness_exclude_mm,
+        "scan_planner": {
+            "method": "random_cad_surface_point_and_random_tangent_direction",
+            "fpfh_used_for_scan_selection": False,
+            "information_gain_used_for_scan_selection": False,
+            "scan_length_mm": args.scan_length_mm,
+            "scan_step_mm": args.scan_step_mm,
+            "rescan_exclusion_mm": args.rescan_exclusion_mm,
+            "random_scan_max_attempts": args.random_scan_max_attempts,
         },
         "accepted_scan_count": len(accepted_scans),
         "scan_selection_count_after_scan1": len(attempt_history),
         "stop_reason": stop_reason,
         "final_active_hypothesis_count": final_relative_state["count"],
         "final_plausible_hypothesis_count": final_relative_state["plausible_count"],
-        "plausible_vote_relative_threshold": args.plausible_vote_relative,
-        "stop_runnerup_relative_threshold": args.stop_runnerup_relative,
-        "final_runnerup_relative_to_top1": final_relative_state["runnerup_relative"],
+        "posterior_plausible_relative_threshold": args.posterior_plausible_relative,
+        "posterior_stop_runnerup_relative_threshold": args.posterior_stop_runnerup_relative,
+        "final_runnerup_relative_to_map": final_relative_state["runnerup_relative"],
+        "bayesian_pose_model": {
+            "method": final_relative_state["method"],
+            "prior_T_model_to_world": prior_T.tolist(),
+            "prior_translation_sigma_mm": args.prior_translation_sigma_mm,
+            "prior_rotation_sigma_deg": args.prior_rotation_sigma_deg,
+            "prior_gate_mahalanobis": args.prior_gate_mahalanobis,
+            "gt_generation_mode": args.gt_generation,
+            "geom_sigma_normal_mm": args.geom_sigma_normal_mm,
+            "geom_sigma_tangent_mm": args.geom_sigma_tangent_mm,
+            "geom_object_prior": args.geom_object_prior,
+            "geom_outlier_halfwidth_mm": args.geom_outlier_halfwidth_mm,
+            "geom_observation_spacing_mm": args.geom_observation_spacing_mm,
+            "local_refine_iterations": args.posterior_local_refine_iterations,
+            "stop_translation_std_mm": args.posterior_stop_translation_std_mm,
+            "stop_rotation_std_deg": args.posterior_stop_rotation_std_deg,
+            "ppf_votes_used_as_probability": False,
+            "component_model": "SE3 Gaussian mixture; Laplace/Gauss-Newton local covariance",
+        },
         "ground_truth": {"T_model_to_world": gt_model_to_world.tolist()},
-        "final_ppf_top1": {
-            "T_model_to_world": clusters[0].transform_model_to_world.tolist(),
+        "final_posterior_map": {
+            "T_model_to_world": final_relative_state["clusters"][0].transform_model_to_world.tolist(),
+            "posterior_weight": final_relative_state["active_records"][0]["posterior_weight"],
+            "source_ppf_rank": final_relative_state["active_records"][0]["source_cluster_rank"],
+            "local_covariance_6x6": final_relative_state["active_records"][0]["covariance_6x6"].tolist(),
+            "local_std_translation_mm": final_relative_state["active_records"][0]["local_std_translation_mm"].tolist(),
+            "local_std_rotation_deg": final_relative_state["active_records"][0]["local_std_rotation_deg"].tolist(),
+            "mode_separated": final_relative_state["mode_separated"],
+            "local_confident": final_relative_state["local_confident"],
             "gt_error": pose_error_model_to_world(
-                clusters[0].transform_model_to_world, gt_model_to_world
+                final_relative_state["clusters"][0].transform_model_to_world, gt_model_to_world
             ),
         },
+        "posterior_local_covariance_note": (
+            "Each retained PPF basin is a Gaussian component (T_i, Sigma_i, w_i). "
+            "Sigma_i is a robust Gauss-Newton/Laplace covariance from the geometric "
+            "likelihood plus the SE(3) prior; PPF votes are not used as probabilities."
+        ),
         "final_icp": {
             "T_model_to_world": final_model_to_world.tolist(),
             "fitness": float(final_icp.fitness),
@@ -2064,6 +2727,67 @@ def save_active_scan_outputs(
     with (output_dir / "active_scan_report.json").open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
+
+def sample_valid_random_scan(
+    surface_points: np.ndarray,
+    surface_normals: np.ndarray,
+    cad_scene,
+    world_scene,
+    aim_model_to_world: np.ndarray,
+    previous_plans: list[RandomScanPlan],
+    args,
+    rng: np.random.Generator,
+) -> tuple[RandomScanPlan, ScanGeometry, np.ndarray, int]:
+    """Draw a random CAD surface point + random tangent sweep direction.
+
+    There is deliberately no FPFH, Fisher-information, uniqueness, or posterior-driven
+    scan selection here.  The only rejection rules are operational sanity checks:
+      1) optional minimum CAD-center spacing from earlier scans, and
+      2) the simulated measurement must contain at least --min-new-scan-points.
+
+    --scan-length-mm directly controls the linear sweep length used by
+    simulate_scan_from_plan_world().
+    """
+    exclude_m = args.rescan_exclusion_mm / 1000.0
+    last_reason = ""
+
+    for draw_id in range(1, args.random_scan_max_attempts + 1):
+        plan = random_scan_plan_from_surface_pool(
+            surface_points,
+            surface_normals,
+            cad_scene,
+            args,
+            rng,
+        )
+
+        if previous_plans and exclude_m > 0.0:
+            dmin = min(
+                float(np.linalg.norm(plan.point_cad_m - prev.point_cad_m))
+                for prev in previous_plans
+            )
+            if dmin < exclude_m:
+                last_reason = f"too close to previous scan ({dmin*1000.0:.2f} mm)"
+                continue
+
+        scan = simulate_scan_from_plan_world(
+            world_scene,
+            plan,
+            aim_model_to_world,
+            args,
+        )
+        points_world = noisy_scan_points(scan, args, rng)
+        if len(points_world) < args.min_new_scan_points:
+            last_reason = f"only {len(points_world)} measured points"
+            continue
+
+        return plan, scan, points_world, draw_id
+
+    raise RuntimeError(
+        f"Could not draw a usable random scan after {args.random_scan_max_attempts} attempts"
+        + (f": {last_reason}" if last_reason else "")
+    )
+
+
 def main() -> int:
     args = parse_args()
     validate_args(args)
@@ -2071,68 +2795,67 @@ def main() -> int:
     output_dir = (
         args.output_dir
         if args.output_dir is not None
-        else Path(f"{args.cad.stem}_drost2010_ppf_fpfh_policy")
+        else Path(f"{args.cad.stem}_ppf_bayesian_gmm_random_scan")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
-    print("[setup 1/5] Load CAD")
+    print("[setup 1/3] Load CAD")
     mesh, metadata = load_centered_mesh(args.cad, args.mesh_unit)
     diameter_m = metadata["diameter_mm"] / 1000.0
     cad_scene = build_raycast_scene(mesh)
 
-    print("[setup 2/5] Prepare PCL PPF model")
+    print("[setup 2/3] Prepare PCL PPF model")
     model_points, model_normals = sample_oriented_cad_drost(
         mesh, args.cad_sample_points, diameter_m, args
     )
     model = build_ppf_model(model_points, model_normals, diameter_m, args)
 
-    print("[setup 3/5] Build CAD FPFH database")
-    fpfh_db = prepare_cad_fpfh_database(mesh, args)
-    print(
-        f"  FPFH points={len(fpfh_db['points_m'])}, "
-        f"metric={args.fpfh_distance_metric}, "
-        f"L2-scale={fpfh_db['open3d_l2_scale']:.3f}"
-    )
-
-    print("[setup 4/5] Build global-unique scan candidate pool")
-    candidates, offline_actions = build_global_unique_candidate_pool(
-        cad_scene, fpfh_db, args
-    )
-    print(
-        f"  selected candidates={len(candidates)} from "
-        f"{len(offline_actions):,} valid patch actions"
-    )
-    plot_global_uniqueness(output_dir, offline_actions, candidates, args)
-    save_candidate_csv(output_dir, candidates)
-    show_offline_candidates(mesh, candidates, args)
-
-    print("[setup 5/5] Build ICP target")
+    print("[setup 3/3] Build ICP + sensor-agnostic geometric-likelihood target")
     target_cloud = make_icp_target(mesh, args)
+    geom_db = prepare_geometric_likelihood_target(target_cloud)
+    random_surface_points = geom_db["points_m"]
+    random_surface_normals = geom_db["normals"]
+    prior_T = load_prior_pose(args)
+    print(
+        f"  prior sigma: {args.prior_translation_sigma_mm:.1f} mm / "
+        f"{args.prior_rotation_sigma_deg:.1f} deg | "
+        f"random scan length={args.scan_length_mm:.1f} mm | "
+        f"surface pool={len(random_surface_points):,} points"
+    )
+    print("  next-scan policy: RANDOM surface point + RANDOM tangent direction (no FPFH selection)")
 
-    # Hidden GT is simulation-only.  It is not passed to planning/registration.
-    gt_model_to_world = random_gt_transform(args, rng)
+    # Hidden GT is simulation-only and is generated around the supplied initial pose.
+    # The estimator never receives GT; it only receives prior_T and its covariance.
+    gt_model_to_world = random_gt_transform(prior_T, args, rng)
+    init_err = pose_error_model_to_world(prior_T, gt_model_to_world)
+    print(
+        f"  supplied initial pose -> hidden GT error: "
+        f"{init_err['translation_mm']:.2f} mm / {init_err['rotation_deg']:.2f} deg "
+        f"(GT mode={args.gt_generation})"
+    )
+    print(f"  prior hard gate Mahalanobis radius: {args.prior_gate_mahalanobis:.2f}")
     world_mesh = copy.deepcopy(mesh)
     world_mesh.transform(gt_model_to_world)
     world_scene = build_raycast_scene(world_mesh)
 
     print("\n" + "=" * 96)
-    print("SCAN 1 - INITIAL MEASUREMENT")
+    print("SCAN 1 - RANDOM INITIAL MEASUREMENT")
     print("=" * 96)
-    # Simulation stand-in for the user-guided initial scan.
-    first_plan = random_scan_plan_from_surface_pool(
-        fpfh_db["points_m"],
-        fpfh_db["normals"],
+    first_plan, first_scan, first_points_world, first_draws = sample_valid_random_scan(
+        random_surface_points,
+        random_surface_normals,
         cad_scene,
+        world_scene,
+        prior_T,
+        [],
         args,
         rng,
     )
-    first_scan = simulate_scan_from_plan_world(
-        world_scene, first_plan, gt_model_to_world, args
+    print(
+        f"  random draw={first_draws}, length={args.scan_length_mm:.1f} mm, "
+        f"angle={first_plan.angle_deg:.1f} deg, points={len(first_points_world)}"
     )
-    first_points_world = noisy_scan_points(first_scan, args, rng)
-    if len(first_points_world) < args.min_new_scan_points:
-        raise RuntimeError(f"Scan1 produced only {len(first_points_world)} points")
     show_scan1_measurement(mesh, first_scan, first_points_world, gt_model_to_world, args)
 
     accepted_scans: list[dict[str, Any]] = [{
@@ -2143,31 +2866,32 @@ def main() -> int:
         "candidate_id": None,
     }]
     previous_plans: list[RandomScanPlan] = [first_plan]
-    used_candidate_ids: set[int] = set()
     attempt_history: list[dict[str, Any]] = []
 
     ppf_round = 1
-    hypotheses, clusters = run_cumulative_ppf(
-        accepted_scans,
-        model,
-        args,
-    )
+    hypotheses, clusters = run_cumulative_ppf(accepted_scans, model, args)
 
     stop_reason = ""
     final_relative_state: dict[str, Any] | None = None
 
     while True:
         accepted_count = len(accepted_scans)
-        relative_state = select_plausible_clusters(clusters, args)
+        cumulative_points_world = np.vstack([s["points_world"] for s in accepted_scans])
+        relative_state = build_posterior_state(
+            clusters, cumulative_points_world, prior_T, geom_db, args
+        )
         final_relative_state = relative_state
         bank = build_hypothesis_bank(relative_state)
 
         print("\n" + "-" * 96)
         print(
             f"STATE AFTER {accepted_count} ACCEPTED SCAN(S): "
-            f"clusters={len(clusters)}, plausible={relative_state['plausible_count']}, "
+            f"PPF-proposals={len(clusters)}, posterior-plausible={relative_state['plausible_count']}, "
             f"active-bank={relative_state['count']}, "
-            f"H2/H1={relative_state['runnerup_relative']:.3f}"
+            f"W2/W1={relative_state['runnerup_relative']:.3f}, "
+            f"MAP-std={relative_state['map_max_translation_std_mm']:.2f} mm/"
+            f"{relative_state['map_max_rotation_std_deg']:.2f} deg, "
+            f"prior-rejected={relative_state['ppf_rejected_by_prior_gate']}, planner=random"
         )
         print("-" * 96)
         for h in bank:
@@ -2175,18 +2899,26 @@ def main() -> int:
             err = pose_error_model_to_world(c.transform_model_to_world, gt_model_to_world)
             print(
                 f"  H{h['bank_id']:02d} = cluster#{c.rank:02d}: "
-                f"vote={c.score:.0f}, relTop1={h['relative_to_top1']:.3f}, "
-                f"weight={h['weight']:.3f}, "
+                f"PPFvote={c.score:.0f}, posterior={h['posterior_weight']:.4f}, "
+                f"priorD={h['prior_mahalanobis']:.2f}, obj={h['expected_object_fraction']:.2f}, "
+                f"|e_n|={h['mean_abs_normal_residual_mm']:.2f} mm, "
+                f"stdMax={np.max(h['local_std_translation_mm']):.2f} mm/"
+                f"{np.max(h['local_std_rotation_deg']):.2f} deg, "
+                f"merged={h['merged_proposal_count']}, refine={h['refine_iterations']}, "
                 f"GT={err['translation_mm']:.2f} mm/{err['rotation_deg']:.2f} deg"
             )
 
-        plot_ppf_relative_support(output_dir, clusters, relative_state, ppf_round, args)
+        plot_posterior_support(output_dir, relative_state, ppf_round, args)
         show_current_ppf_state(mesh, accepted_scans, bank, relative_state, args)
 
         if relative_state["stop_ready"]:
             stop_reason = (
-                f"RUNNERUP_RELATIVE:{relative_state['runnerup_relative']:.3f}"
-                f"<{args.stop_runnerup_relative:.3f}"
+                f"POSTERIOR_CONFIDENT:W2/W1={relative_state['runnerup_relative']:.3f}"
+                f"<{args.posterior_stop_runnerup_relative:.3f},"
+                f"stdT={relative_state['map_max_translation_std_mm']:.3f}"
+                f"<={args.posterior_stop_translation_std_mm:.3f}mm,"
+                f"stdR={relative_state['map_max_rotation_std_deg']:.3f}"
+                f"<={args.posterior_stop_rotation_std_deg:.3f}deg"
             )
             print(f"\nSTOP: {stop_reason}")
             break
@@ -2197,68 +2929,33 @@ def main() -> int:
 
         map_T = bank[0]["T_model_to_world"]
         attempt_id = len(attempt_history) + 1
+        next_scan_number = accepted_count + 1
 
         try:
-            selected, evaluations = select_discriminative_next_scan(
-                candidates,
-                previous_plans,
-                used_candidate_ids,
-                bank,
+            random_plan, new_scan, new_points_world, random_draws = sample_valid_random_scan(
+                random_surface_points,
+                random_surface_normals,
+                cad_scene,
+                world_scene,
                 map_T,
-                fpfh_db,
+                previous_plans,
                 args,
+                rng,
             )
         except RuntimeError as exc:
-            stop_reason = f"NO_FEASIBLE_NEXT_SCAN:{exc}"
+            stop_reason = f"NO_USABLE_RANDOM_SCAN:{exc}"
             print(f"\nSTOP: {stop_reason}")
             break
 
-        plot_candidate_scores(
-            output_dir,
-            evaluations,
-            int(selected["candidate_id"]),
-            attempt_id,
-            args,
-        )
-        show_next_scan_candidates(
-            mesh,
-            accepted_scans,
-            candidates,
-            used_candidate_ids,
-            selected,
-            map_T,
-            args,
-        )
-        show_selected_prediction_patches(mesh, selected, bank, fpfh_db, args)
-
-        used_candidate_ids.add(int(selected["candidate_id"]))
-        next_scan_number = accepted_count + 1
+        selected = {
+            "candidate_id": next_scan_number,
+            "planner_mode": "random",
+            "plan": random_plan,
+        }
         print(
-            f"\n  Candidate for Scan{next_scan_number}: C{selected['candidate_id']} "
-            f"angle={selected['plan'].angle_deg:.1f} deg | "
-            f"global-U={selected['global_uniqueness']:.3f} | "
-            f"online CAD-FPFH U={selected['fpfh_disagreement']:.3f}"
-        )
-
-        # Aim the CAD action using only the current MAP pose (bank[0]).
-        new_scan = simulate_scan_from_plan_world(
-            world_scene, selected["plan"], map_T, args
-        )
-        new_points_world = noisy_scan_points(new_scan, args, rng)
-
-        # Registration remains fixed: every selected measurement is accumulated,
-        # then cumulative PPF is rerun from scratch.  No measurement-dependent
-        # score is fed back into the next-scan policy.  The only guard below is
-        # a hard sanity check against an empty/degenerate scan.
-        if len(new_points_world) < args.min_new_scan_points:
-            raise RuntimeError(
-                f"Selected Scan{next_scan_number} produced only "
-                f"{len(new_points_world)} points; reject fallback is disabled."
-            )
-
-        print(
-            f"  measured points={len(new_points_world)} | "
-            "accumulate directly (no incremental-PPF reject gate)"
+            f"\n  Random Scan{next_scan_number}: draw={random_draws}, "
+            f"length={args.scan_length_mm:.1f} mm, angle={random_plan.angle_deg:.1f} deg, "
+            f"points={len(new_points_world)}"
         )
 
         show_new_scan_measurement(
@@ -2277,14 +2974,15 @@ def main() -> int:
             "plausible_hypotheses_before": relative_state["plausible_count"],
             "active_hypotheses_before": relative_state["count"],
             "runnerup_relative_before": relative_state["runnerup_relative"],
-            "candidate_id": selected["candidate_id"],
-            "candidate_global_uniqueness": selected["global_uniqueness"],
-            "scan_angle_deg": selected["plan"].angle_deg,
-            "fpfh_disagreement": selected["fpfh_disagreement"],
-            "valid_patch_count": selected["valid_patch_count"],
-            "active_hypothesis_count": selected["hypothesis_count"],
-            "mean_raw_feature_distance": selected["mean_raw_feature_distance"],
-            "max_raw_feature_distance": selected["max_raw_feature_distance"],
+            "planner_mode": "random",
+            "map_max_translation_std_mm_before": relative_state["map_max_translation_std_mm"],
+            "map_max_rotation_std_deg_before": relative_state["map_max_rotation_std_deg"],
+            "random_draws_needed": random_draws,
+            "scan_length_mm": args.scan_length_mm,
+            "scan_angle_deg": random_plan.angle_deg,
+            "scan_center_x_mm": float(random_plan.point_cad_m[0] * 1000.0),
+            "scan_center_y_mm": float(random_plan.point_cad_m[1] * 1000.0),
+            "scan_center_z_mm": float(random_plan.point_cad_m[2] * 1000.0),
             "measured_points": len(new_points_world),
         }
 
@@ -2292,10 +2990,10 @@ def main() -> int:
             "scan_index": len(accepted_scans) + 1,
             "points_world": new_points_world,
             "scan_geometry": new_scan,
-            "plan": selected["plan"],
-            "candidate_id": selected["candidate_id"],
+            "plan": random_plan,
+            "candidate_id": None,
         })
-        previous_plans.append(selected["plan"])
+        previous_plans.append(random_plan)
         history_row["accepted_scan_index"] = len(accepted_scans)
         attempt_history.append(history_row)
 
@@ -2304,22 +3002,21 @@ def main() -> int:
             "rerun cumulative PPF from scratch"
         )
         ppf_round += 1
-        hypotheses, clusters = run_cumulative_ppf(
-            accepted_scans,
-            model,
-            args,
+        hypotheses, clusters = run_cumulative_ppf(accepted_scans, model, args)
+        cumulative_points_world = np.vstack([s["points_world"] for s in accepted_scans])
+        updated_relative = build_posterior_state(
+            clusters, cumulative_points_world, prior_T, geom_db, args
         )
-        updated_relative = select_plausible_clusters(clusters, args)
         show_updated_registration(mesh, accepted_scans, updated_relative, args)
 
-    # Recompute from the final cumulative PPF clusters.
-    final_relative_state = select_plausible_clusters(clusters, args)
-
     cumulative_points_world = np.vstack([s["points_world"] for s in accepted_scans])
-    final_ppf_T = clusters[0].transform_model_to_world
-    final_ppf_error = pose_error_model_to_world(final_ppf_T, gt_model_to_world)
+    final_relative_state = build_posterior_state(
+        clusters, cumulative_points_world, prior_T, geom_db, args
+    )
+    final_map_T = final_relative_state["clusters"][0].transform_model_to_world
+    final_map_error = pose_error_model_to_world(final_map_T, gt_model_to_world)
     final_icp, final_T = refine_cumulative_icp(
-        cumulative_points_world, target_cloud, final_ppf_T, args
+        cumulative_points_world, target_cloud, final_map_T, args
     )
     final_error = pose_error_model_to_world(final_T, gt_model_to_world)
 
@@ -2327,16 +3024,38 @@ def main() -> int:
     print("FINAL RESULT")
     print("=" * 96)
     print(f"accepted scans        : {len(accepted_scans)}")
-    print(f"next-scan selections  : {len(attempt_history)}")
+    print(f"random scan length    : {args.scan_length_mm:.1f} mm")
+    print(f"next-scan selections  : {len(attempt_history)} (all RANDOM)")
     print(f"stop reason           : {stop_reason}")
     print(f"plausible hypotheses  : {final_relative_state['plausible_count']}")
     print(f"active hypothesis bank: {final_relative_state['count']}")
-    print(f"H2 / H1              : {final_relative_state['runnerup_relative']:.3f}")
-    print(f"plausible threshold   : {args.plausible_vote_relative:.2f} x Top1")
-    print(f"stop H2/H1 threshold  : {args.stop_runnerup_relative:.2f}")
+    print(f"W2 / W1              : {final_relative_state['runnerup_relative']:.3f}")
+    print(f"plausible threshold   : {args.posterior_plausible_relative:.2f} x MAP weight")
+    print(f"stop W2/W1 threshold  : {args.posterior_stop_runnerup_relative:.2f}")
     print(
-        f"PPF Top1 pre-ICP      : {final_ppf_error['translation_mm']:.3f} mm / "
-        f"{final_ppf_error['rotation_deg']:.3f} deg"
+        f"stop local std thresh : {args.posterior_stop_translation_std_mm:.2f} mm / "
+        f"{args.posterior_stop_rotation_std_deg:.2f} deg"
+    )
+    print(
+        f"Posterior MAP pre-ICP : {final_map_error['translation_mm']:.3f} mm / "
+        f"{final_map_error['rotation_deg']:.3f} deg"
+    )
+    final_bank = build_hypothesis_bank(final_relative_state)
+    Sigma_local = posterior_local_covariance(final_bank)
+    std_t_mm = np.sqrt(np.maximum(np.diag(Sigma_local)[:3], 0.0)) * 1000.0
+    std_r_deg = np.degrees(np.sqrt(np.maximum(np.diag(Sigma_local)[3:], 0.0)))
+    print(
+        "MAP component local std: "
+        f"t=[{std_t_mm[0]:.2f},{std_t_mm[1]:.2f},{std_t_mm[2]:.2f}] mm, "
+        f"r=[{std_r_deg[0]:.2f},{std_r_deg[1]:.2f},{std_r_deg[2]:.2f}] deg"
+    )
+    Sigma_gmm = posterior_gmm_covariance(final_bank)
+    gmm_t_mm = np.sqrt(np.maximum(np.diag(Sigma_gmm)[:3], 0.0)) * 1000.0
+    gmm_r_deg = np.degrees(np.sqrt(np.maximum(np.diag(Sigma_gmm)[3:], 0.0)))
+    print(
+        "active GMM total std   : "
+        f"t=[{gmm_t_mm[0]:.2f},{gmm_t_mm[1]:.2f},{gmm_t_mm[2]:.2f}] mm, "
+        f"r=[{gmm_r_deg[0]:.2f},{gmm_r_deg[1]:.2f},{gmm_r_deg[2]:.2f}] deg"
     )
     print(
         f"Final ICP             : {final_error['translation_mm']:.3f} mm / "
@@ -2351,17 +3070,19 @@ def main() -> int:
         mesh, accepted_scans, gt_model_to_world, final_T,
         final_icp, final_error, args,
     )
+    # Empty candidate list is intentional: FPFH/offline scan selection is disabled.
     save_active_scan_outputs(
         output_dir,
         accepted_scans,
         attempt_history,
-        candidates,
+        [],
         clusters,
         final_relative_state,
         final_icp,
         final_T,
         gt_model_to_world,
         stop_reason,
+        prior_T,
         args,
         metadata,
     )

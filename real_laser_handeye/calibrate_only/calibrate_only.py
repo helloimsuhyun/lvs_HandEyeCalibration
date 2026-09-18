@@ -102,7 +102,7 @@ def load_scans(dataset_dir: Path) -> list[LaserScan]:
     Load capture_*.npz files.
 
     Each file must contain:
-      - T_base_tcp: 4x4 robot TCP pose
+      - T_world_tcp or T_base_tcp: 4x4 robot TCP pose
       - points_s:   (N, 3) laser points in the sensor frame
     """
     if not dataset_dir.exists():
@@ -115,12 +115,17 @@ def load_scans(dataset_dir: Path) -> list[LaserScan]:
     scans: list[LaserScan] = []
     for scan_id, path in enumerate(capture_paths, start=1):
         with np.load(path, allow_pickle=False) as pair:
-            if "T_base_tcp" not in pair or "points_s" not in pair:
+            pose_key = next(
+                (key for key in ("T_world_tcp", "T_base_tcp") if key in pair),
+                None,
+            )
+            if pose_key is None or "points_s" not in pair:
                 raise KeyError(
-                    f"{path} must contain both 'T_base_tcp' and 'points_s'"
+                    f"{path} must contain 'T_world_tcp' or 'T_base_tcp', "
+                    "and 'points_s'"
                 )
 
-            pose = validate_transform(pair["T_base_tcp"], str(path))
+            pose = validate_transform(pair[pose_key], str(path))
             points = np.asarray(pair["points_s"], dtype=float)
 
         if points.ndim != 2 or points.shape[1] != 3:

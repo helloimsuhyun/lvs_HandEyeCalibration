@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from real_laser_handeye.calibrate_only.with_ransac_calibrate_only import load_scans
 from real_laser_handeye.main import atomic_accumulated_scans
 from real_laser_handeye.workflow import WorkflowConfig, WorkflowController
 
@@ -29,6 +30,35 @@ def test_atomic_accumulated_scans_preserves_variable_profiles(tmp_path):
         np.testing.assert_array_equal(data["scan_ids"], [4, 9])
         assert data["points_s"].shape == (3, 3)
         assert data["T_base_tcp"].shape == (2, 4, 4)
+
+
+def test_stage4_loader_accepts_workflow_world_tcp_capture(tmp_path):
+    pose = np.eye(4)
+    pose[:3, 3] = [100.0, 200.0, 300.0]
+    points = np.column_stack(
+        [np.linspace(-10.0, 10.0, 21), np.zeros(21), np.zeros(21)]
+    )
+    np.savez_compressed(
+        tmp_path / "capture_0001.npz",
+        T_world_tcp=pose,
+        points_s=points,
+    )
+
+    scans, diagnostics = load_scans(
+        tmp_path,
+        use_profile_ransac=False,
+        ransac_threshold_mm=0.15,
+        ransac_max_iterations=10,
+        ransac_min_inliers=2,
+        ransac_min_inlier_ratio=0.5,
+        ransac_seed=1,
+        ransac_refine_iterations=1,
+        ransac_reject_policy="error",
+    )
+
+    assert len(scans) == len(diagnostics) == 1
+    np.testing.assert_allclose(scans[0].T_base_ef, pose)
+    np.testing.assert_allclose(scans[0].points_s, points)
 
 
 def test_stage4_manual_dataset_calibrates_without_scan_plan(tmp_path, monkeypatch):
@@ -67,4 +97,3 @@ def test_stage4_manual_dataset_calibrates_without_scan_plan(tmp_path, monkeypatc
     result = controller.calibrate()
     np.testing.assert_allclose(result, np.eye(4))
     assert controller.plan is None
-

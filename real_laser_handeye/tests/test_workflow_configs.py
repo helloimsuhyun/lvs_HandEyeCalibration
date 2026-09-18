@@ -111,6 +111,10 @@ def test_real_configs_auto_launch_matching_official_drivers():
 
     ur = WorkflowConfig.load(CONFIGS / "ur5e_ljv7080_workflow.yaml")
     assert ur.values["equipment"]["driver"]["calibration"]["auto_extract"] is True
+    assert ur.values["equipment"]["cartesian_uses_moveit"] is True
+    assert ur.values["equipment"]["cartesian_motion_backend"] == (
+        "moveit_cartesian_follow_joint_trajectory"
+    )
 
 
 def test_sim_configs_inherit_matching_real_configs_with_sim_only_overrides():

@@ -10,7 +10,7 @@ python /home/choisuhyun/lvs_HandEyeCalibration/pose_estimation/surface_scan_path
     --path-step-mm 1.0 \
     --sensor-standoff-mm 80 \
     --normal-radius-mm 3 \
-    --orientation-smooth-window 15 \
+    --orientation-smooth-window 35 \
     --gui \
     --save-json scan_path.json
 

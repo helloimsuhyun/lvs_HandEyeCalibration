@@ -4,9 +4,12 @@ This package is intentionally visualization-only. It does not add a UR5e MoveIt 
 
 The mounting used by the preview is:
 
-- `T_tool0_sensor = diag(-1,+1,-1)` with translation `[0,0,151] mm`
-- equivalently `T_flange_sensor`: translation `[151,0,0] mm`, RPY `[+90°,0,-90°]`
+- `T_tool0_sensor = diag(+1,-1,-1)` with translation `[0,0,151] mm`
+- equivalently `T_flange_sensor`: translation `[151,0,0] mm`, RPY `[-90°,0,+90°]`
 - `T_sensor_physical`: translation `[0,0,+80] mm`
+
+The rotation includes the sensor's physical 180-degree turn about the final
+`wrist_3_joint` / `+Z_tool0` axis.
 
 Origin marker colors:
 
@@ -35,8 +38,9 @@ Expected geometry:
 
 
 Axis mapping used in this revision:
-- `+X_sensor = -X_tool0`
-- `+Y_sensor = +Y_tool0`
+- `+X_sensor = +X_tool0`
+- `+Y_sensor = -Y_tool0`
 - `+Z_sensor = -Z_tool0`
 
-This keeps the sensor Z direction unchanged from the previous preview while flipping X and Y together to preserve a proper right-handed frame.
+The 180-degree turn flips sensor X and Y relative to the previous mounting
+while leaving its Z direction unchanged.

@@ -16,16 +16,19 @@ Contract:
 Current transforms:
 
 ```text
-^tool0 T_sensor rotation = diag(-1,+1,-1)
+^tool0 T_sensor rotation = diag(+1,-1,-1)
 ^tool0 p_sensor = [0,0,151] mm
 ^sensor p_physical = [0,0,80] mm
 ```
+
+This rotation includes the sensor's physical 180-degree turn about the final
+`wrist_3_joint` axis, which is `+Z_tool0` in the UR5e model.
 
 The equivalent URDF mounting is:
 
 ```text
 ^flange p_sensor = [151,0,0] mm
-^flange R_sensor = RPY(+90 deg, 0, -90 deg)
+^flange R_sensor = RPY(-90 deg, 0, +90 deg)
 ```
 
 ## Build

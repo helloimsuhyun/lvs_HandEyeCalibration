@@ -30,11 +30,12 @@ def T(R, p):
 # URDF fixed joint flange -> tool0: rpy=(+pi/2, 0, +pi/2)
 T_f_t = T(rz(math.pi / 2) @ ry(0) @ rx(math.pi / 2), [0, 0, 0])
 
-# Application JSON: tool0 -> sensor
-T_t_s = T(np.diag([-1.0, 1.0, -1.0]), [0, 0, 0.151])
+# Application JSON: tool0 -> sensor.  Compared with the original mount, the
+# sensor is rotated pi about wrist_3/tool0 +Z.
+T_t_s = T(np.diag([1.0, -1.0, -1.0]), [0, 0, 0.151])
 
-# Xacro: flange -> sensor, rpy=(+pi/2, 0, -pi/2)
-T_f_s_xacro = T(rz(-math.pi / 2) @ ry(0) @ rx(math.pi / 2), [0.151, 0, 0])
+# Xacro: flange -> sensor, rpy=(-pi/2, 0, +pi/2)
+T_f_s_xacro = T(rz(math.pi / 2) @ ry(0) @ rx(-math.pi / 2), [0.151, 0, 0])
 
 T_f_s_composed = T_f_t @ T_t_s
 np.testing.assert_allclose(T_f_s_composed, T_f_s_xacro, atol=1e-10)

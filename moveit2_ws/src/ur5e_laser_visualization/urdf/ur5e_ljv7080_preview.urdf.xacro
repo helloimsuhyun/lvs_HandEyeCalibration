@@ -5,10 +5,13 @@
 
     Coordinate convention used here:
       ^tool0 T_sensor =
-        [-1  0  0    0 mm ]
-        [ 0  1  0    0 mm ]
+        [ 1  0  0    0 mm ]
+        [ 0 -1  0    0 mm ]
         [ 0  0 -1  151 mm ]
         [ 0  0  0    1    ]
+
+    This includes the physical 180-degree sensor rotation about the final
+    wrist_3/tool0 +Z rotation axis.
 
       ^sensor T_physical = Trans(0, 0, +80 mm)
 
@@ -19,7 +22,7 @@
 
     Therefore the same sensor mounting is
       ^flange p_sensor = [151, 0, 0] mm
-      ^flange R_sensor = RPY(+90 deg, 0, -90 deg).
+      ^flange R_sensor = RPY(-90 deg, 0, +90 deg).
   -->
 
   <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
@@ -94,7 +97,7 @@
     <parent link="flange"/>
     <child link="sensor_measurement_frame"/>
     <!-- ^flange T_sensor: +151 mm along +X_flange. -->
-    <origin xyz="0.151 0 0" rpy="1.57079632679 0 -1.57079632679"/>
+    <origin xyz="0.151 0 0" rpy="-1.57079632679 0 1.57079632679"/>
   </joint>
 
   <xacro:frame_triad name="sensor_axes_preview" parent="sensor_measurement_frame" origin_rgba="1.0 0.05 0.85 1"/>

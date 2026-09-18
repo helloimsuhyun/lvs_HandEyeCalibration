@@ -144,6 +144,7 @@ class ROS2JointTrajectoryRobotAdapter:
                 if candidate.wait_for_server(timeout_sec=per_candidate):
                     self._action_client = candidate
                     self.trajectory_action = action_name
+                    self._require_single_action_server(action_name)
                     break
                 candidate.destroy()
             if self._action_client is None:
@@ -161,6 +162,26 @@ class ROS2JointTrajectoryRobotAdapter:
         except BaseException:
             self.close()
             raise
+
+    def _require_single_action_server(self, action_name: str) -> None:
+        """Reject ambiguous ROS graphs containing duplicate controller actions."""
+        if self._node is None:
+            raise RuntimeError("ROS node is not initialized")
+        status_topic = f"{action_name.rstrip('/')}/_action/status"
+        endpoints = self._node.get_publishers_info_by_topic(status_topic)
+        if len(endpoints) <= 1:
+            return
+        owners = sorted(
+            {
+                f"{str(info.node_namespace).rstrip('/')}/{info.node_name}"
+                for info in endpoints
+            }
+        )
+        raise ConnectionError(
+            f"multiple action servers publish {status_topic}: "
+            f"{len(endpoints)} endpoints ({', '.join(owners)}). "
+            "Only one robot driver may run in the ROS domain."
+        )
 
     def close(self) -> None:
         self._connected = False
@@ -329,6 +350,93 @@ class ROS2JointTrajectoryRobotAdapter:
         # ROS TF translation is metres; workflow uses millimetres.
         T[:3, 3] = 1000.0 * np.asarray([t.x, t.y, t.z], dtype=float)
         return T
+
+    @staticmethod
+    def _validate_tcp_pose_vec(value: Sequence[float]) -> np.ndarray:
+        pose = np.asarray(value, dtype=float).reshape(-1)
+        if pose.shape != (6,) or not np.all(np.isfinite(pose)):
+            raise ValueError(
+                "target_pose_vec_mm must contain six finite values "
+                "[x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]"
+            )
+        return pose.copy()
+
+    @staticmethod
+    def _tcp_pose_vec_to_transform(value: Sequence[float]) -> np.ndarray:
+        pose = ROS2JointTrajectoryRobotAdapter._validate_tcp_pose_vec(value)
+        transform = np.eye(4, dtype=float)
+        transform[:3, :3] = Rotation.from_euler(
+            "xyz", pose[3:], degrees=True
+        ).as_matrix()
+        transform[:3, 3] = pose[:3]
+        return transform
+
+    @staticmethod
+    def _transform_to_tcp_pose_vec(transform: np.ndarray) -> np.ndarray:
+        value = np.asarray(transform, dtype=float)
+        if value.shape != (4, 4) or not np.all(np.isfinite(value)):
+            raise ValueError("TCP transform must be a finite 4x4 matrix")
+        pose = np.empty(6, dtype=float)
+        pose[:3] = value[:3, 3]
+        pose[3:] = Rotation.from_matrix(value[:3, :3]).as_euler(
+            "xyz", degrees=True
+        )
+        return pose
+
+    def read_tcp_pose_vec_mm(self) -> np.ndarray:
+        return self._transform_to_tcp_pose_vec(self.read_T_base_tcp())
+
+    def wait_until_tcp_reached(
+        self,
+        target_pose_vec_mm: Sequence[float],
+        *,
+        position_tolerance_mm: float = 1.0,
+        rotation_tolerance_deg: float = 1.0,
+        timeout_s: float = 30.0,
+        stable_count: int = 5,
+        poll_interval_s: float = 0.05,
+    ) -> np.ndarray:
+        """Wait for stable measured TCP arrival in ``BASE_FRAME``."""
+        target = self._validate_tcp_pose_vec(target_pose_vec_mm)
+        if position_tolerance_mm <= 0.0 or rotation_tolerance_deg <= 0.0:
+            raise ValueError("TCP arrival tolerances must be positive")
+        if timeout_s <= 0.0 or stable_count < 1 or poll_interval_s <= 0.0:
+            raise ValueError("timeout, stable_count, and poll interval must be positive")
+
+        target_rotation = Rotation.from_euler("xyz", target[3:], degrees=True)
+        deadline = time.monotonic() + float(timeout_s)
+        consecutive = 0
+        last_pose = None
+        last_position_error = math.inf
+        last_rotation_error = math.inf
+        while time.monotonic() < deadline:
+            current = self.read_tcp_pose_vec_mm()
+            last_pose = current
+            last_position_error = float(np.linalg.norm(current[:3] - target[:3]))
+            current_rotation = Rotation.from_euler(
+                "xyz", current[3:], degrees=True
+            )
+            last_rotation_error = float(
+                np.rad2deg((target_rotation.inv() * current_rotation).magnitude())
+            )
+            if (
+                last_position_error <= position_tolerance_mm
+                and last_rotation_error <= rotation_tolerance_deg
+            ):
+                consecutive += 1
+            else:
+                consecutive = 0
+            if consecutive >= stable_count:
+                return current.copy()
+            time.sleep(float(poll_interval_s))
+
+        raise TimeoutError(
+            "TCP target was not reached: "
+            f"position_error={last_position_error:.3f} mm, "
+            f"rotation_error={last_rotation_error:.3f} deg, "
+            f"target={target.tolist()}, "
+            f"current={None if last_pose is None else last_pose.tolist()}"
+        )
 
     # ------------------------------------------------------------------
     # Joint motion
@@ -553,9 +661,18 @@ class ROS2JointTrajectoryRobotAdapter:
         if wrapped is None:
             raise RuntimeError("Trajectory controller returned no result")
         if int(wrapped.status) != int(GoalStatus.STATUS_SUCCEEDED):
+            result = getattr(wrapped, "result", None)
+            error_code = getattr(result, "error_code", None)
+            error_string = str(getattr(result, "error_string", "") or "").strip()
+            details = []
+            if error_code is not None:
+                details.append(f"error_code={error_code}")
+            if error_string:
+                details.append(f"error_string={error_string!r}")
+            suffix = "" if not details else ", " + ", ".join(details)
             raise RuntimeError(
                 "FollowJointTrajectory action did not succeed: "
-                f"status={wrapped.status}"
+                f"status={wrapped.status}{suffix}"
             )
         result = wrapped.result
         if int(result.error_code) != 0:

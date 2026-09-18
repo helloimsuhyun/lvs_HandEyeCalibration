@@ -13,6 +13,9 @@ equipment:
   base_frame: link0
   joint_names: [base, shoulder, elbow, wrist1, wrist2, wrist3]
   robot_adapter: real_laser_handeye.robot_adapter_rb5_ros:RobotAdapter
+  cartesian_robot_adapter: real_laser_handeye.robot_adapter_rb5_ros:RobotAdapter
+  cartesian_motion_backend: rbpodo_ros2_move_l_action
+  cartesian_requires_ros_driver: true
   laser_adapter: real_laser_handeye.laser_adapter:LaserAdapter
   robot_host: ""
   robot_port: null
@@ -107,13 +110,13 @@ planning:
 motion:
   approach_distance_mm: 80.0
 
-  joint_tolerance_deg: 0.1
-  path_tolerance_deg: 1.0
+  joint_tolerance_deg: 0.05
+  path_tolerance_deg: 0.5
 
-  linear_position_tolerance_mm: 0.5
-  linear_rotation_tolerance_deg: 0.2
+  linear_position_tolerance_mm: 0.2
+  linear_rotation_tolerance_deg: 0.1
 
-  start_tolerance_deg: 0.25
+  start_tolerance_deg: 0.1
   timeout_s: 60.0
   settle_time_s: 1.0
 

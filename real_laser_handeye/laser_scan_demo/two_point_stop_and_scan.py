@@ -294,38 +294,86 @@ class TwoPointScanViewer:
         self.abort_requested = False
         self.quit_requested = False
 
+        self._tcp_history_started_at = time.monotonic()
+        self._tcp_history_t: list[float] = []
+        self._tcp_history_xyz: list[np.ndarray] = []
+
         root = QtWidgets.QVBoxLayout(self.window)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        self.window.setStyleSheet(
+            """
+            QWidget { background: #0f172a; color: #e5edf6; font-size: 13px; }
+            QFrame#card { background: #111c31; border: 1px solid #26364d; border-radius: 10px; }
+            QLabel#title { font-size: 20px; font-weight: 800; }
+            QLabel#panelTitle { font-size: 15px; font-weight: 700; color: #dce8f5; }
+            QLabel#muted { color: #93a4b8; }
+            QPushButton { background: #1c2b42; border: 1px solid #334963; border-radius: 7px;
+                          padding: 8px 13px; min-height: 22px; font-weight: 700; }
+            QPushButton:hover { background: #263b59; }
+            QPushButton:disabled { color: #64748b; background: #172033; border-color: #243147; }
+            QPushButton#primary { background: #155e75; border: 2px solid #22d3ee; color: #cffafe; }
+            QPushButton#execute { background: #9a3412; border: 2px solid #fb923c; color: #fff7ed; }
+            QPushButton#danger { background: #7f1d1d; border-color: #b33a3a; color: white; }
+            QProgressBar { background: #0b1322; border: 1px solid #334963; border-radius: 7px;
+                           text-align: center; min-height: 20px; font-weight: 800; }
+            QProgressBar::chunk { background: #f97316; border-radius: 6px; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #0b1322;
+                border: 1px solid #334963; border-radius: 6px; padding: 5px; }
+            """
+        )
+
+        header = QtWidgets.QFrame()
+        header.setObjectName("card")
+        header_layout = QtWidgets.QVBoxLayout(header)
+        header_layout.setContentsMargins(16, 12, 16, 12)
+        title_row = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Two-point stop-and-scan")
+        title.setObjectName("title")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.direction_label = QtWidgets.QLabel("SCAN  2nd → 1st · fixed 1st orientation")
+        self.direction_label.setObjectName("muted")
+        title_row.addWidget(self.direction_label)
+        header_layout.addLayout(title_row)
 
         self.status = QtWidgets.QLabel("Connecting...")
         self.status.setWordWrap(True)
-        root.addWidget(self.status)
+        self.status.setObjectName("muted")
+        header_layout.addWidget(self.status)
+        root.addWidget(header)
 
-        self.first_label = QtWidgets.QLabel("First: not taught")
-        self.second_label = QtWidgets.QLabel("Second: not taught")
-        self.direction_label = QtWidgets.QLabel(
-            "Stop-and-scan: second -> first, fixed orientation: first pose"
-        )
+        teaching_card = QtWidgets.QFrame()
+        teaching_card.setObjectName("card")
+        teaching_layout = QtWidgets.QVBoxLayout(teaching_card)
+        teaching_layout.setContentsMargins(14, 10, 14, 10)
+        self.first_label = QtWidgets.QLabel("FIRST · not taught")
+        self.second_label = QtWidgets.QLabel("SECOND · not taught")
         self.first_label.setWordWrap(True)
         self.second_label.setWordWrap(True)
-        root.addWidget(self.first_label)
-        root.addWidget(self.second_label)
-        root.addWidget(self.direction_label)
 
         controls = QtWidgets.QHBoxLayout()
-        self.teach_first_button = QtWidgets.QPushButton("1. Teach first")
-        self.teach_second_button = QtWidgets.QPushButton("2. Teach second")
-        self.start_scan_button = QtWidgets.QPushButton("3. Start stop-and-scan: second -> first")
-        self.new_step_button = QtWidgets.QPushButton("New step")
-        self.undo_step_button = QtWidgets.QPushButton("Undo last step")
-        self.fit_view_button = QtWidgets.QPushButton("Fit view")
+        self.teach_first_button = QtWidgets.QPushButton("1  FIRST 교시")
+        self.teach_second_button = QtWidgets.QPushButton("2  SECOND 교시")
+        self.start_scan_button = QtWidgets.QPushButton("3  움직임 시작  ·  2nd → 1st")
+        self.save_button = QtWidgets.QPushButton("저장")
+        self.teach_first_button.setObjectName("primary")
+        self.teach_second_button.setObjectName("primary")
+        self.start_scan_button.setObjectName("execute")
+        self.start_scan_button.setMinimumHeight(42)
+
+        self.new_step_button = QtWidgets.QPushButton("새 스텝")
+        self.undo_step_button = QtWidgets.QPushButton("마지막 스텝 취소")
+        self.fit_view_button = QtWidgets.QPushButton("3D 화면 맞춤")
         self.fit_view_button.setToolTip(
             "Fit the 3D camera to the accumulated scan cloud. "
             "Before scanning, taught TCP positions are used instead."
         )
-        self.save_button = QtWidgets.QPushButton("Save")
-        self.finish_button = QtWidgets.QPushButton("Save and finish")
-        self.abort_button = QtWidgets.QPushButton("Abort move")
-        self.quit_button = QtWidgets.QPushButton("Save and quit")
+        self.finish_button = QtWidgets.QPushButton("저장 후 종료")
+        self.abort_button = QtWidgets.QPushButton("이동 중지")
+        self.abort_button.setObjectName("danger")
+        self.quit_button = QtWidgets.QPushButton("저장하고 닫기")
 
         self.teach_first_button.setShortcut("1")
         self.teach_second_button.setShortcut("2")
@@ -349,26 +397,57 @@ class TwoPointScanViewer:
             self.teach_first_button,
             self.teach_second_button,
             self.start_scan_button,
+            self.save_button,
+            self.abort_button,
+        ):
+            controls.addWidget(button)
+        teaching_layout.addLayout(controls)
+
+        pose_row = QtWidgets.QHBoxLayout()
+        pose_row.addWidget(self.first_label, 1)
+        pose_row.addWidget(self.second_label, 1)
+        teaching_layout.addLayout(pose_row)
+
+        utility_row = QtWidgets.QHBoxLayout()
+        for button in (
             self.new_step_button,
             self.undo_step_button,
             self.fit_view_button,
-            self.save_button,
             self.finish_button,
-            self.abort_button,
             self.quit_button,
         ):
-            controls.addWidget(button)
-        root.addLayout(controls)
+            utility_row.addWidget(button)
+        utility_row.addStretch(1)
+        teaching_layout.addLayout(utility_row)
+
+        progress_row = QtWidgets.QHBoxLayout()
+        self.motion_state_label = QtWidgets.QLabel("● IDLE")
+        self.motion_state_label.setObjectName("panelTitle")
+        self.motion_time_label = QtWidgets.QLabel("Elapsed —  ·  Remaining —")
+        self.motion_time_label.setObjectName("muted")
+        progress_row.addWidget(self.motion_state_label)
+        progress_row.addStretch(1)
+        progress_row.addWidget(self.motion_time_label)
+        teaching_layout.addLayout(progress_row)
+        self.motion_progress = QtWidgets.QProgressBar()
+        self.motion_progress.setRange(0, 100)
+        self.motion_progress.setValue(0)
+        self.motion_progress.setFormat("0%")
+        teaching_layout.addWidget(self.motion_progress)
+        root.addWidget(teaching_card)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         root.addWidget(splitter, stretch=1)
 
+        left_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        splitter.addWidget(left_splitter)
+
         # Lightweight live 2D profile plot for teaching and motion.
-        profile_panel = QtWidgets.QWidget()
+        profile_panel = QtWidgets.QFrame()
+        profile_panel.setObjectName("card")
         profile_layout = QtWidgets.QVBoxLayout(profile_panel)
-        profile_title = QtWidgets.QLabel(
-            "Live sensor profile (display-downsampled only; saved data stay full resolution)"
-        )
+        profile_title = QtWidgets.QLabel("LIVE PROFILE · sensor frame")
+        profile_title.setObjectName("panelTitle")
         profile_layout.addWidget(profile_title)
         self.profile_plot = pg.PlotWidget()
         self.profile_plot.setBackground((12, 14, 18))
@@ -379,18 +458,49 @@ class TwoPointScanViewer:
             [], [], pen=None, symbol="o", symbolSize=2
         )
         profile_layout.addWidget(self.profile_plot, stretch=1)
-        splitter.addWidget(profile_panel)
+        left_splitter.addWidget(profile_panel)
+
+        # Dedicated TCP position monitor (rolling base-frame XYZ history).
+        tcp_panel = QtWidgets.QFrame()
+        tcp_panel.setObjectName("card")
+        tcp_layout = QtWidgets.QVBoxLayout(tcp_panel)
+        tcp_header = QtWidgets.QHBoxLayout()
+        tcp_title = QtWidgets.QLabel("TCP MONITOR · base frame")
+        tcp_title.setObjectName("panelTitle")
+        self.tcp_value_label = QtWidgets.QLabel("XYZ —  |  RPY —")
+        self.tcp_value_label.setObjectName("muted")
+        tcp_header.addWidget(tcp_title)
+        tcp_header.addStretch(1)
+        tcp_header.addWidget(self.tcp_value_label)
+        tcp_layout.addLayout(tcp_header)
+        self.tcp_plot = pg.PlotWidget()
+        self.tcp_plot.setBackground((12, 14, 18))
+        self.tcp_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.tcp_plot.setLabel("bottom", "Recent time", units="s")
+        self.tcp_plot.setLabel("left", "TCP position", units="mm")
+        self.tcp_plot.addLegend(offset=(8, 8))
+        self.tcp_curves = (
+            self.tcp_plot.plot([], [], pen=pg.mkPen("#fb7185", width=2), name="X"),
+            self.tcp_plot.plot([], [], pen=pg.mkPen("#86efac", width=2), name="Y"),
+            self.tcp_plot.plot([], [], pen=pg.mkPen("#60a5fa", width=2), name="Z"),
+        )
+        tcp_layout.addWidget(self.tcp_plot, stretch=1)
+        left_splitter.addWidget(tcp_panel)
+        left_splitter.setSizes([420, 330])
 
         # Accumulated 3D base-frame cloud.
-        cloud_panel = QtWidgets.QWidget()
+        cloud_panel = QtWidgets.QFrame()
+        cloud_panel.setObjectName("card")
         cloud_layout = QtWidgets.QVBoxLayout(cloud_panel)
-        cloud_layout.addWidget(QtWidgets.QLabel("Accumulated world/base-frame scan"))
+        cloud_title = QtWidgets.QLabel("ACCUMULATED PROFILE · world / base frame")
+        cloud_title.setObjectName("panelTitle")
+        cloud_layout.addWidget(cloud_title)
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor((12, 14, 18))
         self.view.setCameraPosition(distance=1000, elevation=25, azimuth=45)
         cloud_layout.addWidget(self.view, stretch=1)
         splitter.addWidget(cloud_panel)
-        splitter.setSizes([520, 900])
+        splitter.setSizes([560, 900])
 
         grid = gl.GLGridItem()
         grid.setSize(x=2000, y=2000)
@@ -628,11 +738,13 @@ class TwoPointScanViewer:
         self.save_button.setEnabled(not busy)
         self.finish_button.setEnabled(not busy)
         self.abort_button.setEnabled(busy)
+        if not busy and self.motion_progress.maximum() == 0:
+            self.motion_progress.setRange(0, 100)
         self.process_events()
 
     def set_teaching(self, first: np.ndarray | None, second: np.ndarray | None) -> None:
-        self.first_label.setText(f"First: {pose_text(first)}")
-        self.second_label.setText(f"Second: {pose_text(second)}")
+        self.first_label.setText(f"FIRST · {pose_text(first)}")
+        self.second_label.setText(f"SECOND · {pose_text(second)}")
         self.first_pose_item.setData(
             pos=(
                 np.empty((0, 3), dtype=np.float32)
@@ -671,6 +783,49 @@ class TwoPointScanViewer:
         self.status.setText(message)
         self.process_events()
 
+    def set_motion_progress(
+        self,
+        fraction: float | None,
+        phase: str,
+        *,
+        elapsed_s: float | None = None,
+        remaining_s: float | None = None,
+    ) -> None:
+        """Update the prominent scan progress strip.
+
+        A ``None`` fraction selects the indeterminate state, which is useful while
+        MoveIt is planning or the initial orientation is being aligned.
+        """
+        self.motion_state_label.setText(f"● {phase}")
+        if fraction is None:
+            self.motion_progress.setRange(0, 0)
+        else:
+            value = int(round(100.0 * min(1.0, max(0.0, float(fraction)))))
+            self.motion_progress.setRange(0, 100)
+            self.motion_progress.setValue(value)
+            self.motion_progress.setFormat(f"{value}%")
+
+        elapsed_text = "—" if elapsed_s is None else self._duration_text(elapsed_s)
+        remaining_text = "—" if remaining_s is None else self._duration_text(remaining_s)
+        self.motion_time_label.setText(
+            f"Elapsed {elapsed_text}  ·  Remaining {remaining_text}"
+        )
+        self.process_events()
+
+    @staticmethod
+    def _duration_text(seconds: float) -> str:
+        seconds = max(0, int(round(float(seconds))))
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def reset_motion_progress(self, message: str = "IDLE") -> None:
+        self.motion_progress.setRange(0, 100)
+        self.motion_progress.setValue(0)
+        self.motion_progress.setFormat("0%")
+        self.motion_state_label.setText(f"● {message}")
+        self.motion_time_label.setText("Elapsed —  ·  Remaining —")
+        self.process_events()
+
     def update_live_profile(self, points_sensor: np.ndarray | None) -> None:
         if points_sensor is None:
             self.profile_curve.setData([], [])
@@ -703,11 +858,30 @@ class TwoPointScanViewer:
         if current_T_base_tcp is None:
             self.latest_current_tcp = np.empty((0, 3), dtype=np.float32)
             self.current_tcp_item.setData(pos=self.latest_current_tcp)
+            self.tcp_value_label.setText("XYZ —  |  RPY —")
         else:
             self.latest_current_tcp = np.asarray(
                 current_T_base_tcp[:3, 3], dtype=np.float32
             ).reshape(1, 3)
             self.current_tcp_item.setData(pos=self.latest_current_tcp)
+            xyz = np.asarray(current_T_base_tcp[:3, 3], dtype=float)
+            rpy = rotation_to_rpy_deg(np.asarray(current_T_base_tcp[:3, :3], dtype=float))
+            self.tcp_value_label.setText(
+                f"XYZ [{xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f}] mm  ·  "
+                f"RPY [{rpy[0]:.1f}, {rpy[1]:.1f}, {rpy[2]:.1f}]°"
+            )
+            now = time.monotonic() - self._tcp_history_started_at
+            if not self._tcp_history_t or now - self._tcp_history_t[-1] >= 0.05:
+                self._tcp_history_t.append(now)
+                self._tcp_history_xyz.append(xyz.copy())
+                if len(self._tcp_history_t) > 300:
+                    del self._tcp_history_t[:-300]
+                    del self._tcp_history_xyz[:-300]
+                times = np.asarray(self._tcp_history_t, dtype=float)
+                times = times - times[-1]
+                positions = np.asarray(self._tcp_history_xyz, dtype=float)
+                for axis, curve in enumerate(self.tcp_curves):
+                    curve.setData(times, positions[:, axis])
 
     def process_events(self) -> None:
         self.app.processEvents()
@@ -951,6 +1125,12 @@ def move_to_waypoint_with_ui(
         viewer.process_events()
         time.sleep(0.005)
 
+    if worker.is_alive() and not viewer.is_open():
+        # Closing the GUI must not leave a background robot command running.
+        try:
+            robot.stop()
+        except Exception as exc:
+            print(f"window-close stop request failed: {type(exc).__name__}: {exc}")
     worker.join()
     if worker.error is not None:
         raise RuntimeError(
@@ -1069,6 +1249,11 @@ def align_orientation_at_second(
         viewer.process_events()
         time.sleep(0.005)
 
+    if worker.is_alive() and not viewer.is_open():
+        try:
+            robot.stop()
+        except Exception as exc:
+            print(f"window-close stop request failed: {type(exc).__name__}: {exc}")
     worker.join()
     if worker.error is not None:
         raise RuntimeError(f"orientation alignment failed: {worker.error}")
@@ -1099,6 +1284,7 @@ def scan_second_to_first(
     scan_from = np.r_[second_pose[:3], first_pose[3:6]].astype(float)
     scan_to = np.asarray(first_pose, dtype=float).reshape(6).copy()
 
+    viewer.set_motion_progress(None, "ALIGNING ORIENTATION")
     align_orientation_at_second(
         robot=robot,
         first_pose=first_pose,
@@ -1120,8 +1306,22 @@ def scan_second_to_first(
     )
 
     last_render = 0.0
+    scan_started_at = time.monotonic()
 
     for waypoint_index, target_pose in enumerate(waypoints):
+        elapsed = time.monotonic() - scan_started_at
+        completed = waypoint_index
+        remaining = (
+            None
+            if completed == 0
+            else elapsed / completed * (len(waypoints) - completed)
+        )
+        viewer.set_motion_progress(
+            completed / len(waypoints),
+            f"RUNNING · waypoint {waypoint_index + 1}/{len(waypoints)}",
+            elapsed_s=elapsed,
+            remaining_s=remaining,
+        )
         if waypoint_index > 0:
             move_to_waypoint_with_ui(
                 robot=robot,
@@ -1243,6 +1443,19 @@ def scan_second_to_first(
             f"Step {step_index}: captured waypoint {waypoint_index + 1}/{len(waypoints)} | "
             f"stored captures={len(step.profiles)} | points={step.point_count}"
         )
+        elapsed = time.monotonic() - scan_started_at
+        completed = waypoint_index + 1
+        remaining = elapsed / completed * (len(waypoints) - completed)
+        viewer.set_motion_progress(
+            completed / len(waypoints),
+            (
+                "COMPLETE"
+                if completed == len(waypoints)
+                else f"RUNNING · captured {completed}/{len(waypoints)}"
+            ),
+            elapsed_s=elapsed,
+            remaining_s=remaining,
+        )
         viewer.process_events()
 
     step.completed_at_utc = utc_now_text()
@@ -1297,6 +1510,12 @@ def save_session(
         "scan_speed_mm_s": args.scan_speed_mm_s,
         "scan_accel_mm_s2": args.scan_accel_mm_s2,
     }
+    # Optional provenance supplied by alternate robot frontends. Keeping these
+    # conditional preserves the original standalone demo's save format.
+    for key in ("robot", "motion_backend", "robot_adapter_module"):
+        value = getattr(args, key, None)
+        if value is not None:
+            metadata[key] = str(value)
 
     payload: dict[str, np.ndarray] = {
         "metadata_json": np.array(json.dumps(metadata, ensure_ascii=False)),

@@ -15,10 +15,13 @@ The UR5e path now has the same simulation ingredients as the RB5 path:
 Current hand-eye JSON:
 
 ```text
-^tool0 R_sensor = diag(-1,+1,-1)
+^tool0 R_sensor = diag(+1,-1,-1)
 ^tool0 p_sensor = [0,0,151] mm
 ^sensor p_physical = [0,0,80] mm
 ```
+
+The rotation includes the sensor's physical 180-degree turn about the final
+`wrist_3_joint` / `+Z_tool0` axis.
 
 Thus the physical origin is 71 mm along `+Z_tool0` from tool0.
 

@@ -8,9 +8,8 @@ Flow:
     4) Simulate laser-profile measurements and visualize them
 
 Example:
-python main.py 미그럼틀.stl \
-    --save-ply simulated_scan.ply \
-    --save-npz simulated_scan.npz
+python main.py /home/choisuhyun/lvs_HandEyeCalibration/pose_estimation/미그럼틀.stl \
+
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from laser_profile_simulator import (
 
 PATH_STEP_MM = 1.0
 SENSOR_STANDOFF_MM = 80.0
-ORIENTATION_SMOOTH_WINDOW = 15
+ORIENTATION_SMOOTH_WINDOW = 31
 AUTO_BREAK_ANGLE_DEG = 45.0
 
 PICKER_POINT_SIZE = 2.0

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import real_laser_handeye.ros2_driver_launcher as driver_launcher_module
 import real_laser_handeye.workflow as workflow_module
@@ -38,6 +39,47 @@ def test_driver_command_quotes_ip_and_static_arguments(tmp_path: Path):
     assert "ur_type:=ur5e" in command[2]
     assert "robot_ip:=192.168.0.2" in command[2]
     assert "launch_rviz:=false" in command[2]
+
+
+def test_auto_launched_driver_lock_rejects_second_owner(
+    tmp_path: Path, monkeypatch
+):
+    setup = tmp_path / "setup.bash"
+    setup.write_text("# test\n", encoding="utf-8")
+    session_root = tmp_path / "session"
+
+    class Config:
+        source_path = tmp_path / "workflow.yaml"
+        values = {
+            "equipment": {
+                "driver": {
+                    "auto_launch": True,
+                    "ros_setup": str(setup),
+                    "launch_package": "ur_robot_driver",
+                    "launch_file": "ur_control.launch.py",
+                    "process_alive_check_s": 0.0,
+                }
+            }
+        }
+
+        @staticmethod
+        def path(name):
+            assert name == "session_root"
+            return session_root
+
+    fake_process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(driver_launcher_module.subprocess, "Popen", lambda *a, **k: fake_process)
+    monkeypatch.setattr(ROS2DriverLauncher, "_stop_process", staticmethod(lambda process: None))
+
+    first = ROS2DriverLauncher(Config())
+    second = ROS2DriverLauncher(Config())
+    try:
+        first.start("192.0.2.10")
+        with pytest.raises(RuntimeError, match="another workflow already owns"):
+            second.start("192.0.2.10")
+    finally:
+        second.close()
+        first.close()
 
 
 class _HoldRobot:

@@ -546,6 +546,12 @@ def capture_once(
                     T_after
                 ),
 
+                # Compatibility alias for calibration tools and older
+                # datasets that name the workflow planning frame ``base``.
+                T_base_tcp=(
+                    T_after
+                ),
+
                 T_tcp_sensor=(
                     args.T_tcp_sensor
                 ),

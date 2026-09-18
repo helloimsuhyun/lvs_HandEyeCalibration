@@ -162,12 +162,12 @@ class PoseSelectionConfig:
     plane_normal_scale_deg: float
     plane_offset_scale_mm: float
     fisher_objective: str = "d_optimal"
-    measurement_noise_std_mm: float = 0.20
+    measurement_noise_std_mm: float = 0.25
     measurement_noise_axis: str = "xz"
     measurement_seed: int = 1701
     initialization_seed: int = 1701
-    initial_translation_range_mm: float = 100.0
-    initial_angle_range_deg: float = 15.0
+    initial_translation_range_mm: float = 50.0
+    initial_angle_range_deg: float = 5.0
     initial_rotation_perturbation: str = "axis_angle"
     initial_translation_perturbation: str = "direction_norm"
     estimator_max_iterations: int = 60
@@ -282,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fisher-profile-noise-std-mm",
         type=float,
-        default=0.20,
+        default=0.25,
         help=(
             "Assumed per-coordinate profile noise used to whiten the "
             "point-to-plane Jacobians."
@@ -343,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selection-measurement-noise-std-mm",
         type=float,
-        default=0.20,
+        default=0.25,
         help=(
             "Noise applied once to acquired profiles during online selection. "
             "The saved datasets contain this same noise."
@@ -371,12 +371,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selection-initial-translation-range-mm",
         type=float,
-        default=100.0,
+        default=50.0,
     )
     parser.add_argument(
         "--selection-initial-angle-range-deg",
         type=float,
-        default=15.0,
+        default=5.0,
     )
     parser.add_argument(
         "--selection-initial-rotation-perturbation",
@@ -1013,18 +1013,12 @@ def _selection_initial_transform(
     )
     _unused_noise_seed, initialization_seed = trial_seed.spawn(2)
     true_transform = np.asarray(T_ef_s_true, dtype=float).reshape(4, 4)
-    true_angles_deg = (
-        None
-        if config.initial_rotation_perturbation == "axis_angle"
-        else Rotation.from_matrix(true_transform[:3, :3]).as_euler(
-            "xyz",
-            degrees=True,
-        )
-    )
+    true_angles_deg = Rotation.from_matrix(
+        true_transform[:3, :3]
+    ).as_euler("xyz", degrees=True)
     return make_initial_guess(
         reference_angles_deg=true_angles_deg,
         reference_translation_mm=true_transform[:3, 3],
-        reference_rotation=true_transform[:3, :3],
         rng=np.random.default_rng(initialization_seed),
         mode="carlson",
         translation_range_mm=config.initial_translation_range_mm,

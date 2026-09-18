@@ -199,7 +199,60 @@ python3 -m real_laser_handeye.estimate_initial_plane estimate \
   --no-show-plot
 ```
 
-## 8. 테스트
+## 8. ROS 2점 정지-스캔 GUI
+
+기존 `laser_scan_demo/two_point_stop_and_scan.py`의 교시·정지·프로파일 집계·
+NPZ 저장 흐름을 유지하면서 로봇별 ROS 실행 백엔드를 사용하는 버전이다.
+
+- RB5: `robot_adapter_rb5_ros.py`에서 공식
+  `/rbpodo_hardware/move_l` (`rbpodo_msgs/action/MoveL`) 호출
+- UR5e: `MoveIt /compute_cartesian_path`로 `tool0` 직선 경로를 충돌 검사하고
+  `/scaled_joint_trajectory_controller/follow_joint_trajectory`로 전체 시간 궤적 실행
+
+```bash
+python -m real_laser_handeye.laser_scan_demo.two_point_stop_and_scan_ros
+```
+
+이 실행 모듈은 시작 시 `/opt/ros/humble/setup.bash`와
+`~/rbpodo_ros2_ws/install/setup.bash`를 자동으로 source한 환경에서 같은 Python
+인터프리터를 한 번 재실행한다. 따라서 별도 ROS source 명령은 필요하지 않다.
+현재 활성화된 conda Python은 그대로 유지된다.
+
+실행하면 연결 창이 먼저 열린다. 여기에서 RB5/UR5e와 로봇/레이저 IP를 선택하고
+`Connect robot`, `Connect laser`를 각각 독립적으로 실행한다. 두 연결이 모두
+성공해야 `Open scan GUI` 버튼이 활성화된다. CLI 인자를 지정한 경우에도 자동으로
+연결하지 않고 연결 창의 초기값으로만 사용한다.
+
+```bash
+python -m real_laser_handeye.laser_scan_demo.two_point_stop_and_scan_ros \
+  --robot rb5 \
+  --robot-ip 169.254.186.20 \
+  --laser-ip 169.254.186.182 \
+  --scan-speed-mm-s 5 \
+  --scan-accel-mm-s2 5 \
+  --waypoint-spacing-mm 1 \
+  --profiles-per-waypoint 10 \
+  --auto-save
+```
+
+`Teach first/second`는 읽기 전용이며, 실제 스캔 이동은 GUI에서
+`Enable real motion`에서 실제 ROS 명령 경로와 measured state가 정상인지 확인한 뒤에만
+열린다. RB 드라이버는 너무 가까운 MoveL 목표를 거부하므로 검증 단계에서 실제
+영변위 명령은 보내지 않는다. UR5e는 `workflow_gui.py`와 동일하게 영변위
+`FollowJointTrajectory`를 보내 External Control 경로까지 확인한다.
+
+`--scan-speed-mm-s`와 `--scan-accel-mm-s2`는 RB `MoveL` 액션에 직접 전달된다.
+UR5e에서는 MoveIt이 생성한 시간 궤적보다 느린 경우에만 시간을 늘리는 상한으로
+적용되므로, MoveIt/URDF의 관절 속도·가속도 제한을 절대 빠르게 만들지 않는다.
+UR5e의 GUI 목표와 도착 검증은 기존과 동일한 `base_link -> tool0` 기준이며, 장착된
+센서 충돌 형상은 MoveIt 로봇 모델에 남아 전체 경로에서 검사된다.
+
+UR5e는 External Control 프로그램과 scaled joint trajectory controller가 실행 중이어야
+한다. Local mode에서는 teach pendant에서 프로그램을 시작하고, Remote mode에서는
+Dashboard 또는 headless 제어로 시작한다. 두 모드를 전환한 뒤에는 드라이버와 프로그램
+상태를 다시 확인한다. RB5와 UR5e 모두 해당 공식 ROS 2 드라이버가 실행 중이어야 한다.
+
+## 9. 테스트
 
 ```bash
 python3 -m compileall -q \

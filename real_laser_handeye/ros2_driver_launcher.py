@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ class ROS2DriverLauncher:
         self.log_file = None
         self.log_path: Path | None = None
         self.calibration_path: Path | None = None
+        self.lock_file = None
+        self.lock_path: Path | None = None
 
     @property
     def enabled(self) -> bool:
@@ -146,29 +149,49 @@ class ROS2DriverLauncher:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "ros_logs").mkdir(parents=True, exist_ok=True)
 
-        arguments = dict(self.settings.get("launch_arguments", {}))
-        arguments["robot_ip"] = robot_ip
-        calibration_path = self._prepare_ur_calibration(robot_ip, log_dir)
-        self.calibration_path = calibration_path
-        if calibration_path is not None:
-            arguments["kinematics_params_file"] = str(calibration_path)
+        self.lock_path = log_dir / "driver.lock"
+        self.lock_file = self.lock_path.open("a+")
+        try:
+            fcntl.flock(
+                self.lock_file.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as error:
+            self.lock_file.close()
+            self.lock_file = None
+            raise RuntimeError(
+                "another workflow already owns the auto-launched ROS 2 robot "
+                f"driver ({self.lock_path}). Close the other GUI/driver, or "
+                "disable automatic driver launch and reuse one existing driver."
+            ) from error
 
-        command = self._command(
-            str(self.settings["launch_package"]),
-            str(self.settings["launch_file"]),
-            arguments,
-        )
-        self.log_path = log_dir / "driver.log"
-        self.log_file = self.log_path.open("ab", buffering=0)
-        self.process = subprocess.Popen(
-            command,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env={**os.environ, "ROS_LOG_DIR": str(log_dir / "ros_logs")},
-        )
-        time.sleep(float(self.settings.get("process_alive_check_s", 1.0)))
-        self.raise_if_exited()
+        try:
+            arguments = dict(self.settings.get("launch_arguments", {}))
+            arguments["robot_ip"] = robot_ip
+            calibration_path = self._prepare_ur_calibration(robot_ip, log_dir)
+            self.calibration_path = calibration_path
+            if calibration_path is not None:
+                arguments["kinematics_params_file"] = str(calibration_path)
+
+            command = self._command(
+                str(self.settings["launch_package"]),
+                str(self.settings["launch_file"]),
+                arguments,
+            )
+            self.log_path = log_dir / "driver.log"
+            self.log_file = self.log_path.open("ab", buffering=0)
+            self.process = subprocess.Popen(
+                command,
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env={**os.environ, "ROS_LOG_DIR": str(log_dir / "ros_logs")},
+            )
+            time.sleep(float(self.settings.get("process_alive_check_s", 1.0)))
+            self.raise_if_exited()
+        except BaseException:
+            self.close()
+            raise
 
     def raise_if_exited(self) -> None:
         if self.process is None:
@@ -194,3 +217,10 @@ class ROS2DriverLauncher:
             self.log_file.close()
         self.log_file = None
         self.calibration_path = None
+        if self.lock_file is not None:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.lock_file.close()
+        self.lock_file = None
+        self.lock_path = None

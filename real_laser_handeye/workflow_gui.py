@@ -2470,8 +2470,10 @@ class WorkflowWindow(QtWidgets.QMainWindow):
             return
 
         detail = (
-            "UR5e: release the E-stop, power/brake-release the robot, and start the "
-            "External Control program on the teach pendant.\n\n"
+            "UR5e: release the E-stop, power/brake-release the robot, and make sure "
+            "the External Control program is running. In Local mode start it on "
+            "the teach pendant; in Remote mode start it through Dashboard/headless "
+            "control.\n\n"
             if self.robot_name == "ur5e"
             else "RB5: release the E-stop, initialize the arm, and keep the work area clear.\n\n"
         )
